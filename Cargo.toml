@@ -25,7 +25,7 @@ libc       = "0.2"
 tokio-util = { version = "0.7", features = ["io"] }
 toml       = { version = "0.8", default-features = false, features = ["parse"] }
 tokio      = { version = "1", features = ["full"] }
-reqwest    = { version = "0.12", features = ["json", "stream", "blocking"] }
+reqwest    = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls", "http2", "charset"] }
 futures    = "0.3"
 
 [features]
