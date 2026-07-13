@@ -40,6 +40,14 @@ pub struct ServeArgs {
     /// there is no per-client override.
     #[arg(long, value_name = "DIR")]
     pub store: Option<PathBuf>,
+
+    /// Run llama-server in a container (docker or podman) instead of as a
+    /// local process — Linux only. Auto-selects the matching
+    /// ghcr.io/ggml-org/llama.cpp:server-<backend> image for whatever GPU
+    /// acceleration the host has (see crate::container); no local
+    /// llama-server binary is required on PATH when this is set.
+    #[arg(long, value_name = "docker|podman")]
+    pub conman: Option<crate::container::ContainerManager>,
 }
 
 // ---------------------------------------------------------------------------
@@ -51,7 +59,10 @@ struct AppState(Arc<Inner>);
 
 struct Inner {
     manager: Mutex<ModelManager>,
-    llama_server_bin: PathBuf,
+    // None when --conman is set: llama-server then runs in a container, so
+    // no local binary is resolved (or required on PATH) at all.
+    llama_server_bin: Option<PathBuf>,
+    conman: Option<crate::container::ContainerManager>,
     store_path: PathBuf,
     cache_path: PathBuf,
     client: Client,
@@ -62,8 +73,28 @@ struct ModelManager {
 }
 
 struct RunningModel {
-    _child: tokio::process::Child,
+    _process: ModelProcess,
     port: u16,
+}
+
+/// A running inference backend: either a local child process (killed via
+/// `Child::kill_on_drop`, as before) or a container (explicitly stopped and
+/// removed on drop — see its own Drop impl for why killing a `docker run`
+/// CLI process doesn't stop the container it started).
+enum ModelProcess {
+    Local(#[allow(dead_code)] tokio::process::Child),
+    Container {
+        conman: crate::container::ContainerManager,
+        id: String,
+    },
+}
+
+impl Drop for ModelProcess {
+    fn drop(&mut self) {
+        if let ModelProcess::Container { conman, id } = self {
+            crate::container::stop(*conman, id);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -618,16 +649,25 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         .with_context(|| format!("resolve model {model_ref}"))?;
     let port = find_free_port()?;
     eprintln!("[llmman] loading {model_ref} on port {port}");
-    let child = match model_path {
-        ModelPath::Gguf(ref path) =>
-            spawn_llama_server(&state.0.llama_server_bin, path, port).await?,
-        ModelPath::SafeTensors(ref dir) =>
-            spawn_vllm_server(dir, port, model_ref).await?,
+    let process = match (&model_path, state.0.conman) {
+        (ModelPath::Gguf(path), Some(conman)) => {
+            let id = crate::container::spawn(conman, path, port).await?;
+            ModelProcess::Container { conman, id }
+        }
+        (ModelPath::Gguf(path), None) => {
+            let bin = state.0.llama_server_bin.as_deref().ok_or_else(|| {
+                anyhow!("no local llama-server binary resolved and --conman was not set")
+            })?;
+            ModelProcess::Local(spawn_llama_server(bin, path, port).await?)
+        }
+        (ModelPath::SafeTensors(dir), _) => {
+            ModelProcess::Local(spawn_vllm_server(dir, port, model_ref).await?)
+        }
     };
     wait_for_ready(&state.0.client, port).await?;
     eprintln!("[llmman] {model_ref} ready on port {port}");
     mgr.running
-        .insert(model_ref.to_string(), RunningModel { _child: child, port });
+        .insert(model_ref.to_string(), RunningModel { _process: process, port });
     Ok(port)
 }
 
@@ -1549,7 +1589,17 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
 }
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
-    let llama_server_bin = resolve_llama_server()?;
+    if _args.conman.is_some() && !cfg!(target_os = "linux") {
+        anyhow::bail!("--conman is only supported on Linux");
+    }
+    // Only resolve (and require) a local llama-server binary when it'll
+    // actually be used: --conman runs llama-server in a container instead,
+    // picking the image itself (see crate::container).
+    let llama_server_bin = if _args.conman.is_none() {
+        Some(resolve_llama_server()?)
+    } else {
+        None
+    };
     let store_path = default_store(_args.store.as_deref())?;
     let cache_path = store_path
         .parent()
@@ -1562,6 +1612,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             running: HashMap::new(),
         }),
         llama_server_bin,
+        conman: _args.conman,
         store_path,
         cache_path,
         client: Client::new(),
