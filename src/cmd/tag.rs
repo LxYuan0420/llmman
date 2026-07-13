@@ -23,7 +23,10 @@ pub fn run(args: &TagArgs) -> anyhow::Result<()> {
     let store_root = crate::default_store(args.store.as_deref())?;
     let store = OciStore::open(&store_root)?;
 
-    let source = crate::shortnames::resolve(&args.source);
+    // resolve_ollama_api, not resolve: SOURCE must match how the model is
+    // actually stored (see rm.rs's comment — same reasoning). TARGET is a
+    // new name the user is choosing, so it's left as typed, unresolved.
+    let source = crate::shortnames::resolve_ollama_api(&args.source);
     let desc = store.find(&source)?;
     store.tag(desc, &args.target)?;
     println!("Tagged {} as {}", source, args.target);

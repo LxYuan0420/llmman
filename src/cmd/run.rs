@@ -41,7 +41,15 @@ pub struct RunArgs {
 }
 
 pub fn run(args: &RunArgs) -> anyhow::Result<()> {
-    let model = crate::shortnames::resolve(&args.model);
+    // resolve_ollama_api, not resolve: `llmman run` is an /api/chat client
+    // (see run_oneshot/run_interactive_tty below), so a bare name must
+    // resolve the same way it would if requested directly over the Ollama
+    // API — otherwise a name resolved here, then handed to ensure_server as
+    // a --model preload and to every /api/chat request this sends, is no
+    // longer "bare" by the time ensure_model resolves it server-side (it
+    // already has a "/" and a "."), so the docker.io/ai/ default never
+    // fires and this silently falls back to hf.co/<name> instead.
+    let model = crate::shortnames::resolve_ollama_api(&args.model);
     let prompt = args.prompt.join(" ");
 
     // Ensure serve is running before anything else.

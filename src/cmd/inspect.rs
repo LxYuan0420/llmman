@@ -21,7 +21,10 @@ pub struct InspectArgs {
 }
 
 pub fn run(args: &InspectArgs) -> anyhow::Result<()> {
-    let reference = crate::shortnames::resolve(&args.reference);
+    // resolve_ollama_api, not resolve: same reasoning as rm.rs/tag.rs for
+    // the local-store case, and consistent with pull's own remote lookup
+    // for --remote (a bare name means the same registry either way).
+    let reference = crate::shortnames::resolve_ollama_api(&args.reference);
     if args.remote {
         let json = ffi::inspect_remote(&reference)?;
         println!("{}", json);

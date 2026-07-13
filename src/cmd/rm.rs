@@ -21,7 +21,11 @@ pub fn run(args: &RmArgs) -> anyhow::Result<()> {
 
     let mut any_err = false;
     for raw in &args.references {
-        let reference = crate::shortnames::resolve(raw);
+        // resolve_ollama_api, not resolve: a bare name pulled via the
+        // Ollama API (POST /api/pull, /api/chat, ...) is stored under
+        // docker.io/ai/<name>, not hf.co/<name> — must resolve the same
+        // way here or `llmman rm <bare-name>` looks for the wrong entry.
+        let reference = crate::shortnames::resolve_ollama_api(raw);
         match store.remove(&reference) {
             Ok(()) => println!("Removed {}", reference),
             Err(e) => {
