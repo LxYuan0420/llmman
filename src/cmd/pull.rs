@@ -1,28 +1,24 @@
-use std::path::PathBuf;
-
 use clap::Args;
-
-use crate::ffi;
 
 #[derive(Args, Debug)]
 pub struct PullArgs {
     /// Registry reference to pull (e.g. registry.example.com/mymodel:latest)
     #[arg(value_name = "REFERENCE")]
     pub reference: String,
-
-    /// Local store directory (overrides default)
-    #[arg(long, value_name = "DIR")]
-    pub store: Option<PathBuf>,
 }
 
+/// `llmman pull` is a thin client of the local daemon's Ollama-protocol
+/// /api/pull (starting one, left running afterwards, if none is running
+/// yet — see daemon::ensure_server) — the same wire protocol `sbx` and any
+/// other Ollama-API client use, so bare-name resolution (shortnames::
+/// resolve_ollama_api) and the model store are always the daemon's.
+///
+/// This intentionally has no `--store` override anymore: the daemon always
+/// uses its own default store (see `llmman serve --store` to change that
+/// store for the daemon itself, which then applies to every client).
 pub fn run(args: &PullArgs) -> anyhow::Result<()> {
-    let store_root = crate::default_store(args.store.as_deref())?;
-    let layout_dir = store_root
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("store path is not valid UTF-8"))?;
-
-    let reference = crate::shortnames::resolve(&args.reference);
-    ffi::pull(&reference, layout_dir)?;
-    println!("Pulled {}", reference);
+    crate::daemon::ensure_server("")?;
+    crate::daemon::stream_progress("/api/pull", &args.reference)?;
+    println!("Pulled {}", args.reference);
     Ok(())
 }

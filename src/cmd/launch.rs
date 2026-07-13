@@ -10,7 +10,7 @@ use std::process::Command;
 use anyhow::Context;
 use clap::Args;
 
-const SERVER: &str = "http://127.0.0.1:17434";
+use crate::daemon::SERVER;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -38,14 +38,20 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         return Ok(());
     };
 
+    // resolve_ollama_api, not resolve: every integration this launches talks
+    // to serve's Ollama/OpenAI/Anthropic-compat surfaces, all of which
+    // resolve model names the same way (see ensure_model in cmd::serve), so
+    // a bare name here must match what the daemon resolves it to at
+    // request time.
     let model = args
         .model
         .as_deref()
-        .map(|m| crate::shortnames::resolve(m))
+        .map(|m| crate::shortnames::resolve_ollama_api(m))
         .unwrap_or_default();
 
-    // Ensure serve is running (start it in background if needed).
-    ensure_server(&model)?;
+    // Ensure serve is running (start it in background if needed), preloading
+    // the requested model so the integration's first request finds it warm.
+    crate::daemon::ensure_server(&model)?;
 
     launch(name, &model, &args.extra_args)
 }
@@ -137,40 +143,6 @@ fn find_on_path(binary: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-// ---------------------------------------------------------------------------
-// Server lifecycle
-// ---------------------------------------------------------------------------
-
-fn server_alive() -> bool {
-    // Quick synchronous check — don't need async here.
-    std::net::TcpStream::connect("127.0.0.1:17434")
-        .map(|_| true)
-        .unwrap_or(false)
-}
-
-fn ensure_server(model: &str) -> anyhow::Result<()> {
-    if server_alive() {
-        return Ok(());
-    }
-    let exe = std::env::current_exe().context("could not resolve own executable")?;
-    eprintln!("[llmman] starting serve...");
-    let mut cmd = Command::new(&exe);
-    cmd.arg("serve");
-    if !model.is_empty() {
-        cmd.arg(model);
-    }
-    cmd.spawn().context("spawn llmman serve")?;
-
-    // Poll until the server is accepting connections (max 60 s).
-    for _ in 0..120 {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if server_alive() {
-            return Ok(());
-        }
-    }
-    anyhow::bail!("llmman serve did not start within 60 s");
 }
 
 // ---------------------------------------------------------------------------

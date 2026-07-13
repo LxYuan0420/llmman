@@ -33,6 +33,13 @@ pub struct ServeArgs {
     /// Model to pre-load immediately on startup (e.g. hf.co/unsloth/Qwen3.5-0.8B-GGUF:latest)
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
+
+    /// Local store directory (overrides the default). Every client of this
+    /// daemon — the CLI's `pull`/`push`/`run`/`list`/etc. and any Ollama-API
+    /// HTTP client — shares whichever store the daemon was started with;
+    /// there is no per-client override.
+    #[arg(long, value_name = "DIR")]
+    pub store: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -561,7 +568,7 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
 }
 
 async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError> {
-    let model_ref = crate::shortnames::resolve(model_ref);
+    let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
     let model_ref = canonical_ref(&state.0.store_path, &model_ref);
     let model_ref = model_ref.as_str();
 
@@ -1125,6 +1132,11 @@ async fn handle_show(
     // filter out empty strings so we always fall back to whichever field is populated.
     let model_ref = req.name.as_deref().filter(|s| !s.is_empty())
         .unwrap_or(&req.model);
+    // Resolve the same way handle_pull stored it — otherwise a bare name
+    // (e.g. "gemma4", pulled and stored as "docker.io/ai/gemma4") would
+    // never be found by show/delete even though it's in the local store.
+    let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
+    let model_ref = model_ref.as_str();
     eprintln!("[llmman] /api/show model={model_ref:?}");
     let store = OciStore::open(&state.0.store_path)?;
     let desc = store
@@ -1162,7 +1174,7 @@ async fn handle_pull(
     State(state): State<AppState>,
     Json(req): Json<OllamaPullRequest>,
 ) -> impl IntoResponse {
-    let model = crate::shortnames::resolve(&req.model);
+    let model = crate::shortnames::resolve_ollama_api(&req.model);
     eprintln!("[llmman] /api/pull model={model:?}");
     let store_path = state.0.store_path.clone();
 
@@ -1181,9 +1193,6 @@ async fn handle_pull(
     // Not in the local store: actually pull it (the previous behavior only
     // ever 404'd here, so no real Ollama client's "pull if missing, then
     // use" flow — e.g. `ollama run <model>` — ever worked against llmman).
-    // Run the blocking FFI pull on a blocking-pool thread and stream a
-    // "pulling manifest" line immediately, then a heartbeat every 2s until
-    // it finishes, so long downloads don't look hung to the client.
     let model_for_task = model.clone();
     let pull_task = tokio::task::spawn_blocking(move || {
         let layout_dir = store_path
@@ -1192,9 +1201,67 @@ async fn handle_pull(
         crate::ffi::pull(&model_for_task, layout_dir)
     });
 
-    let first_line = serde_json::json!({"status": "pulling manifest"}).to_string() + "\n";
+    stream_ffi_progress(model, "pull", "pulling manifest", pull_task)
+}
+
+// -- Ollama /api/push ---------------------------------------------------------
+// Ollama's own /api/push has no equivalent in llmman's original design (the
+// route didn't exist at all before), but it's the same shape as /api/pull —
+// a streamed NDJSON status sequence — so `llmman push` becoming a thin
+// client of this endpoint (like `llmman pull`) gets both operations onto
+// the exact same Ollama-protocol wire format.
+
+#[derive(Debug, Deserialize)]
+struct OllamaPushRequest {
+    model: String,
+    #[serde(alias = "name", default)]
+    _name: String,
+}
+
+async fn handle_push(
+    State(state): State<AppState>,
+    Json(req): Json<OllamaPushRequest>,
+) -> impl IntoResponse {
+    let model = crate::shortnames::resolve_ollama_api(&req.model);
+    eprintln!("[llmman] /api/push model={model:?}");
+    let store_path = state.0.store_path.clone();
+
+    // Unlike pull, there's nothing sensible to do if the model isn't
+    // already in the local store — push has no "fetch it first" fallback.
+    if OciStore::open(&store_path).and_then(|s| s.find(&model)).is_err() {
+        let body = serde_json::json!({"error": format!("model not found: {model}")});
+        return (StatusCode::NOT_FOUND, Json(body)).into_response();
+    }
+
+    let model_for_task = model.clone();
+    let push_task = tokio::task::spawn_blocking(move || {
+        let layout_dir = store_path
+            .to_str()
+            .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
+        crate::ffi::push(layout_dir, &model_for_task)
+    });
+
+    stream_ffi_progress(model, "push", "retrieving manifest", push_task).into_response()
+}
+
+/// Runs `task` (a blocking FFI call already dispatched via spawn_blocking)
+/// to completion, streaming an immediate `first_status` line, then a
+/// `{"status": "<verb>ing <model>"}` heartbeat every 2s until it finishes,
+/// then a final `{"status": "success"}` or `{"error": ...}` line. Shared by
+/// handle_pull and handle_push. Real per-layer progress (Ollama's
+/// `digest`/`total`/`completed` fields) isn't available: the Go shim's
+/// `llmman_pull`/`llmman_push` are single opaque blocking calls with no
+/// progress callback, so this reports coarse status only — every other
+/// field on api.ProgressResponse is `omitempty` on the client side.
+fn stream_ffi_progress(
+    model: String,
+    verb: &'static str,
+    first_status: &'static str,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> Response {
+    let first_line = serde_json::json!({"status": first_status}).to_string() + "\n";
     let stream = futures::stream::once(futures::future::ready(Bytes::from(first_line)))
-        .chain(futures::stream::unfold(Some(pull_task), move |task| {
+        .chain(futures::stream::unfold(Some(task), move |task| {
             let model = model.clone();
             async move {
                 let mut task = task?;
@@ -1203,12 +1270,12 @@ async fn handle_pull(
                         let line = match result {
                             Ok(Ok(())) => serde_json::json!({"status": "success"}).to_string(),
                             Ok(Err(e)) => serde_json::json!({"error": format!("{e:#}")}).to_string(),
-                            Err(e) => serde_json::json!({"error": format!("pull task panicked: {e}")}).to_string(),
+                            Err(e) => serde_json::json!({"error": format!("{verb} task panicked: {e}")}).to_string(),
                         };
                         Some((Bytes::from(line + "\n"), None))
                     }
                     _ = sleep(Duration::from_secs(2)) => {
-                        let line = serde_json::json!({"status": format!("pulling {model}")}).to_string() + "\n";
+                        let line = serde_json::json!({"status": format!("{verb}ing {model}")}).to_string() + "\n";
                         Some((Bytes::from(line), Some(task)))
                     }
                 }
@@ -1229,8 +1296,10 @@ async fn handle_delete(
 ) -> Result<impl IntoResponse, AppError> {
     let model_ref = req.name.as_deref().filter(|s| !s.is_empty())
         .unwrap_or(&req.model);
+    // See handle_show: resolve the same way handle_pull stored it.
+    let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
     let store = OciStore::open(&state.0.store_path)?;
-    store.remove(model_ref)?;
+    store.remove(&model_ref)?;
     Ok(StatusCode::OK)
 }
 
@@ -1273,7 +1342,7 @@ async fn handle_ollama_generate(
     let is_unload = req.prompt.is_empty() && req.keep_alive.as_ref()
         .and_then(|v| v.as_i64()).map(|n| n == 0).unwrap_or(false);
     if is_unload {
-        let resolved = crate::shortnames::resolve(&req.model);
+        let resolved = crate::shortnames::resolve_ollama_api(&req.model);
         let canonical = canonical_ref(&state.0.store_path, &resolved);
         state.0.manager.lock().await.running.remove(&canonical);
         return Ok(Json(OllamaGenerateChunk {
@@ -1476,7 +1545,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let llama_server_bin = resolve_llama_server()?;
-    let store_path = default_store(None)?;
+    let store_path = default_store(_args.store.as_deref())?;
     let cache_path = store_path
         .parent()
         .unwrap_or(&store_path)
@@ -1508,6 +1577,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .route("/api/ps", get(handle_ps))
         .route("/api/show", post(handle_show))
         .route("/api/pull", post(handle_pull))
+        .route("/api/push", post(handle_push))
         .route("/api/delete", delete(handle_delete))
         .route("/api/chat", post(handle_ollama_chat))
         .route("/api/generate", post(handle_ollama_generate))
@@ -1529,7 +1599,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // If a model was given on the command line, start loading it immediately
     // so the first request finds it already warm.
     if let Some(model) = &_args.model {
-        let model = crate::shortnames::resolve(model);
+        let model = crate::shortnames::resolve_ollama_api(model);
         let state_clone = state.clone();
         tokio::spawn(async move {
             if let Err(e) = ensure_model(&state_clone, &model).await {

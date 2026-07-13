@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod cmd;
+mod daemon;
 mod ffi;
 mod shortnames;
 mod storage;

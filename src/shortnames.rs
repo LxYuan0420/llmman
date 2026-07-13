@@ -144,3 +144,77 @@ pub fn resolve(reference: &str) -> String {
     }
     format!("hf.co/{reference}")
 }
+
+/// Returns true if `reference` is *completely* bare: no "/" (no owner/repo
+/// or registry-host structure) and no "." (no host-like dot and no
+/// dotted-version tag such as "3.5"). This is deliberately stricter than
+/// `has_host` — a HuggingFace-style "owner/repo" reference has a "/" but no
+/// dot, and must NOT be treated as bare here.
+fn is_bare(reference: &str) -> bool {
+    !reference.contains('/') && !reference.contains('.')
+}
+
+/// Resolve `reference` the way every Ollama-API-facing path in `cmd::serve`
+/// does (handle_pull, handle_show, handle_delete, ensure_model, and the
+/// `--model` preload in serve_async): identical to `resolve`, except a
+/// *completely bare* reference — e.g. "gemma4", no "/" and no "." anywhere —
+/// defaults to Docker's official curated-model namespace on Docker Hub,
+/// `docker.io/ai/<reference>` (e.g. "gemma4" -> "docker.io/ai/gemma4"),
+/// instead of `resolve`'s general `hf.co/<reference>` default. Any
+/// reference with more structure than that (an owner/repo path, a URI
+/// scheme, an explicit host, a dotted version like "gemma4:3.5") is left to
+/// `resolve`'s normal rules unchanged.
+///
+/// CLI subcommands that talk to a local server over the Ollama API (pull,
+/// push) go through this same resolution server-side, so the docker.io/ai/
+/// default is consistent regardless of whether a bare name reaches llmman
+/// via the CLI or directly over HTTP.
+pub fn resolve_ollama_api(reference: &str) -> String {
+    if is_bare(reference) {
+        if let Some(mapped) = aliases().get(reference) {
+            return mapped.clone();
+        }
+        return format!("docker.io/ai/{reference}");
+    }
+    resolve(reference)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_ollama_api_defaults_bare_names_to_docker_ai() {
+        assert_eq!(resolve_ollama_api("gemma4"), "docker.io/ai/gemma4");
+        // A tag with no dot is still "bare" by this rule (only "/" and "."
+        // disqualify it) — matches the ai/<name>:<tag> shape on Docker Hub.
+        assert_eq!(resolve_ollama_api("gemma4:e4b"), "docker.io/ai/gemma4:e4b");
+    }
+
+    #[test]
+    fn resolve_ollama_api_leaves_structured_references_to_resolve() {
+        // Owner/repo (has a "/") falls back to resolve()'s hf.co default.
+        assert_eq!(resolve_ollama_api("unsloth/Qwen3.5-0.8B-GGUF"), resolve("unsloth/Qwen3.5-0.8B-GGUF"));
+        // Already has an explicit host.
+        assert_eq!(resolve_ollama_api("hf.co/foo/bar"), "hf.co/foo/bar");
+        assert_eq!(resolve_ollama_api("docker.io/ai/gemma4"), "docker.io/ai/gemma4");
+        // A dot (e.g. a dotted version number) disqualifies "bare" even
+        // without a "/".
+        assert_eq!(resolve_ollama_api("qwen3.5"), resolve("qwen3.5"));
+    }
+
+    #[test]
+    fn resolve_ollama_api_matches_resolve_for_uri_schemes_and_paths() {
+        assert_eq!(resolve_ollama_api("hf://unsloth/Qwen3.5-0.8B-GGUF"), resolve("hf://unsloth/Qwen3.5-0.8B-GGUF"));
+        assert_eq!(resolve_ollama_api("/abs/path/model.gguf"), "/abs/path/model.gguf");
+    }
+
+    #[test]
+    fn is_bare_rejects_slashes_and_dots() {
+        assert!(is_bare("gemma4"));
+        assert!(is_bare("gemma4:e4b"));
+        assert!(!is_bare("unsloth/gemma4"));
+        assert!(!is_bare("qwen3.5"));
+        assert!(!is_bare("hf.co/gemma4"));
+    }
+}
