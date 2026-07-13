@@ -188,7 +188,12 @@ struct AnthropicRequest {
     max_tokens: Option<u32>,
     #[serde(default)]
     stream: bool,
-    system: Option<String>,
+    // Anthropic's real API accepts `system` as either a plain string or an
+    // array of content blocks (the same shape as message content) — real
+    // Claude Code always sends the array form, carrying its system prompt
+    // as one or more {"type":"text","text":"..."} blocks, so a bare
+    // Option<String> here 422s on every real request.
+    system: Option<AnthropicContent>,
     temperature: Option<f32>,
     top_p: Option<f32>,
 }
@@ -1464,7 +1469,7 @@ async fn handle_anthropic_messages(
     if let Some(sys) = &req.system {
         messages.push(OAIMessage {
             role: "system".into(),
-            content: sys.clone(),
+            content: sys.as_text(),
         });
     }
     for m in &req.messages {
