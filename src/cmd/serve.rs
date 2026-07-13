@@ -1142,9 +1142,14 @@ async fn handle_show(
 }
 
 // -- Ollama /api/pull ---------------------------------------------------------
-// Clients (e.g. `ollama run`) call this to pull a model.  We don't download
-// anything here — the model must already be in the local store — but we need
-// to return a valid streaming success response so the client proceeds.
+// Mirrors `ollama.PullHandler`: streams newline-delimited JSON status objects
+// (`{"status": "..."}`, matching api.ProgressResponse) ending in either
+// `{"status": "success"}` or `{"error": "..."}`. Real Ollama also reports
+// per-layer `digest`/`total`/`completed` fields for a byte-level progress
+// bar; the Go shim's `llmman_pull` is a single opaque blocking call with no
+// progress callback, so this reports coarse status only — every field is
+// `omitempty` on the client side, so callers that only render `status` (as
+// `llmman pull`'s own CLI progress text does) see accurate text throughout.
 
 #[derive(Debug, Deserialize)]
 struct OllamaPullRequest {
@@ -1159,24 +1164,63 @@ async fn handle_pull(
 ) -> impl IntoResponse {
     let model = crate::shortnames::resolve(&req.model);
     eprintln!("[llmman] /api/pull model={model:?}");
-    let store = match OciStore::open(&state.0.store_path) {
-        Ok(s) => s,
-        Err(e) => {
-            let body = serde_json::json!({"error": format!("{e:#}")});
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(body).into_response());
-        }
-    };
-    let found = store.find(&model).is_ok();
-    if found {
-        // Model already in store — stream a single "success" status line.
+    let store_path = state.0.store_path.clone();
+
+    let already_present = OciStore::open(&store_path)
+        .and_then(|s| s.find(&model))
+        .is_ok();
+    if already_present {
         let line = serde_json::json!({"status": "success"}).to_string() + "\n";
-        return (StatusCode::OK, axum::response::Response::builder()
+        return Response::builder()
+            .status(StatusCode::OK)
             .header("content-type", "application/x-ndjson")
             .body(Body::from(line))
-            .unwrap());
+            .unwrap();
     }
-    let body = serde_json::json!({"error": format!("model not found: {model}")});
-    (StatusCode::NOT_FOUND, Json(body).into_response())
+
+    // Not in the local store: actually pull it (the previous behavior only
+    // ever 404'd here, so no real Ollama client's "pull if missing, then
+    // use" flow — e.g. `ollama run <model>` — ever worked against llmman).
+    // Run the blocking FFI pull on a blocking-pool thread and stream a
+    // "pulling manifest" line immediately, then a heartbeat every 2s until
+    // it finishes, so long downloads don't look hung to the client.
+    let model_for_task = model.clone();
+    let pull_task = tokio::task::spawn_blocking(move || {
+        let layout_dir = store_path
+            .to_str()
+            .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
+        crate::ffi::pull(&model_for_task, layout_dir)
+    });
+
+    let first_line = serde_json::json!({"status": "pulling manifest"}).to_string() + "\n";
+    let stream = futures::stream::once(futures::future::ready(Bytes::from(first_line)))
+        .chain(futures::stream::unfold(Some(pull_task), move |task| {
+            let model = model.clone();
+            async move {
+                let mut task = task?;
+                tokio::select! {
+                    result = &mut task => {
+                        let line = match result {
+                            Ok(Ok(())) => serde_json::json!({"status": "success"}).to_string(),
+                            Ok(Err(e)) => serde_json::json!({"error": format!("{e:#}")}).to_string(),
+                            Err(e) => serde_json::json!({"error": format!("pull task panicked: {e}")}).to_string(),
+                        };
+                        Some((Bytes::from(line + "\n"), None))
+                    }
+                    _ = sleep(Duration::from_secs(2)) => {
+                        let line = serde_json::json!({"status": format!("pulling {model}")}).to_string() + "\n";
+                        Some((Bytes::from(line), Some(task)))
+                    }
+                }
+            }
+        }))
+        .map(Ok::<_, std::convert::Infallible>);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .unwrap()
 }
 
 async fn handle_delete(
