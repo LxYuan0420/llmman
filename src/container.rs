@@ -166,18 +166,38 @@ fn detect_vulkan() -> bool {
         .unwrap_or(false)
 }
 
-/// Runs `llama-server` inside a container: `docker run -d` (or
-/// `podman run -d`), auto-selecting the image for whatever
-/// [`detect_backend`] found. Returns the running container's id.
+/// Runs `llama-server` inside a container: `docker run --rm --init -t`
+/// (or `podman run` with the same flags), auto-selecting the image for
+/// whatever [`detect_backend`] found. Returns the running child process
+/// (the attached `docker`/`podman` CLI itself, not the container) — the
+/// container's own stdio is inherited through it, same as a local
+/// `llama-server` child's would be.
 ///
-/// Unlike a local `llama-server` child process (killed via
-/// `Child::kill_on_drop`), the caller must explicitly
-/// `docker/podman rm -f <id>` this container when the model is unloaded
-/// (see `stop` below) — killing the `docker run` CLI process here would
-/// not stop the container it started, since the container lives in the
-/// engine daemon's own process tree, detached from the CLI that launched
-/// it, not as a child of this process.
-pub async fn spawn(conman: ContainerManager, model_path: &Path, port: u16) -> Result<String> {
+/// This runs *attached* (no `-d`) specifically so it can be managed like
+/// a normal child process: `--init` runs a real init (tini) as the
+/// container's PID 1, so SIGTERM forwarded to it (e.g. via `docker stop`,
+/// or the CLI's own signal forwarding while attached) is actually
+/// delivered with default disposition and terminates the container
+/// promptly — a bare `sleep`/`llama-server` running *as* PID 1 (no
+/// `--init`) does not get default signal handling at all, a well-known
+/// Linux PID-1 gotcha, and was verified live to leave the container
+/// running indefinitely after being sent SIGTERM. `--rm` then cleans up
+/// the stopped container automatically. `-t` allocates a pseudo-tty so
+/// the containerized process's own output behaves like a normal
+/// interactive process (typically line-buffered) instead of block image
+/// buffered as it would through a plain pipe — deliberately *not* paired
+/// with `-i`: `-i` needs an actual open, readable stdin to attach, which
+/// fails ("cannot attach stdin to a TTY-enabled container because stdin
+/// is not a terminal") when combined with `-t` and this process's own
+/// stdin isn't a real terminal — the common case, since `llmman serve`
+/// itself is normally daemonized with stdin closed (see daemon.rs).
+///
+/// Callers must stop this gracefully (SIGTERM, not the default
+/// `Child::kill()`/`kill_on_drop`, which sends SIGKILL) — see
+/// `cmd::serve::ModelProcess`'s Drop impl. SIGKILL cannot be caught or
+/// forwarded by the CLI process at all (that's what SIGKILL means), so
+/// it was also verified live to leave the container running.
+pub fn spawn(conman: ContainerManager, model_path: &Path, port: u16) -> Result<tokio::process::Child> {
     let backend = detect_backend();
     eprintln!(
         "[llmman] {}: detected {:?}, using image tag {:?}",
@@ -201,7 +221,9 @@ pub async fn spawn(conman: ContainerManager, model_path: &Path, port: u16) -> Re
 
     let mut args: Vec<String> = vec![
         "run".into(),
-        "-d".into(),
+        "--rm".into(),
+        "--init".into(),
+        "-t".into(),
         "-p".into(),
         format!("127.0.0.1:{port}:{port}"),
         "-v".into(),
@@ -218,51 +240,41 @@ pub async fn spawn(conman: ContainerManager, model_path: &Path, port: u16) -> Re
         "0.0.0.0".into(),
     ]);
 
-    let output = tokio::process::Command::new(conman.binary())
+    tokio::process::Command::new(conman.binary())
         .args(&args)
-        .output()
-        .await
-        .with_context(|| format!("run {} {}", conman.binary(), args.join(" ")))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "{} {} failed: {}",
-            conman.binary(),
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if container_id.is_empty() {
-        anyhow::bail!("{} run produced no container id", conman.binary());
-    }
-    Ok(container_id)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn {} {}", conman.binary(), args.join(" ")))
 }
 
-/// Force-stops and removes a container started by [`spawn`]. Best-effort:
-/// called from a synchronous `Drop` impl (see `ModelProcess` in
-/// cmd::serve), so errors are only logged, never propagated.
-pub fn stop(conman: ContainerManager, container_id: &str) {
-    let result = std::process::Command::new(conman.binary())
-        .args(["rm", "-f", container_id])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output();
-    match result {
-        Ok(output) if !output.status.success() => {
-            eprintln!(
-                "[llmman] warning: {} rm -f {container_id} failed: {}",
-                conman.binary(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "[llmman] warning: {} rm -f {container_id} failed: {e}",
-                conman.binary()
-            );
-        }
-        Ok(_) => {}
+/// Gracefully stops a container started by [`spawn`] by sending SIGTERM to
+/// the attached `docker`/`podman` CLI process — see `spawn`'s doc comment
+/// for why this must be SIGTERM (forwarded to the container's `--init`
+/// PID 1) and not the default forceful kill. Best-effort: called from a
+/// synchronous `Drop` impl (see `ModelProcess` in cmd::serve), so errors
+/// are only logged, never propagated. Unix only (matching `--conman`
+/// itself, which cmd::serve::serve_async already rejects on other
+/// platforms) — `libc::kill` is not meaningful on Windows.
+#[cfg(unix)]
+pub fn stop(pid: u32) {
+    // SAFETY: kill(2) with an existing pid and a valid signal number is
+    // always safe to call; a stale/already-reaped pid just returns ESRCH,
+    // which is not a memory-safety concern.
+    let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if result != 0 {
+        let err = std::io::Error::last_os_error();
+        eprintln!("[llmman] warning: SIGTERM to container process {pid} failed: {err}");
     }
+}
+
+/// Unreachable in practice (`--conman` is rejected on non-Linux before
+/// `spawn` is ever called — see cmd::serve::serve_async), but this needs
+/// to compile on every platform llmman ships for, and a plain forceful
+/// kill here is at least no worse than the SIGKILL callers were already
+/// relying on before this module existed.
+#[cfg(not(unix))]
+pub fn stop(_pid: u32) {
+    eprintln!("[llmman] warning: container::stop is a no-op on non-Unix platforms");
 }
 
 #[cfg(test)]

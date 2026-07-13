@@ -77,22 +77,23 @@ struct RunningModel {
     port: u16,
 }
 
-/// A running inference backend: either a local child process (killed via
-/// `Child::kill_on_drop`, as before) or a container (explicitly stopped and
-/// removed on drop — see its own Drop impl for why killing a `docker run`
-/// CLI process doesn't stop the container it started).
+/// A running inference backend: either a local `llama-server`/`vllm`
+/// process (killed via `Child::kill_on_drop`, as before, set at spawn
+/// time) or an attached `docker run --rm --init -t`/`podman run` process
+/// (see crate::container::spawn's doc comment) — gracefully stopped via
+/// SIGTERM on drop, since the default forceful kill `kill_on_drop` would
+/// use cannot be forwarded to (and so does not stop) the container.
 enum ModelProcess {
     Local(#[allow(dead_code)] tokio::process::Child),
-    Container {
-        conman: crate::container::ContainerManager,
-        id: String,
-    },
+    Container(tokio::process::Child),
 }
 
 impl Drop for ModelProcess {
     fn drop(&mut self) {
-        if let ModelProcess::Container { conman, id } = self {
-            crate::container::stop(*conman, id);
+        if let ModelProcess::Container(child) = self {
+            if let Some(pid) = child.id() {
+                crate::container::stop(pid);
+            }
         }
     }
 }
@@ -651,8 +652,7 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
     eprintln!("[llmman] loading {model_ref} on port {port}");
     let process = match (&model_path, state.0.conman) {
         (ModelPath::Gguf(path), Some(conman)) => {
-            let id = crate::container::spawn(conman, path, port).await?;
-            ModelProcess::Container { conman, id }
+            ModelProcess::Container(crate::container::spawn(conman, path, port)?)
         }
         (ModelPath::Gguf(path), None) => {
             let bin = state.0.llama_server_bin.as_deref().ok_or_else(|| {
