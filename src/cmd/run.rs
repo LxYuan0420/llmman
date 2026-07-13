@@ -20,13 +20,10 @@ use std::io::{self, IsTerminal, Write};
 
 use anyhow::Context;
 use clap::Args;
-use futures::StreamExt;
-use reqwest::Client;
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncBufReadExt;
-use tokio::time::{sleep, Duration, Instant};
 
-const SERVER: &str = "http://127.0.0.1:17434";
+use crate::daemon::SERVER;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -42,7 +39,7 @@ pub struct RunArgs {
 
 pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     // resolve_ollama_api, not resolve: `llmman run` is an /api/chat client
-    // (see run_oneshot/run_interactive_tty below), so a bare name must
+    // (see chat_submit/run_interactive_tty below), so a bare name must
     // resolve the same way it would if requested directly over the Ollama
     // API — otherwise a name resolved here, then handed to ensure_server as
     // a --model preload and to every /api/chat request this sends, is no
@@ -52,10 +49,13 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     let model = crate::shortnames::resolve_ollama_api(&args.model);
     let prompt = args.prompt.join(" ");
 
-    // Ensure serve is running before anything else.
-    let rt = tokio::runtime::Runtime::new()?;
-    let async_client = Client::new();
-    rt.block_on(ensure_server(&async_client, &model))?;
+    // Starts `llmman serve` detached, left running indefinitely, if one
+    // isn't already reachable — the same shared helper pull/push/launch
+    // use (see daemon::ensure_server's doc comment for why stdio is
+    // redirected there: without it, this command would hang forever
+    // waiting for the (never-exiting) daemon's inherited stdout/stderr
+    // pipes to close).
+    crate::daemon::ensure_server(&model)?;
 
     let interactive = prompt.is_empty() && io::stdin().is_terminal();
 
@@ -70,51 +70,23 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
             prompt
         };
         if !p.is_empty() {
-            rt.block_on(run_oneshot(&async_client, &model, &p))?;
+            // A single-turn "conversation" over /api/chat — the same
+            // endpoint, and the same chat_submit helper, interactive mode
+            // uses below. Ollama's own CLI uses /api/generate for one-shot
+            // prompts and /api/chat for its interactive REPL, but keeping
+            // every mode in this file on one endpoint means there's a
+            // single wire-format implementation to maintain here, and it
+            // works identically against llmman or a real Ollama install
+            // either way (both expose /api/chat).
+            let client = Client::new();
+            chat_submit(&client, &model, &mut Vec::new(), p)?;
         }
         Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Server lifecycle
-// ---------------------------------------------------------------------------
-
-async fn server_alive(client: &Client) -> bool {
-    client
-        .get(SERVER)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .is_ok()
-}
-
-async fn ensure_server(client: &Client, model: &str) -> anyhow::Result<()> {
-    if server_alive(client).await {
-        return Ok(());
-    }
-    let exe = std::env::current_exe().context("could not resolve own executable")?;
-    eprintln!("[llmman] starting serve...");
-    tokio::process::Command::new(&exe)
-        .arg("serve")
-        .arg(model)
-        .kill_on_drop(false)
-        .spawn()
-        .context("spawn llmman serve")?;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if Instant::now() > deadline {
-            anyhow::bail!("llmman serve did not start within 60 s");
-        }
-        if server_alive(client).await {
-            return Ok(());
-        }
-        sleep(Duration::from_millis(300)).await;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Wire types (shared between async one-shot and sync interactive)
+// Wire types
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,79 +110,6 @@ struct ChatChunk {
     message: Option<Msg>,
     #[serde(default)]
     done: bool,
-}
-
-#[derive(Serialize)]
-struct GenReq<'a> {
-    model: &'a str,
-    prompt: &'a str,
-    stream: bool,
-}
-
-#[derive(Deserialize)]
-struct GenChunk {
-    #[serde(default)]
-    response: String,
-    #[serde(default)]
-    thinking: Option<String>,
-    #[serde(default)]
-    done: bool,
-}
-
-// ---------------------------------------------------------------------------
-// One-shot (async streaming)
-// ---------------------------------------------------------------------------
-
-async fn run_oneshot(client: &Client, model: &str, prompt: &str) -> anyhow::Result<()> {
-    let resp = client
-        .post(&format!("{SERVER}/api/generate"))
-        .json(&GenReq { model, prompt, stream: true })
-        .send()
-        .await
-        .context("connect to llmman serve")?;
-    if !resp.status().is_success() {
-        anyhow::bail!("{}", resp.text().await.unwrap_or_default());
-    }
-    let mut thinking_open = false;
-    stream_lines(resp, |line| {
-        let Ok(chunk) = serde_json::from_str::<GenChunk>(line) else { return };
-        if let Some(ref t) = chunk.thinking {
-            if !t.is_empty() {
-                if !thinking_open {
-                    eprint!("Thinking: ");
-                    thinking_open = true;
-                }
-                eprint!("{t}");
-            }
-        }
-        if !chunk.response.is_empty() && thinking_open {
-            eprintln!();
-            thinking_open = false;
-        }
-        if !chunk.response.is_empty() {
-            print!("{}", chunk.response);
-            io::stdout().flush().ok();
-        }
-    })
-    .await?;
-    println!("\n");
-    Ok(())
-}
-
-async fn stream_lines(
-    resp: reqwest::Response,
-    mut f: impl FnMut(&str),
-) -> anyhow::Result<()> {
-    use tokio_util::io::StreamReader;
-    let body = resp
-        .bytes_stream()
-        .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-    let reader = StreamReader::new(body);
-    let mut lines = tokio::io::BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await? {
-        f(&line);
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -340,8 +239,9 @@ fn run_interactive_unix(model: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Send one chat turn using the blocking reqwest client and stream the response.
-#[cfg(unix)]
+/// Send one chat turn using the blocking reqwest client and stream the
+/// response. Platform-agnostic (used by one-shot mode, the Unix
+/// raw-mode REPL, and the Windows/non-TTY cooked-mode fallback below).
 fn chat_submit(
     client: &reqwest::blocking::Client,
     model: &str,
@@ -660,43 +560,8 @@ fn run_interactive_cooked(model: &str) -> anyhow::Result<()> {
             _ => {}
         }
         if !line.trim().is_empty() {
-            #[cfg(unix)]
             chat_submit(&client, model, &mut messages, line)?;
-            #[cfg(not(unix))]
-            chat_submit_win(&client, model, &mut messages, line)?;
         }
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn chat_submit_win(
-    client: &reqwest::blocking::Client,
-    model: &str,
-    messages: &mut Vec<Msg>,
-    content: String,
-) -> anyhow::Result<()> {
-    messages.push(Msg { role: "user".into(), content, thinking: None });
-    let resp = client
-        .post(&format!("{SERVER}/api/chat"))
-        .json(&ChatReq { model, messages, stream: true })
-        .send()?;
-    use std::io::BufRead;
-    let mut full = String::new();
-    for line in std::io::BufReader::new(resp).lines() {
-        let line = line?;
-        if line.is_empty() { continue; }
-        let Ok(chunk) = serde_json::from_str::<ChatChunk>(&line) else { continue };
-        if let Some(ref msg) = chunk.message {
-            if !msg.content.is_empty() {
-                print!("{}", msg.content);
-                io::stdout().flush().ok();
-                full.push_str(&msg.content);
-            }
-        }
-        if chunk.done { break; }
-    }
-    println!("\n");
-    messages.push(Msg { role: "assistant".into(), content: full, thinking: None });
     Ok(())
 }
