@@ -207,6 +207,35 @@ fn detect_vulkan() -> bool {
 /// stdin isn't a real terminal — the common case, since `llmman serve`
 /// itself is normally daemonized with stdin closed (see daemon.rs).
 ///
+/// Pulls the image [`spawn`] would run for the current host's detected GPU
+/// backend, with the pull's own progress output (a real `docker pull`/
+/// `podman pull` progress bar — not something llmman re-implements)
+/// inherited directly to this process's stdout/stderr.
+///
+/// `spawn`'s underlying `docker run`/`podman run` would pull an image that
+/// isn't already cached locally on its own, but silently and without any
+/// visible progress from the caller's perspective (its own stdio is
+/// redirected to a log file when started detached — see daemon.rs and
+/// cmd::serve). A caller that wants to warm this up as its own distinct,
+/// visible step first (typically right before starting `llmman serve
+/// --conman ...` detached, so a slow first pull doesn't look like a stuck
+/// first prompt to whoever's waiting on it) should call this — in the
+/// foreground, before `serve` is even started — rather than relying on
+/// `spawn`'s own implicit pull.
+pub fn pull_image(conman: ContainerManager, llama_cpp_version: Option<&str>) -> Result<()> {
+    let backend = detect_backend();
+    let image = backend.image_ref(llama_cpp_version);
+    eprintln!("[llmman] {}: pulling {image}...", conman.binary());
+    let status = std::process::Command::new(conman.binary())
+        .args(["pull", &image])
+        .status()
+        .with_context(|| format!("run {} pull {image}", conman.binary()))?;
+    if !status.success() {
+        anyhow::bail!("{} pull {image} failed", conman.binary());
+    }
+    Ok(())
+}
+
 /// Callers must stop this gracefully (SIGTERM, not the default
 /// `Child::kill()`/`kill_on_drop`, which sends SIGKILL) — see
 /// `cmd::serve::ModelProcess`'s Drop impl. SIGKILL cannot be caught or

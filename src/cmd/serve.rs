@@ -58,6 +58,23 @@ pub struct ServeArgs {
     /// explicitly if you want reproducible behavior across runs.
     #[arg(long, value_name = "TAG", requires = "conman")]
     pub llama_cpp_version: Option<String>,
+
+    /// Proactively pull the ghcr.io/ggml-org/llama.cpp image `--conman`
+    /// would run, in the foreground before listening starts, with the
+    /// pull's own progress (a real `docker pull`/`podman pull` progress
+    /// bar) inherited directly to this process's stdout/stderr — only
+    /// meaningful together with --conman, ignored otherwise.
+    ///
+    /// `--conman`'s underlying `docker run`/`podman run` pulls an image
+    /// that isn't already cached on its own, but silently: `serve` is
+    /// normally started detached (see daemon.rs), its stdio redirected to
+    /// a log file, so a caller waiting on the first request that actually
+    /// needs the container (the first real prompt) sees nothing happen
+    /// for however long a multi-hundred-MB-to-GB image pull takes —
+    /// indistinguishable from a hang. `--pull-oci` does that pull here
+    /// instead, before this process's stdio is ever redirected.
+    #[arg(long, requires = "conman")]
+    pub pull_oci: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1726,6 +1743,13 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     if _args.conman.is_some() && !cfg!(target_os = "linux") {
         anyhow::bail!("--conman is only supported on Linux");
+    }
+    // Must happen before daemon.rs's caller (if any) redirects this
+    // process's stdio to a log file — see ServeArgs::pull_oci's doc
+    // comment for why that would otherwise hide the pull's progress.
+    if _args.pull_oci {
+        let conman = _args.conman.context("--pull-oci requires --conman")?;
+        crate::container::pull_image(conman, _args.llama_cpp_version.as_deref())?;
     }
     // Only resolve (and require) a local llama-server binary when it'll
     // actually be used: --conman runs llama-server in a container instead,
