@@ -266,6 +266,18 @@ impl OciStore {
             .ok_or_else(|| anyhow!("image not found: {}", reference))
     }
 
+    /// The real total size of an image: the sum of its layer sizes, not
+    /// `desc.size` (a `Descriptor`'s own `size` field is the *manifest
+    /// blob's* size — just a few hundred bytes of JSON — not the image's
+    /// actual content size). Falls back to `desc.size` if the manifest
+    /// can't be read, so callers still get *something* rather than an
+    /// error over what's only ever used for display.
+    pub fn total_size(&self, desc: &Descriptor) -> u64 {
+        self.read_manifest(&desc.digest)
+            .map(|manifest| manifest.layers.iter().map(|l| l.size).sum())
+            .unwrap_or(desc.size)
+    }
+
     // ------------------------------------------------------------------
     // List / Remove
     // ------------------------------------------------------------------
@@ -287,12 +299,7 @@ impl OciStore {
                     .ok()
                     .and_then(|p| fs::metadata(p).ok())
                     .and_then(|meta| meta.modified().ok());
-                // Sum the layer sizes from the manifest rather than using the
-                // manifest blob size (which is only a few hundred bytes).
-                let size = self
-                    .read_manifest(&m.digest)
-                    .map(|manifest| manifest.layers.iter().map(|l| l.size).sum())
-                    .unwrap_or(m.size);
+                let size = self.total_size(&m);
                 ImageSummary {
                     reference,
                     digest: m.digest,

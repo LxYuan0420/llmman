@@ -83,9 +83,50 @@ struct ModelManager {
     running: HashMap<String, RunningModel>,
 }
 
+/// Everything `handle_ps` (and, transitively, `llmman ps`) needs to know
+/// about a running model — see cmd::ps for the CLI side of this.
 struct RunningModel {
-    _process: ModelProcess,
+    process: ModelProcess,
     port: u16,
+    /// Full manifest digest (e.g. "sha256:abcd...") from the OCI store,
+    /// captured at load time (see resolve_model's caller in ensure_model).
+    digest: String,
+    /// GGUF file size in bytes; 0 for a safetensors dir (vllm) — walking a
+    /// multi-file safetensors directory isn't worth the cost just for
+    /// `ps` output today.
+    size: u64,
+    started_at: String,
+}
+
+/// Which engine is actually serving requests for a [`RunningModel`] — surfaced
+/// in `llmman ps`'s PROCESSOR column since, unlike Ollama's embedded
+/// inference engine, llmman shells out to one of several different ones and
+/// none of them report GPU/CPU memory split back to llmman, so there's no
+/// equivalent of Ollama's "100% GPU"/"N%/N% CPU/GPU" figure to show here —
+/// only which engine, and (for containers) which engine manager, is running.
+impl RunningModel {
+    fn processor(&self) -> String {
+        match &self.process {
+            ModelProcess::Local(Engine::LlamaServer, _) => "llama-server (local)".into(),
+            ModelProcess::Local(Engine::Vllm, _) => "vllm (local)".into(),
+            ModelProcess::Container(conman, _) => format!("llama-server (container/{})", conman.binary()),
+        }
+    }
+
+    fn pid(&self) -> Option<u32> {
+        match &self.process {
+            ModelProcess::Local(_, child) => child.id(),
+            ModelProcess::Container(_, child) => child.id(),
+        }
+    }
+}
+
+/// Which local engine a [`ModelProcess::Local`] is running — see
+/// [`RunningModel::processor`].
+#[derive(Clone, Copy, Debug)]
+enum Engine {
+    LlamaServer,
+    Vllm,
 }
 
 /// A running inference backend: either a local `llama-server`/`vllm`
@@ -95,13 +136,13 @@ struct RunningModel {
 /// SIGTERM on drop, since the default forceful kill `kill_on_drop` would
 /// use cannot be forwarded to (and so does not stop) the container.
 enum ModelProcess {
-    Local(#[allow(dead_code)] tokio::process::Child),
-    Container(tokio::process::Child),
+    Local(Engine, #[allow(dead_code)] tokio::process::Child),
+    Container(crate::container::ContainerManager, tokio::process::Child),
 }
 
 impl Drop for ModelProcess {
     fn drop(&mut self) {
-        if let ModelProcess::Container(child) = self {
+        if let ModelProcess::Container(_, child) = self {
             if let Some(pid) = child.id() {
                 crate::container::stop(pid);
             }
@@ -198,8 +239,17 @@ struct OllamaPsResponse {
 struct OllamaRunningModelInfo {
     name: String,
     model: String,
+    // Real Ollama /api/ps shape ends here (see api.ProcessModelResponse in
+    // ollama/api/types.go); the fields below are llmman-specific additions
+    // for `llmman ps` — safe for any other Ollama-API client to ignore.
+    digest: String,
     size: u64,
     size_vram: u64,
+    pid: Option<u32>,
+    port: u16,
+    processor: String,
+    context_length: Option<u64>,
+    started_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -659,31 +709,47 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
     }
     let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
         .with_context(|| format!("resolve model {model_ref}"))?;
+    // Best-effort — used only to populate `llmman ps`'s ID/SIZE columns;
+    // resolve_model above already established the model exists, so a
+    // failure here (e.g. a race with a concurrent `rm`) just means those
+    // columns show as empty/zero rather than failing the whole request.
+    let (digest, size) = OciStore::open(&state.0.store_path)
+        .and_then(|s| s.find(model_ref).map(|d| {
+            let size = s.total_size(&d);
+            (d.digest, size)
+        }))
+        .unwrap_or_default();
     let port = find_free_port()?;
     eprintln!("[llmman] loading {model_ref} on port {port}");
     let process = match (&model_path, state.0.conman) {
         (ModelPath::Gguf(path), Some(conman)) => {
-            ModelProcess::Container(crate::container::spawn(
+            ModelProcess::Container(
                 conman,
-                path,
-                port,
-                state.0.llama_cpp_version.as_deref(),
-            )?)
+                crate::container::spawn(conman, path, port, state.0.llama_cpp_version.as_deref())?,
+            )
         }
         (ModelPath::Gguf(path), None) => {
             let bin = state.0.llama_server_bin.as_deref().ok_or_else(|| {
                 anyhow!("no local llama-server binary resolved and --conman was not set")
             })?;
-            ModelProcess::Local(spawn_llama_server(bin, path, port).await?)
+            ModelProcess::Local(Engine::LlamaServer, spawn_llama_server(bin, path, port).await?)
         }
         (ModelPath::SafeTensors(dir), _) => {
-            ModelProcess::Local(spawn_vllm_server(dir, port, model_ref).await?)
+            ModelProcess::Local(Engine::Vllm, spawn_vllm_server(dir, port, model_ref).await?)
         }
     };
     wait_for_ready(&state.0.client, port).await?;
     eprintln!("[llmman] {model_ref} ready on port {port}");
-    mgr.running
-        .insert(model_ref.to_string(), RunningModel { _process: process, port });
+    mgr.running.insert(
+        model_ref.to_string(),
+        RunningModel {
+            process,
+            port,
+            digest,
+            size,
+            started_at: now_rfc3339(),
+        },
+    );
     Ok(port)
 }
 
@@ -1170,19 +1236,72 @@ async fn handle_tags(State(state): State<AppState>) -> Result<impl IntoResponse,
     Ok(Json(OllamaTagsResponse { models }))
 }
 
+/// The subset of a [`RunningModel`] `handle_ps` needs, cloned out while
+/// holding `manager`'s lock (see `handle_ps`) so the per-model `/props`
+/// round trips afterward don't hold that lock for the duration.
+struct PsEntry {
+    name: String,
+    digest: String,
+    size: u64,
+    port: u16,
+    pid: Option<u32>,
+    processor: String,
+    started_at: String,
+}
+
 async fn handle_ps(State(state): State<AppState>) -> impl IntoResponse {
-    let mgr = state.0.manager.lock().await;
-    let models = mgr
-        .running
-        .keys()
-        .map(|k| OllamaRunningModelInfo {
-            name: k.clone(),
-            model: k.clone(),
-            size: 0,
-            size_vram: 0,
-        })
-        .collect();
+    let entries: Vec<PsEntry> = {
+        let mgr = state.0.manager.lock().await;
+        mgr.running
+            .iter()
+            .map(|(name, m)| PsEntry {
+                name: name.clone(),
+                digest: m.digest.clone(),
+                size: m.size,
+                port: m.port,
+                pid: m.pid(),
+                processor: m.processor(),
+                started_at: m.started_at.clone(),
+            })
+            .collect()
+    };
+
+    let mut models = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let context_length = query_context_length(&state.0.client, entry.port).await;
+        models.push(OllamaRunningModelInfo {
+            name: entry.name.clone(),
+            model: entry.name,
+            digest: entry.digest,
+            size: entry.size,
+            size_vram: 0, // not tracked — see RunningModel::processor's doc comment
+            pid: entry.pid,
+            port: entry.port,
+            processor: entry.processor,
+            context_length,
+            started_at: entry.started_at,
+        });
+    }
     Json(OllamaPsResponse { models })
+}
+
+/// Best-effort live context-length lookup via the running llama-server's own
+/// `/props` endpoint (`default_generation_settings.n_ctx`) — mirrors
+/// Ollama's own preference for live runner data over anything cached (see
+/// server.PsHandler's use of `v.llama.ContextLength()`). Returns `None` on
+/// any failure (short timeout, connection error, unexpected shape, or a
+/// vllm-backed model, which doesn't expose this endpoint at all) rather
+/// than failing the whole `ps` response over one unreachable model.
+async fn query_context_length(client: &Client, port: u16) -> Option<u64> {
+    let url = format!("http://127.0.0.1:{port}/props");
+    let resp = client
+        .get(&url)
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await
+        .ok()?;
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("default_generation_settings")?.get("n_ctx")?.as_u64()
 }
 
 async fn handle_show(

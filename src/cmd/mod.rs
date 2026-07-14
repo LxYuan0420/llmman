@@ -5,6 +5,7 @@ pub mod inspect;
 pub mod list;
 pub mod login;
 pub mod logout;
+pub mod ps;
 pub mod pull;
 pub mod push;
 pub mod rm;

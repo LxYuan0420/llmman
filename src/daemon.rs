@@ -170,3 +170,17 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// A plain `GET {SERVER}{path}` returning the parsed JSON body — for
+/// callers (currently just `ps`) that don't need `stream_progress`'s
+/// newline-delimited-JSON streaming, just a single request/response.
+pub fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
+    let resp = reqwest::blocking::get(format!("{SERVER}{path}"))
+        .with_context(|| format!("request {path}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!("{path}: server returned {status}: {body}");
+    }
+    resp.json().with_context(|| format!("parse response from {path}"))
+}

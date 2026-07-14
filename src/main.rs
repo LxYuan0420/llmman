@@ -4,6 +4,7 @@ mod cmd;
 mod container;
 mod daemon;
 mod ffi;
+mod fmt;
 mod shortnames;
 mod storage;
 pub mod webui;
@@ -47,6 +48,8 @@ enum Commands {
     /// List locally stored images
     #[command(alias = "ls")]
     List(cmd::list::ListArgs),
+    /// List models currently loaded by a running `llmman serve`
+    Ps(cmd::ps::PsArgs),
     /// Remove a local image
     Rm(cmd::rm::RmArgs),
     /// Show the manifest of a local (or remote with --remote) image
@@ -72,6 +75,7 @@ fn main() {
         Commands::Push(a)    => cmd::push::run(a),
         Commands::Pull(a)    => cmd::pull::run(a),
         Commands::List(a)    => cmd::list::run(a),
+        Commands::Ps(a)      => cmd::ps::run(a),
         Commands::Rm(a)      => cmd::rm::run(a),
         Commands::Inspect(a) => cmd::inspect::run(a),
         Commands::Serve(a)   => cmd::serve::run(a),
