@@ -48,6 +48,16 @@ pub struct ServeArgs {
     /// llama-server binary is required on PATH when this is set.
     #[arg(long, value_name = "docker|podman")]
     pub conman: Option<crate::container::ContainerManager>,
+
+    /// Pin the ghcr.io/ggml-org/llama.cpp container image to a specific
+    /// release tag (e.g. b9994) instead of the floating server/server-cuda/
+    /// ... tags — only meaningful together with --conman, ignored
+    /// otherwise. llmman itself has no default or opinion here: pick a
+    /// tag that's actually published for every backend variant you might
+    /// run (see docs/docker.md in ggml-org/llama.cpp) and pass it
+    /// explicitly if you want reproducible behavior across runs.
+    #[arg(long, value_name = "TAG", requires = "conman")]
+    pub llama_cpp_version: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +73,7 @@ struct Inner {
     // no local binary is resolved (or required on PATH) at all.
     llama_server_bin: Option<PathBuf>,
     conman: Option<crate::container::ContainerManager>,
+    llama_cpp_version: Option<String>,
     store_path: PathBuf,
     cache_path: PathBuf,
     client: Client,
@@ -652,7 +663,12 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
     eprintln!("[llmman] loading {model_ref} on port {port}");
     let process = match (&model_path, state.0.conman) {
         (ModelPath::Gguf(path), Some(conman)) => {
-            ModelProcess::Container(crate::container::spawn(conman, path, port)?)
+            ModelProcess::Container(crate::container::spawn(
+                conman,
+                path,
+                port,
+                state.0.llama_cpp_version.as_deref(),
+            )?)
         }
         (ModelPath::Gguf(path), None) => {
             let bin = state.0.llama_server_bin.as_deref().ok_or_else(|| {
@@ -1613,6 +1629,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         }),
         llama_server_bin,
         conman: _args.conman,
+        llama_cpp_version: _args.llama_cpp_version.clone(),
         store_path,
         cache_path,
         client: Client::new(),

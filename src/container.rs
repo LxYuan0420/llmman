@@ -64,6 +64,21 @@ impl GpuBackend {
         }
     }
 
+    /// The full `ghcr.io/ggml-org/llama.cpp:<tag>` reference. `version`,
+    /// when given, pins to that release (e.g. `server-b9994` instead of
+    /// the floating `server`) — ghcr.io/ggml-org/llama.cpp publishes a
+    /// versioned tag alongside every floating one, built from the same
+    /// release. llmman itself has no opinion on which (or whether) to
+    /// pin: reproducibility across runs is the caller's concern (see
+    /// `ServeArgs::llama_cpp_version` in cmd::serve), not something to
+    /// default or hardcode here.
+    fn image_ref(self, version: Option<&str>) -> String {
+        match version {
+            Some(v) => format!("ghcr.io/ggml-org/llama.cpp:{}-{v}", self.image_tag()),
+            None => format!("ghcr.io/ggml-org/llama.cpp:{}", self.image_tag()),
+        }
+    }
+
     /// Extra `docker run`/`podman run` arguments needed to see the host's
     /// GPU from inside the container, matching docs/docker.md's own
     /// examples for each backend (CUDA: "Docker With CUDA"; ROCm/Vulkan:
@@ -197,13 +212,22 @@ fn detect_vulkan() -> bool {
 /// `cmd::serve::ModelProcess`'s Drop impl. SIGKILL cannot be caught or
 /// forwarded by the CLI process at all (that's what SIGKILL means), so
 /// it was also verified live to leave the container running.
-pub fn spawn(conman: ContainerManager, model_path: &Path, port: u16) -> Result<tokio::process::Child> {
+///
+/// `llama_cpp_version`, when given, pins the image to that release tag
+/// (see [`GpuBackend::image_ref`]) instead of the floating one.
+pub fn spawn(
+    conman: ContainerManager,
+    model_path: &Path,
+    port: u16,
+    llama_cpp_version: Option<&str>,
+) -> Result<tokio::process::Child> {
     let backend = detect_backend();
+    let image = backend.image_ref(llama_cpp_version);
     eprintln!(
-        "[llmman] {}: detected {:?}, using image tag {:?}",
+        "[llmman] {}: detected {:?}, using image {:?}",
         conman.binary(),
         backend,
-        backend.image_tag()
+        image
     );
 
     let model_dir = model_path
@@ -216,8 +240,6 @@ pub fn spawn(conman: ContainerManager, model_path: &Path, port: u16) -> Result<t
     let model_dir_str = model_dir
         .to_str()
         .context("model directory is not valid UTF-8")?;
-
-    let image = format!("ghcr.io/ggml-org/llama.cpp:{}", backend.image_tag());
 
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -327,6 +349,27 @@ mod tests {
         assert_eq!(GpuBackend::Cuda13.image_tag(), "server-cuda13");
         assert_eq!(GpuBackend::Rocm.image_tag(), "server-rocm");
         assert_eq!(GpuBackend::Vulkan.image_tag(), "server-vulkan");
+    }
+
+    #[test]
+    fn image_ref_uses_floating_tag_when_no_version_given() {
+        assert_eq!(GpuBackend::Cpu.image_ref(None), "ghcr.io/ggml-org/llama.cpp:server");
+        assert_eq!(
+            GpuBackend::Cuda13.image_ref(None),
+            "ghcr.io/ggml-org/llama.cpp:server-cuda13"
+        );
+    }
+
+    #[test]
+    fn image_ref_pins_to_the_given_version() {
+        assert_eq!(
+            GpuBackend::Cpu.image_ref(Some("b9994")),
+            "ghcr.io/ggml-org/llama.cpp:server-b9994"
+        );
+        assert_eq!(
+            GpuBackend::Cuda13.image_ref(Some("b9994")),
+            "ghcr.io/ggml-org/llama.cpp:server-cuda13-b9994"
+        );
     }
 
     #[test]
