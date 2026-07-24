@@ -55,28 +55,9 @@ Use it as an Ollama-compatible server:
 OLLAMA_HOST=127.0.0.1:17434 ollama run unsloth/Qwen3.5-0.8B-GGUF
 ```
 
-Or with any OpenAI-compatible client:
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:17434/v1", api_key="unused")
-response = client.chat.completions.create(
-    model="unsloth/Qwen3.5-0.8B-GGUF:latest",
-    messages=[{"role": "user", "content": "Hello"}],
-)
-```
+Or with any Ollama, Anthropic or OpenAI-compatible client.
 
 Models are loaded on demand. Each model gets its own `llama-server` subprocess on a random loopback port; subsequent requests reuse the running process.
-
-## Short names
-
-`shortnames.conf` maps friendly names to full registry references:
-
-```
-llmman pull qwen3.5:0.8b          # → unsloth/Qwen3.5-0.8B-GGUF
-llmman pull gemma4:e4b-it-q4_K_M  # → unsloth/gemma-4-E4B-it-GGUF:Q4_K_M
-llmman pull granite4.1:8b-q4_K_M  # → unsloth/granite-4.1-8b-GGUF:Q4_K_M
-```
 
 Short names work with all commands: `pull`, `push`, `rm`, `tag`, `inspect`, and `serve`.
 
