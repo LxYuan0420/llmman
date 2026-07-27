@@ -47,25 +47,25 @@ pub struct ServeArgs {
     /// acceleration the host has (see crate::container); no local
     /// llama-server binary is required on PATH when this is set.
     #[arg(long, value_name = "docker|podman")]
-    pub conman: Option<crate::container::ContainerManager>,
+    pub ociman: Option<crate::container::ContainerManager>,
 
     /// Pin the ghcr.io/ggml-org/llama.cpp container image to a specific
     /// release tag (e.g. b9994) instead of the floating server/server-cuda/
-    /// ... tags — only meaningful together with --conman, ignored
+    /// ... tags — only meaningful together with --ociman, ignored
     /// otherwise. llmman itself has no default or opinion here: pick a
     /// tag that's actually published for every backend variant you might
     /// run (see docs/docker.md in ggml-org/llama.cpp) and pass it
     /// explicitly if you want reproducible behavior across runs.
-    #[arg(long, value_name = "TAG", requires = "conman")]
+    #[arg(long, value_name = "TAG", requires = "ociman")]
     pub llama_cpp_version: Option<String>,
 
-    /// Proactively pull the ghcr.io/ggml-org/llama.cpp image `--conman`
+    /// Proactively pull the ghcr.io/ggml-org/llama.cpp image `--ociman`
     /// would run, in the foreground before listening starts, with the
     /// pull's own progress (a real `docker pull`/`podman pull` progress
     /// bar) inherited directly to this process's stdout/stderr — only
-    /// meaningful together with --conman, ignored otherwise.
+    /// meaningful together with --ociman, ignored otherwise.
     ///
-    /// `--conman`'s underlying `docker run`/`podman run` pulls an image
+    /// `--ociman`'s underlying `docker run`/`podman run` pulls an image
     /// that isn't already cached on its own, but silently: `serve` is
     /// normally started detached (see daemon.rs), its stdio redirected to
     /// a log file, so a caller waiting on the first request that actually
@@ -73,7 +73,7 @@ pub struct ServeArgs {
     /// for however long a multi-hundred-MB-to-GB image pull takes —
     /// indistinguishable from a hang. `--pull-oci` does that pull here
     /// instead, before this process's stdio is ever redirected.
-    #[arg(long, requires = "conman")]
+    #[arg(long, requires = "ociman")]
     pub pull_oci: bool,
 }
 
@@ -86,10 +86,10 @@ struct AppState(Arc<Inner>);
 
 struct Inner {
     manager: Mutex<ModelManager>,
-    // None when --conman is set: llama-server then runs in a container, so
+    // None when --ociman is set: llama-server then runs in a container, so
     // no local binary is resolved (or required on PATH) at all.
     llama_server_bin: Option<PathBuf>,
-    conman: Option<crate::container::ContainerManager>,
+    ociman: Option<crate::container::ContainerManager>,
     llama_cpp_version: Option<String>,
     store_path: PathBuf,
     cache_path: PathBuf,
@@ -126,7 +126,7 @@ impl RunningModel {
         match &self.process {
             ModelProcess::Local(Engine::LlamaServer, _) => "llama-server (local)".into(),
             ModelProcess::Local(Engine::Vllm, _) => "vllm (local)".into(),
-            ModelProcess::Container(conman, _) => format!("llama-server (container/{})", conman.binary()),
+            ModelProcess::Container(ociman, _) => format!("llama-server (container/{})", ociman.binary()),
         }
     }
 
@@ -738,16 +738,16 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         .unwrap_or_default();
     let port = find_free_port()?;
     eprintln!("[llmman] loading {model_ref} on port {port}");
-    let process = match (&model_path, state.0.conman) {
-        (ModelPath::Gguf(path), Some(conman)) => {
+    let process = match (&model_path, state.0.ociman) {
+        (ModelPath::Gguf(path), Some(ociman)) => {
             ModelProcess::Container(
-                conman,
-                crate::container::spawn(conman, path, port, state.0.llama_cpp_version.as_deref())?,
+                ociman,
+                crate::container::spawn(ociman, path, port, state.0.llama_cpp_version.as_deref())?,
             )
         }
         (ModelPath::Gguf(path), None) => {
             let bin = state.0.llama_server_bin.as_deref().ok_or_else(|| {
-                anyhow!("no local llama-server binary resolved and --conman was not set")
+                anyhow!("no local llama-server binary resolved and --ociman was not set")
             })?;
             ModelProcess::Local(Engine::LlamaServer, spawn_llama_server(bin, path, port).await?)
         }
@@ -1741,20 +1741,20 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
 }
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
-    if _args.conman.is_some() && !cfg!(target_os = "linux") {
-        anyhow::bail!("--conman is only supported on Linux");
+    if _args.ociman.is_some() && !cfg!(target_os = "linux") {
+        anyhow::bail!("--ociman is only supported on Linux");
     }
     // Must happen before daemon.rs's caller (if any) redirects this
     // process's stdio to a log file — see ServeArgs::pull_oci's doc
     // comment for why that would otherwise hide the pull's progress.
     if _args.pull_oci {
-        let conman = _args.conman.context("--pull-oci requires --conman")?;
-        crate::container::pull_image(conman, _args.llama_cpp_version.as_deref())?;
+        let ociman = _args.ociman.context("--pull-oci requires --ociman")?;
+        crate::container::pull_image(ociman, _args.llama_cpp_version.as_deref())?;
     }
     // Only resolve (and require) a local llama-server binary when it'll
-    // actually be used: --conman runs llama-server in a container instead,
+    // actually be used: --ociman runs llama-server in a container instead,
     // picking the image itself (see crate::container).
-    let llama_server_bin = if _args.conman.is_none() {
+    let llama_server_bin = if _args.ociman.is_none() {
         Some(resolve_llama_server()?)
     } else {
         None
@@ -1771,7 +1771,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             running: HashMap::new(),
         }),
         llama_server_bin,
-        conman: _args.conman,
+        ociman: _args.ociman,
         llama_cpp_version: _args.llama_cpp_version.clone(),
         store_path,
         cache_path,

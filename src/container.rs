@@ -1,4 +1,4 @@
-//! Runs `llama-server` inside a container (Linux only, via `--conman
+//! Runs `llama-server` inside a container (Linux only, via `--ociman
 //! docker|podman`) instead of as a local process, auto-selecting the
 //! matching `ghcr.io/ggml-org/llama.cpp:server-<backend>` image for
 //! whatever GPU acceleration the host actually has — see
@@ -218,20 +218,20 @@ fn detect_vulkan() -> bool {
 /// redirected to a log file when started detached — see daemon.rs and
 /// cmd::serve). A caller that wants to warm this up as its own distinct,
 /// visible step first (typically right before starting `llmman serve
-/// --conman ...` detached, so a slow first pull doesn't look like a stuck
+/// --ociman ...` detached, so a slow first pull doesn't look like a stuck
 /// first prompt to whoever's waiting on it) should call this — in the
 /// foreground, before `serve` is even started — rather than relying on
 /// `spawn`'s own implicit pull.
-pub fn pull_image(conman: ContainerManager, llama_cpp_version: Option<&str>) -> Result<()> {
+pub fn pull_image(ociman: ContainerManager, llama_cpp_version: Option<&str>) -> Result<()> {
     let backend = detect_backend();
     let image = backend.image_ref(llama_cpp_version);
-    eprintln!("[llmman] {}: pulling {image}...", conman.binary());
-    let status = std::process::Command::new(conman.binary())
+    eprintln!("[llmman] {}: pulling {image}...", ociman.binary());
+    let status = std::process::Command::new(ociman.binary())
         .args(["pull", &image])
         .status()
-        .with_context(|| format!("run {} pull {image}", conman.binary()))?;
+        .with_context(|| format!("run {} pull {image}", ociman.binary()))?;
     if !status.success() {
-        anyhow::bail!("{} pull {image} failed", conman.binary());
+        anyhow::bail!("{} pull {image} failed", ociman.binary());
     }
     Ok(())
 }
@@ -245,7 +245,7 @@ pub fn pull_image(conman: ContainerManager, llama_cpp_version: Option<&str>) -> 
 /// `llama_cpp_version`, when given, pins the image to that release tag
 /// (see [`GpuBackend::image_ref`]) instead of the floating one.
 pub fn spawn(
-    conman: ContainerManager,
+    ociman: ContainerManager,
     model_path: &Path,
     port: u16,
     llama_cpp_version: Option<&str>,
@@ -254,7 +254,7 @@ pub fn spawn(
     let image = backend.image_ref(llama_cpp_version);
     eprintln!(
         "[llmman] {}: detected {:?}, using image {:?}",
-        conman.binary(),
+        ociman.binary(),
         backend,
         image
     );
@@ -291,11 +291,11 @@ pub fn spawn(
         "0.0.0.0".into(),
     ]);
 
-    tokio::process::Command::new(conman.binary())
+    tokio::process::Command::new(ociman.binary())
         .args(&args)
         .stdin(std::process::Stdio::null())
         .spawn()
-        .with_context(|| format!("spawn {} {}", conman.binary(), args.join(" ")))
+        .with_context(|| format!("spawn {} {}", ociman.binary(), args.join(" ")))
 }
 
 /// Gracefully stops a container started by [`spawn`] by sending SIGTERM to
@@ -303,7 +303,7 @@ pub fn spawn(
 /// for why this must be SIGTERM (forwarded to the container's `--init`
 /// PID 1) and not the default forceful kill. Best-effort: called from a
 /// synchronous `Drop` impl (see `ModelProcess` in cmd::serve), so errors
-/// are only logged, never propagated. Unix only (matching `--conman`
+/// are only logged, never propagated. Unix only (matching `--ociman`
 /// itself, which cmd::serve::serve_async already rejects on other
 /// platforms) — `libc::kill` is not meaningful on Windows.
 #[cfg(unix)]
@@ -318,7 +318,7 @@ pub fn stop(pid: u32) {
     }
 }
 
-/// Unreachable in practice (`--conman` is rejected on non-Linux before
+/// Unreachable in practice (`--ociman` is rejected on non-Linux before
 /// `spawn` is ever called — see cmd::serve::serve_async), but this needs
 /// to compile on every platform llmman ships for, and a plain forceful
 /// kill here is at least no worse than the SIGKILL callers were already
