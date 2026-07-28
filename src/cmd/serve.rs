@@ -60,7 +60,8 @@ pub struct ServeArgs {
     pub llama_cpp_version: Option<String>,
 
     /// Proactively pull the ghcr.io/ggml-org/llama.cpp image `--ociman`
-    /// would run, in the foreground before listening starts, with the
+    /// would run, as its own explicit foreground step, then exit — this
+    /// process does not go on to bind the listener or serve — with the
     /// pull's own progress (a real `docker pull`/`podman pull` progress
     /// bar) inherited directly to this process's stdout/stderr — only
     /// meaningful together with --ociman, ignored otherwise.
@@ -71,8 +72,10 @@ pub struct ServeArgs {
     /// a log file, so a caller waiting on the first request that actually
     /// needs the container (the first real prompt) sees nothing happen
     /// for however long a multi-hundred-MB-to-GB image pull takes —
-    /// indistinguishable from a hang. `--pull-oci` does that pull here
-    /// instead, before this process's stdio is ever redirected.
+    /// indistinguishable from a hang. Run `llmman serve --ociman ...
+    /// --pull-oci` first, in the foreground, to do that pull visibly and
+    /// finish as soon as it completes; then start the real, detached
+    /// `llmman serve --ociman ...` (without `--pull-oci`) separately.
     #[arg(long, requires = "ociman")]
     pub pull_oci: bool,
 }
@@ -1747,9 +1750,15 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // Must happen before daemon.rs's caller (if any) redirects this
     // process's stdio to a log file — see ServeArgs::pull_oci's doc
     // comment for why that would otherwise hide the pull's progress.
+    // This is meant as its own explicit, foreground warm-up step run
+    // before a separate, detached `serve` invocation — not a prelude to
+    // this same invocation going on to serve — so it returns as soon as
+    // the pull finishes instead of falling through into binding the
+    // listener and serving forever.
     if _args.pull_oci {
         let ociman = _args.ociman.context("--pull-oci requires --ociman")?;
         crate::container::pull_image(ociman, _args.llama_cpp_version.as_deref())?;
+        return Ok(());
     }
     // Only resolve (and require) a local llama-server binary when it'll
     // actually be used: --ociman runs llama-server in a container instead,
