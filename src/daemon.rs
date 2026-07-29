@@ -155,6 +155,14 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
             continue; // tolerate stray non-JSON keepalive output
         };
         if let Some(err) = msg.error.filter(|e| !e.is_empty()) {
+            // Only prefix with `reference` if the error doesn't already
+            // mention it — many pull failures (e.g. containerd's "not
+            // found") already embed the exact reference themselves, and
+            // piling this prefix on unconditionally produced the same
+            // reference two or three times over in one error line.
+            if err.contains(reference) {
+                anyhow::bail!("{err}");
+            }
             anyhow::bail!("{reference}: {err}");
         }
         if let Some(status) = msg.status {
@@ -169,6 +177,35 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
         anyhow::bail!("{reference}: stream ended without a success status");
     }
     Ok(())
+}
+
+/// POSTs `{"model": reference}` to `/api/show` and reports whether the
+/// daemon's local store already has it — a read-only existence check with
+/// no download/pull side effects.
+fn model_exists(reference: &str) -> anyhow::Result<bool> {
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{SERVER}/api/show"))
+        .json(&serde_json::json!({"model": reference}))
+        .send()
+        .with_context(|| format!("request /api/show for {reference}"))?;
+    Ok(resp.status().is_success())
+}
+
+/// Ensures `reference` is present in the daemon's local store, pulling it
+/// (and streaming progress the same way `llmman pull` does) if it isn't.
+///
+/// Mirrors ollama's `RunHandler`, which calls `client.Show` before ever
+/// entering the interactive/one-shot prompt loop and only falls back to
+/// `PullHandler` on a miss — so a bad reference (typo'd tag, malformed
+/// `hf.co/...` name, etc.) is reported and aborts the command immediately,
+/// instead of only surfacing once the first message is submitted to
+/// `/api/chat` (by which point the interactive `> ` prompt has already
+/// been shown and read from).
+pub fn ensure_model_pulled(reference: &str) -> anyhow::Result<()> {
+    if model_exists(reference).unwrap_or(false) {
+        return Ok(());
+    }
+    stream_progress("/api/pull", reference)
 }
 
 /// A plain `GET {SERVER}{path}` returning the parsed JSON body — for

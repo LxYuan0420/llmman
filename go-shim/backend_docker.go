@@ -250,9 +250,14 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	}
 
 	resolver := newResolver(ctx)
+	// Deliberately not "resolve %s: %w" — containerd's own resolve errors
+	// (e.g. errdefs.ErrNotFound) already embed ref themselves, and every
+	// caller of llmman_pull (the Rust daemon's /api/pull handler) already
+	// prefixes whatever error comes back with the reference it asked for.
+	// Including ref here too just repeats it two or three times over.
 	name, manifestDesc, err := resolver.Resolve(ctx, ref)
 	if err != nil {
-		return errResp(fmt.Errorf("resolve %s: %w", ref, err))
+		return errResp(fmt.Errorf("resolve: %w", err))
 	}
 	fetcher, err := resolver.Fetcher(ctx, name)
 	if err != nil {
@@ -382,7 +387,7 @@ func llmman_inspect(cRef *C.char) *C.char {
 	resolver := newResolver(ctx)
 	name, manifestDesc, err := resolver.Resolve(ctx, ref)
 	if err != nil {
-		return errResp(fmt.Errorf("resolve %s: %w", ref, err))
+		return errResp(fmt.Errorf("resolve: %w", err))
 	}
 	fetcher, err := resolver.Fetcher(ctx, name)
 	if err != nil {

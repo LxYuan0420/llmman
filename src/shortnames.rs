@@ -83,11 +83,21 @@ fn aliases() -> &'static HashMap<String, String> {
     CACHE.get_or_init(load_aliases)
 }
 
-/// Returns true if `reference` already carries an explicit registry host
-/// (the first path component contains a dot or equals "localhost").
+/// Returns true if `reference` already carries an explicit registry host:
+/// it has a "/" (so there's an actual leading path component to examine),
+/// and that first component contains a dot or equals "localhost". Requiring
+/// a "/" here matters: without one, a slash-less reference like
+/// "qwen3.5:0.8B" would otherwise be misread as "already has host qwen3.5"
+/// just because its dotted version number contains a '.', when there's no
+/// host/path structure there at all — leaving it neither hf.co- nor
+/// docker.io/ai-prefixed, so it reaches the Go shim raw and dead-ends in
+/// its HuggingFace-only parser with a misleading error instead of either
+/// default ever being applied.
 fn has_host(reference: &str) -> bool {
-    let first = reference.split('/').next().unwrap_or("");
-    first.contains('.') || first.eq_ignore_ascii_case("localhost")
+    match reference.split_once('/') {
+        Some((first, _)) => first.contains('.') || first.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
 /// Resolve `reference` through the short-name alias table, then default the
@@ -145,25 +155,33 @@ pub fn resolve(reference: &str) -> String {
     format!("hf.co/{reference}")
 }
 
-/// Returns true if `reference` is *completely* bare: no "/" (no owner/repo
-/// or registry-host structure) and no "." (no host-like dot and no
-/// dotted-version tag such as "3.5"). This is deliberately stricter than
-/// `has_host` — a HuggingFace-style "owner/repo" reference has a "/" but no
-/// dot, and must NOT be treated as bare here.
+/// Returns true if `reference` is bare: no "/" at all, i.e. no owner/repo
+/// or registry-host structure — just a single path component, optionally
+/// with a ":tag". Dots are deliberately *not* checked here (unlike a
+/// stricter earlier version of this function): a dotted version number
+/// such as "3.5" in "qwen3.5:0.8B" is just part of the name/tag, not a
+/// registry host, and real ollama makes the same distinction purely on
+/// "/" — it never treats embedded dots specially. Since a single bare
+/// component (with or without dots) can never satisfy HuggingFace's
+/// required host/owner/repo shape anyway, sending it to `resolve`'s
+/// hf.co default would be a guaranteed dead end; docker.io/ai/<reference>
+/// below is the only default that's ever actually resolvable for it.
 fn is_bare(reference: &str) -> bool {
-    !reference.contains('/') && !reference.contains('.')
+    !reference.contains('/')
 }
 
 /// Resolve `reference` the way every Ollama-API-facing path in `cmd::serve`
 /// does (handle_pull, handle_show, handle_delete, ensure_model, and the
 /// `--model` preload in serve_async): identical to `resolve`, except a
-/// *completely bare* reference — e.g. "gemma4", no "/" and no "." anywhere —
+/// *bare* reference — no "/" anywhere, e.g. "gemma4" or "qwen3.5:0.8B" —
 /// defaults to Docker's official curated-model namespace on Docker Hub,
-/// `docker.io/ai/<reference>` (e.g. "gemma4" -> "docker.io/ai/gemma4"),
-/// instead of `resolve`'s general `hf.co/<reference>` default. Any
-/// reference with more structure than that (an owner/repo path, a URI
-/// scheme, an explicit host, a dotted version like "gemma4:3.5") is left to
-/// `resolve`'s normal rules unchanged.
+/// `docker.io/ai/<reference>` (e.g. "gemma4" -> "docker.io/ai/gemma4",
+/// "qwen3.5:0.8B" -> "docker.io/ai/qwen3.5:0.8B"), instead of `resolve`'s
+/// general `hf.co/<reference>` default. Dots in the name or tag don't
+/// disqualify this — only a "/" does — since `resolve`'s hf.co default
+/// requires a host/owner/repo shape that a single bare component can never
+/// satisfy anyway. Any reference with a "/" (an owner/repo path, a URI
+/// scheme, an explicit host) is left to `resolve`'s normal rules unchanged.
 ///
 /// CLI subcommands that talk to a local server over the Ollama API (pull,
 /// push) go through this same resolution server-side, so the docker.io/ai/
@@ -186,9 +204,17 @@ mod tests {
     #[test]
     fn resolve_ollama_api_defaults_bare_names_to_docker_ai() {
         assert_eq!(resolve_ollama_api("gemma4"), "docker.io/ai/gemma4");
-        // A tag with no dot is still "bare" by this rule (only "/" and "."
-        // disqualify it) — matches the ai/<name>:<tag> shape on Docker Hub.
+        // A tag with no dot is still "bare" by this rule (only "/"
+        // disqualifies it) — matches the ai/<name>:<tag> shape on Docker Hub.
         assert_eq!(resolve_ollama_api("gemma4:e4b"), "docker.io/ai/gemma4:e4b");
+        // Dots in the name and/or tag don't disqualify "bare" either — only
+        // a "/" does. Regression test: this used to fall through unchanged
+        // (neither hf.co- nor docker.io/ai-prefixed) because has_host()
+        // mistook the dotted version number for an explicit registry host,
+        // and dead-ended in the Go shim's HF-only parser with a misleading
+        // "invalid HuggingFace reference" error instead.
+        assert_eq!(resolve_ollama_api("qwen3.5"), "docker.io/ai/qwen3.5");
+        assert_eq!(resolve_ollama_api("qwen3.5:0.8B"), "docker.io/ai/qwen3.5:0.8B");
     }
 
     #[test]
@@ -198,9 +224,6 @@ mod tests {
         // Already has an explicit host.
         assert_eq!(resolve_ollama_api("hf.co/foo/bar"), "hf.co/foo/bar");
         assert_eq!(resolve_ollama_api("docker.io/ai/gemma4"), "docker.io/ai/gemma4");
-        // A dot (e.g. a dotted version number) disqualifies "bare" even
-        // without a "/".
-        assert_eq!(resolve_ollama_api("qwen3.5"), resolve("qwen3.5"));
     }
 
     #[test]
@@ -210,11 +233,26 @@ mod tests {
     }
 
     #[test]
-    fn is_bare_rejects_slashes_and_dots() {
+    fn is_bare_rejects_only_slashes() {
         assert!(is_bare("gemma4"));
         assert!(is_bare("gemma4:e4b"));
         assert!(!is_bare("unsloth/gemma4"));
-        assert!(!is_bare("qwen3.5"));
+        // Dots alone (no "/") no longer disqualify bareness — see
+        // has_host_requires_a_slash below for the corresponding fix.
+        assert!(is_bare("qwen3.5"));
+        assert!(is_bare("qwen3.5:0.8B"));
         assert!(!is_bare("hf.co/gemma4"));
+    }
+
+    #[test]
+    fn has_host_requires_a_slash() {
+        // No "/" at all: a dotted version number must not be mistaken for
+        // an explicit host, no matter how host-like the dot looks.
+        assert!(!has_host("qwen3.5:0.8B"));
+        assert!(!has_host("qwen3.5"));
+        // With a "/", the first component is genuinely checked for a host.
+        assert!(has_host("hf.co/foo/bar"));
+        assert!(has_host("localhost/foo"));
+        assert!(!has_host("unsloth/Qwen3.5-0.8B-GGUF"));
     }
 }

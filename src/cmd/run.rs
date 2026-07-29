@@ -57,6 +57,14 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     // pipes to close).
     crate::daemon::ensure_server(&model)?;
 
+    // Fail fast on a bad/unresolvable reference — mirrors ollama's
+    // RunHandler, which resolves (Show, falling back to Pull) the model
+    // before ever showing its interactive prompt. Without this, an error
+    // like an invalid `hf.co/...` reference wouldn't surface until the
+    // first message was submitted to /api/chat, well after the `> `
+    // prompt had already been shown and read from.
+    crate::daemon::ensure_model_pulled(&model)?;
+
     let interactive = prompt.is_empty() && io::stdin().is_terminal();
 
     if interactive {
