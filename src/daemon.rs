@@ -46,8 +46,10 @@ pub fn server_alive() -> bool {
 /// optional positional argument so the daemon starts loading it
 /// immediately (see cmd::serve::ServeArgs::model) instead of waiting for
 /// the first request that references it. Pass "" when there's nothing to
-/// preload (e.g. pull/push, which only need the daemon up, not any
-/// particular model warm).
+/// preload — `run`/`pull`/`push` all pass "" so the daemon they spawn
+/// stays a plain, model-agnostic `llmman serve` (only `launch` still
+/// preloads, since its whole point is warming up one model for the
+/// integration it's about to hand off to).
 pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     if server_alive() {
         return Ok(());
@@ -64,6 +66,12 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
         cmd.arg(preload_model);
     }
     cmd.stdin(Stdio::null());
+    // Silently redirect the daemon's stdio to its log file (or /dev/null if
+    // that file can't be opened) — no "starting serve" status line here:
+    // every caller of ensure_server (run/pull/push/launch) wants to look
+    // like a plain client of an already-running server, not announce that
+    // it happened to be the one that started it this time. Anyone who
+    // needs to know still can — see log_path above / `llmman serve.log`.
     match log_path
         .as_ref()
         .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
@@ -72,14 +80,10 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
         Some((out, err)) => {
             cmd.stdout(out);
             cmd.stderr(err);
-            if let Some(p) = &log_path {
-                eprintln!("[llmman] starting serve (logs: {})...", p.display());
-            }
         }
         None => {
             cmd.stdout(Stdio::null());
             cmd.stderr(Stdio::null());
-            eprintln!("[llmman] starting serve...");
         }
     }
     detach(&mut cmd);

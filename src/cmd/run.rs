@@ -54,8 +54,13 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     // use (see daemon::ensure_server's doc comment for why stdio is
     // redirected there: without it, this command would hang forever
     // waiting for the (never-exiting) daemon's inherited stdout/stderr
-    // pipes to close).
-    crate::daemon::ensure_server(&model)?;
+    // pipes to close). No preload model is passed: the resulting daemon
+    // is a plain `llmman serve` with no model argument, so it's shared
+    // cleanly across every future `run`/`pull`/`push`/`launch` in this
+    // session rather than looking like it's dedicated to whatever model
+    // happened to start it first. ensure_model_pulled below still makes
+    // sure the model is on disk before the first /api/chat request.
+    crate::daemon::ensure_server("")?;
 
     // Fail fast on a bad/unresolvable reference — mirrors ollama's
     // RunHandler, which resolves (Show, falling back to Pull) the model
@@ -86,7 +91,7 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
             // single wire-format implementation to maintain here, and it
             // works identically against llmman or a real Ollama install
             // either way (both expose /api/chat).
-            let client = Client::new();
+            let client = chat_client()?;
             chat_submit(&client, &model, &mut Vec::new(), p)?;
         }
         Ok(())
@@ -103,6 +108,20 @@ struct Msg {
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
+}
+
+/// Builds the `reqwest::blocking::Client` every chat-submitting caller in
+/// this file shares. `reqwest::blocking::Client::new()` carries a 30s
+/// default request timeout (unlike the async `Client`, which has none) —
+/// fine for quick calls, but loading a model into `llama-server`/vllm for
+/// the first time (or the daemon's own up-to-600s wait_for_ready health
+/// poll, see cmd::serve::wait_for_ready) routinely takes longer than
+/// that, so `Client::new()` here would abort an otherwise-succeeding
+/// request with a misleading "operation timed out" long before the model
+/// actually finished loading. Mirrors daemon::stream_progress's own
+/// `.timeout(None)` for the same reason on the pull/push side.
+fn chat_client() -> anyhow::Result<Client> {
+    Client::builder().timeout(None).build().context("build http client")
 }
 
 #[derive(Serialize)]
@@ -144,7 +163,7 @@ fn run_interactive_tty(model: &str) -> anyhow::Result<()> {
 fn run_interactive_unix(model: &str) -> anyhow::Result<()> {
     use unix_readline::Readline;
 
-    let client = reqwest::blocking::Client::new();
+    let client = chat_client()?;
     let mut messages: Vec<Msg> = Vec::new();
     let mut rl = Readline::new()?;
     let mut multiline: Option<String> = None; // Some while inside """
@@ -549,7 +568,7 @@ mod unix_readline {
 
 #[allow(dead_code)]
 fn run_interactive_cooked(model: &str) -> anyhow::Result<()> {
-    let client = reqwest::blocking::Client::new();
+    let client = chat_client()?;
     let mut messages: Vec<Msg> = Vec::new();
     use std::io::BufRead;
     let stdin = std::io::stdin();
