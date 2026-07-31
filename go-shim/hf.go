@@ -92,6 +92,41 @@ func hfEndpoint(host string) string {
 	return "https://" + host + "/"
 }
 
+// hfToken resolves the HuggingFace bearer token to use for authenticated
+// requests, mirroring huggingface_hub's own resolution order: the HF_TOKEN
+// environment variable (falling back to the legacy
+// HUGGING_FACE_HUB_TOKEN), then the on-disk active-token file written by
+// `llmman login` — see the Rust `hf` module's `token_path`, which uses the
+// exact same path, so either tool's login is honored by the other.
+func hfToken() string {
+	for _, env := range []string{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"} {
+		if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+			return v
+		}
+	}
+	data, err := os.ReadFile(hfTokenPath())
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// hfTokenPath returns the path to the active HuggingFace token file:
+// $HF_TOKEN_PATH if set, else "$HF_HOME/token", else
+// "~/.cache/huggingface/token".
+func hfTokenPath() string {
+	if p := os.Getenv("HF_TOKEN_PATH"); p != "" {
+		return p
+	}
+	if home := os.Getenv("HF_HOME"); home != "" {
+		return filepath.Join(home, "token")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".cache", "huggingface", "token")
+	}
+	return filepath.Join(".cache", "huggingface", "token")
+}
+
 // hfGet issues an authenticated GET and decodes JSON into dst.
 func hfGet(ctx context.Context, client *http.Client, url, token string, dst any) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -280,7 +315,7 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 	}
 
 	endpoint := hfEndpoint(host)
-	token := os.Getenv("HF_TOKEN")
+	token := hfToken()
 
 	// apiClient: short total timeout for metadata requests (commit, file list).
 	apiClient := &http.Client{Timeout: 120 * time.Second}

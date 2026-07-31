@@ -5,6 +5,7 @@ mod container;
 mod daemon;
 mod ffi;
 mod fmt;
+mod hf;
 mod shortnames;
 mod storage;
 pub mod webui;
@@ -37,14 +38,16 @@ enum Commands {
     Run(cmd::run::RunArgs),
     /// Package model files into a local OCI image
     Build(cmd::build::BuildArgs),
-    /// Log in to a container registry
+    /// Log in to a container registry or HuggingFace
     Login(cmd::login::LoginArgs),
-    /// Log out from a container registry
+    /// Log out from a container registry or HuggingFace
     Logout(cmd::logout::LogoutArgs),
     /// Push a local image to a registry
     Push(cmd::push::PushArgs),
     /// Pull an image from a registry to the local store
     Pull(cmd::pull::PullArgs),
+    /// Copy an image directly from one location to another (e.g. HuggingFace to an OCI registry)
+    Transfer(cmd::transfer::TransferArgs),
     /// List locally stored images
     #[command(alias = "ls")]
     List(cmd::list::ListArgs),
@@ -67,19 +70,20 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
-        Commands::Launch(a)  => cmd::launch::run(a),
-        Commands::Run(a)     => cmd::run::run(a),
-        Commands::Build(a)   => cmd::build::run(a),
-        Commands::Login(a)   => cmd::login::run(a),
-        Commands::Logout(a)  => cmd::logout::run(a),
-        Commands::Push(a)    => cmd::push::run(a),
-        Commands::Pull(a)    => cmd::pull::run(a),
-        Commands::List(a)    => cmd::list::run(a),
-        Commands::Ps(a)      => cmd::ps::run(a),
-        Commands::Rm(a)      => cmd::rm::run(a),
-        Commands::Inspect(a) => cmd::inspect::run(a),
-        Commands::Serve(a)   => cmd::serve::run(a),
-        Commands::Tag(a)     => cmd::tag::run(a),
+        Commands::Launch(a)   => cmd::launch::run(a),
+        Commands::Run(a)      => cmd::run::run(a),
+        Commands::Build(a)    => cmd::build::run(a),
+        Commands::Login(a)    => cmd::login::run(a),
+        Commands::Logout(a)   => cmd::logout::run(a),
+        Commands::Push(a)     => cmd::push::run(a),
+        Commands::Pull(a)     => cmd::pull::run(a),
+        Commands::Transfer(a) => cmd::transfer::run(a),
+        Commands::List(a)     => cmd::list::run(a),
+        Commands::Ps(a)       => cmd::ps::run(a),
+        Commands::Rm(a)       => cmd::rm::run(a),
+        Commands::Inspect(a)  => cmd::inspect::run(a),
+        Commands::Serve(a)    => cmd::serve::run(a),
+        Commands::Tag(a)      => cmd::tag::run(a),
     };
     if let Err(e) = result {
         eprintln!("Error: {:#}", e);
