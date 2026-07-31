@@ -127,6 +127,68 @@ func hfTokenPath() string {
 	return filepath.Join(".cache", "huggingface", "token")
 }
 
+// hfHeadMetadata performs a HEAD request against a HuggingFace file's
+// /resolve/ URL and reports the file's real content digest and size,
+// without downloading the body — mirroring huggingface_hub's own
+// get_hf_file_metadata(). This is what makes streaming a HuggingFace file
+// straight into a registry push possible at all: containerd/OCI registry
+// pushes require the blob's digest to be known *before* any bytes are
+// sent (see backend_docker.go's llmman_transfer), and for a large,
+// LFS-tracked file (virtually every real GGUF/safetensors weight file)
+// the true sha256 of the content is exposed via the X-Linked-Etag header
+// on this cheap HEAD request — the same field huggingface_hub prefers
+// over the plain ETag for exactly this reason (LFS pointer vs. real
+// object). ok is false when the digest can't be determined this way
+// (small, non-LFS files, where the ETag is a git blob sha1, not a sha256
+// of the content) — callers should fall back to a normal buffered
+// download for those; they're tiny (config/tokenizer files), so buffering
+// them in memory costs nothing.
+func hfHeadMetadata(ctx context.Context, client *http.Client, url, token string) (dgst digest.Digest, size int64, ok bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
+	if err != nil {
+		return "", 0, false, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Accept-Encoding", "identity") // force the real, uncompressed size
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("HEAD %s: %w", url, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", 0, false, fmt.Errorf("HEAD %s: HTTP %d", url, resp.StatusCode)
+	}
+
+	etag := resp.Header.Get("X-Linked-Etag")
+	if etag == "" {
+		etag = resp.Header.Get("ETag")
+	}
+	etag = strings.TrimPrefix(etag, "W/")
+	etag = strings.Trim(etag, `"`)
+	if len(etag) != 64 {
+		return "", 0, false, nil // not a sha256 — not LFS, caller should buffer instead
+	}
+
+	sizeStr := resp.Header.Get("X-Linked-Size")
+	if sizeStr == "" {
+		sizeStr = resp.Header.Get("Content-Length")
+	}
+	size, convErr := parseInt64(sizeStr)
+	if convErr != nil {
+		return "", 0, false, nil
+	}
+
+	return digest.NewDigestFromEncoded(digest.SHA256, strings.ToLower(etag)), size, true, nil
+}
+
+func parseInt64(s string) (int64, error) {
+	var n int64
+	_, err := fmt.Sscanf(s, "%d", &n)
+	return n, err
+}
+
 // hfGet issues an authenticated GET and decodes JSON into dst.
 func hfGet(ctx context.Context, client *http.Client, url, token string, dst any) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)

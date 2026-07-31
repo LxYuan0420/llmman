@@ -20,6 +20,7 @@ extern "C" {
     fn llmman_push(layout_dir: *const c_char, reference: *const c_char) -> *mut c_char;
     fn llmman_pull(reference: *const c_char, layout_dir: *const c_char) -> *mut c_char;
     fn llmman_inspect(reference: *const c_char) -> *mut c_char;
+    fn llmman_transfer(source: *const c_char, destination: *const c_char) -> *mut c_char;
 }
 
 // ---------------------------------------------------------------------------
@@ -90,4 +91,16 @@ pub fn pull(reference: &str, layout_dir: &str) -> anyhow::Result<()> {
 pub fn inspect_remote(reference: &str) -> anyhow::Result<String> {
     let r = cstr(reference)?;
     consume(unsafe { llmman_inspect(r.as_ptr()) })
+}
+
+/// Copy an image directly from `source` to `destination` — the `skopeo
+/// copy` equivalent — without going through the local store. See
+/// go-shim/transfer_docker.go / transfer_podman.go for how each backend
+/// implements this (streamed blob-for-blob where possible, exactly like
+/// skopeo itself does, falling back to a throwaway local staging
+/// directory only for source kinds that transport has no way to stream).
+pub fn transfer(source: &str, destination: &str) -> anyhow::Result<()> {
+    let s = cstr(source)?;
+    let d = cstr(destination)?;
+    consume(unsafe { llmman_transfer(s.as_ptr(), d.as_ptr()) }).map(|_| ())
 }

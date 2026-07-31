@@ -81,52 +81,63 @@ func llmman_logout(cServer *C.char) *C.char {
 //
 //export llmman_push
 func llmman_push(cLayoutDir, cRef *C.char) *C.char {
-	layoutDir := C.GoString(cLayoutDir)
-	ref := C.GoString(cRef)
+	if err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), C.GoString(cRef)); err != nil {
+		return errResp(err)
+	}
+	return okResp("")
+}
+
+// pushToRegistry is llmman_push's implementation, factored out so
+// llmman_transfer's staging-directory fallback (see transfer_podman.go)
+// can reuse it without going through CGO.
+func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 	tag := tagFromRef(ref)
 
 	// Source: OCI layout directory
 	srcStr := fmt.Sprintf("oci:%s:%s", layoutDir, tag)
 	srcRef, err := alltransports.ParseImageName(srcStr)
 	if err != nil {
-		return errResp(fmt.Errorf("parse src ref %q: %w", srcStr, err))
+		return fmt.Errorf("parse src ref %q: %w", srcStr, err)
 	}
 
 	// Destination: Docker registry
 	dstStr := "docker://" + ref
 	dstRef, err := alltransports.ParseImageName(dstStr)
 	if err != nil {
-		return errResp(fmt.Errorf("parse dst ref %q: %w", dstStr, err))
+		return fmt.Errorf("parse dst ref %q: %w", dstStr, err)
 	}
 
 	pctx, err := insecurePolicy()
 	if err != nil {
-		return errResp(fmt.Errorf("policy context: %w", err))
+		return fmt.Errorf("policy context: %w", err)
 	}
 	defer pctx.Destroy()
 
-	_, err = copy.Image(context.Background(), pctx, dstRef, srcRef, &copy.Options{
+	_, err = copy.Image(ctx, pctx, dstRef, srcRef, &copy.Options{
 		ReportWriter: os.Stderr,
 	})
 	if err != nil {
-		return errResp(fmt.Errorf("copy image: %w", err))
+		return fmt.Errorf("copy image: %w", err)
 	}
-	return okResp("")
+	return nil
 }
 
 // llmman_pull pulls an image from a registry into a local OCI layout directory.
 //
 //export llmman_pull
 func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
-	ref := C.GoString(cRef)
-	layoutDir := C.GoString(cLayoutDir)
+	if err := pullToLayout(context.Background(), C.GoString(cRef), C.GoString(cLayoutDir)); err != nil {
+		return errResp(err)
+	}
+	return okResp("")
+}
 
+// pullToLayout is llmman_pull's implementation, factored out so
+// llmman_transfer's staging-directory fallback can reuse it.
+func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	// URI-scheme dispatch: hf://, ms://, ngc://, s3://, gs://, /absolute/path.
-	if handled, err := dispatchPull(context.Background(), ref, layoutDir); handled {
-		if err != nil {
-			return errResp(err)
-		}
-		return okResp("")
+	if handled, err := dispatchPull(ctx, ref, layoutDir); handled {
+		return err
 	}
 
 	// Normalize: append :latest if reference has no tag or digest
@@ -138,14 +149,11 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	// protocol (their paths contain uppercase letters which containers/image
 	// rejects).  Delegate to the shared HF pull path instead.
 	host := strings.SplitN(ref, "/", 2)[0]
-	if isKnownHFHost(host) || (!isKnownOCIHost(host) && !isOCIRegistry(context.Background(), &http.Client{Timeout: 5 * time.Second}, host)) {
+	if isKnownHFHost(host) || (!isKnownOCIHost(host) && !isOCIRegistry(ctx, &http.Client{Timeout: 5 * time.Second}, host)) {
 		if err := ensureLayout(layoutDir); err != nil {
-			return errResp(fmt.Errorf("init OCI layout: %w", err))
+			return fmt.Errorf("init OCI layout: %w", err)
 		}
-		if err := pullHF(context.Background(), ref, layoutDir); err != nil {
-			return errResp(err)
-		}
-		return okResp("")
+		return pullHF(ctx, ref, layoutDir)
 	}
 
 	tag := tagFromRef(ref)
@@ -154,24 +162,24 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	srcStr := "docker://" + ref
 	srcRef, err := alltransports.ParseImageName(srcStr)
 	if err != nil {
-		return errResp(fmt.Errorf("parse src ref %q: %w", srcStr, err))
+		return fmt.Errorf("parse src ref %q: %w", srcStr, err)
 	}
 
 	// Ensure the OCI layout directory exists
 	if err := os.MkdirAll(layoutDir, 0o755); err != nil {
-		return errResp(fmt.Errorf("create layout dir: %w", err))
+		return fmt.Errorf("create layout dir: %w", err)
 	}
 
 	// Destination: OCI layout directory
 	dstStr := fmt.Sprintf("oci:%s:%s", layoutDir, tag)
 	dstRef, err := alltransports.ParseImageName(dstStr)
 	if err != nil {
-		return errResp(fmt.Errorf("parse dst ref %q: %w", dstStr, err))
+		return fmt.Errorf("parse dst ref %q: %w", dstStr, err)
 	}
 
 	pctx, err := insecurePolicy()
 	if err != nil {
-		return errResp(fmt.Errorf("policy context: %w", err))
+		return fmt.Errorf("policy context: %w", err)
 	}
 	defer pctx.Destroy()
 
@@ -229,7 +237,7 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 		}
 	}()
 
-	_, err = copy.Image(context.Background(), pctx, dstRef, srcRef, &copy.Options{
+	_, err = copy.Image(ctx, pctx, dstRef, srcRef, &copy.Options{
 		Progress:             ch,
 		ProgressInterval:     200 * time.Millisecond,
 		MaxParallelDownloads: 6,
@@ -239,9 +247,9 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	prog.Wait()
 
 	if err != nil {
-		return errResp(fmt.Errorf("copy image: %w", err))
+		return fmt.Errorf("copy image: %w", err)
 	}
-	return okResp("")
+	return nil
 }
 
 // llmman_inspect fetches and returns the raw manifest JSON for a remote reference.
@@ -273,6 +281,23 @@ func llmman_inspect(cRef *C.char) *C.char {
 		return okResp(string(manifestData))
 	}
 	return okResp(buf.String())
+}
+
+// llmman_transfer copies an image directly from source to destination —
+// llmman's equivalent of `skopeo copy` — without ever writing it to the
+// persistent local store. See transfer_podman.go for what this picks
+// between (a direct docker://→docker:// copy.Image, which — like skopeo
+// itself — streams every blob straight through since containers/image
+// already knows each one's digest from the source manifest; or a
+// staging-directory fallback for HuggingFace and other non-OCI sources,
+// which containers/image has no source transport for).
+//
+//export llmman_transfer
+func llmman_transfer(cSource, cDestination *C.char) *C.char {
+	if err := podmanTransfer(context.Background(), C.GoString(cSource), C.GoString(cDestination)); err != nil {
+		return errResp(err)
+	}
+	return okResp("")
 }
 
 // Ensure io is used (imported via shared helpers but referenced here for the build)

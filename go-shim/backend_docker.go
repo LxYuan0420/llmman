@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	dockerconfig "github.com/containerd/containerd/v2/core/remotes/docker/config"
+	remoteerrors "github.com/containerd/containerd/v2/core/remotes/errors"
 	"github.com/containerd/errdefs"
 	dockercliconfig "github.com/docker/cli/cli/config"
 	clitypes "github.com/docker/cli/cli/config/types"
@@ -57,9 +59,19 @@ func newResolver(ctx context.Context) remotes.Resolver {
 	})
 }
 
-// ---------------------------------------------------------------------------
-// OCI layout helpers
-// ---------------------------------------------------------------------------
+// describeErr enriches a containerd registry error with the response body,
+// when there is one — containerd's own ErrUnexpectedStatus.Error() deliberately
+// omits it (only logged at debug level), which is exactly the detail needed to
+// tell "repository doesn't exist", "insufficient scope", and similar registry-
+// side rejections apart from each other instead of a bare, unexplained status
+// code.
+func describeErr(err error) error {
+	var ue remoteerrors.ErrUnexpectedStatus
+	if errors.As(err, &ue) && len(ue.Body) > 0 {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(ue.Body)))
+	}
+	return err
+}
 
 // ---------------------------------------------------------------------------
 // ociProvider implements content.Provider backed by an OCI layout directory.
@@ -97,7 +109,7 @@ func pushBlob(ctx context.Context, pusher remotes.Pusher, provider *ociProvider,
 		if errdefs.IsAlreadyExists(err) {
 			return nil
 		}
-		return err
+		return describeErr(err)
 	}
 	defer cw.Close()
 
@@ -107,7 +119,39 @@ func pushBlob(ctx context.Context, pusher remotes.Pusher, provider *ociProvider,
 	}
 	defer ra.Close()
 
-	return content.Copy(ctx, cw, io.NewSectionReader(ra, 0, ra.Size()), desc.Size, desc.Digest)
+	return describeErr(content.Copy(ctx, cw, io.NewSectionReader(ra, 0, ra.Size()), desc.Size, desc.Digest))
+}
+
+// pushBytes pushes an in-memory blob (a manifest or a small config/metadata
+// file) directly to the registry pusher — no local file involved.
+func pushBytes(ctx context.Context, pusher remotes.Pusher, desc ocispec.Descriptor, data []byte) error {
+	cw, err := pusher.Push(ctx, desc)
+	if err != nil {
+		if errdefs.IsAlreadyExists(err) {
+			return nil
+		}
+		return describeErr(err)
+	}
+	defer cw.Close()
+	return describeErr(content.Copy(ctx, cw, bytes.NewReader(data), desc.Size, desc.Digest))
+}
+
+// pushStream pushes a blob whose digest and size are already known (see
+// hfHeadMetadata) directly from a live reader — typically an in-flight HTTP
+// GET response body — straight into the registry pusher, with no local
+// file or full in-memory buffer at any point. This is what makes
+// `llmman transfer` behave like `skopeo copy` for large HuggingFace files:
+// bytes flow source → destination without ever landing on disk in between.
+func pushStream(ctx context.Context, pusher remotes.Pusher, desc ocispec.Descriptor, r io.Reader) error {
+	cw, err := pusher.Push(ctx, desc)
+	if err != nil {
+		if errdefs.IsAlreadyExists(err) {
+			return nil
+		}
+		return describeErr(err)
+	}
+	defer cw.Close()
+	return describeErr(content.Copy(ctx, cw, r, desc.Size, desc.Digest))
 }
 
 // ---------------------------------------------------------------------------
@@ -160,70 +204,78 @@ func llmman_logout(cServer *C.char) *C.char {
 //
 //export llmman_push
 func llmman_push(cLayoutDir, cRef *C.char) *C.char {
-	layoutDir := C.GoString(cLayoutDir)
-	ref := C.GoString(cRef)
-	ctx := context.Background()
+	if err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), C.GoString(cRef)); err != nil {
+		return errResp(err)
+	}
+	return okResp("")
+}
 
+// pushToRegistry is llmman_push's implementation, factored out so
+// llmman_transfer's staging-directory fallback (see transferViaStaging in
+// transfer.go) can reuse it without going through CGO.
+func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 	// Locate the manifest in the local index
 	idx, err := readIndex(layoutDir)
 	if err != nil {
-		return errResp(fmt.Errorf("read OCI index: %w", err))
+		return fmt.Errorf("read OCI index: %w", err)
 	}
 	tag := tagFromRef(ref)
 	manifestDesc, err := findManifestDesc(idx, tag)
 	if err != nil {
-		return errResp(err)
+		return err
 	}
 
 	// Read manifest
 	manifestData, err := readBlob(layoutDir, manifestDesc.Digest)
 	if err != nil {
-		return errResp(fmt.Errorf("read manifest blob: %w", err))
+		return fmt.Errorf("read manifest blob: %w", err)
 	}
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
-		return errResp(fmt.Errorf("parse manifest: %w", err))
+		return fmt.Errorf("parse manifest: %w", err)
 	}
 
 	resolver := newResolver(ctx)
 	pusher, err := resolver.Pusher(ctx, ref)
 	if err != nil {
-		return errResp(fmt.Errorf("create pusher: %w", err))
+		return fmt.Errorf("create pusher: %w", err)
 	}
 	provider := &ociProvider{dir: layoutDir}
 
 	// Push layers
 	for _, layer := range manifest.Layers {
 		if err := pushBlob(ctx, pusher, provider, layer); err != nil {
-			return errResp(fmt.Errorf("push layer %s: %w", layer.Digest, err))
+			return fmt.Errorf("push layer %s: %w", layer.Digest, err)
 		}
 	}
 	// Push config
 	if err := pushBlob(ctx, pusher, provider, manifest.Config); err != nil {
-		return errResp(fmt.Errorf("push config: %w", err))
+		return fmt.Errorf("push config: %w", err)
 	}
 	// Push manifest
 	if err := pushBlob(ctx, pusher, provider, manifestDesc); err != nil {
-		return errResp(fmt.Errorf("push manifest: %w", err))
+		return fmt.Errorf("push manifest: %w", err)
 	}
-	return okResp("")
+	return nil
 }
 
 // llmman_pull pulls an image from a registry into a local OCI layout directory.
 //
 //export llmman_pull
 func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
-	ref := C.GoString(cRef)
-	layoutDir := C.GoString(cLayoutDir)
-	ctx := context.Background()
+	if err := pullToLayout(context.Background(), C.GoString(cRef), C.GoString(cLayoutDir)); err != nil {
+		return errResp(err)
+	}
+	return okResp("")
+}
 
+// pullToLayout is llmman_pull's implementation, factored out so
+// llmman_transfer's staging-directory fallback can reuse it.
+func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	// URI-scheme dispatch: hf://, ms://, ngc://, s3://, gs://, /absolute/path.
 	// These bypass the OCI registry probe and HF host detection below.
 	if handled, err := dispatchPull(ctx, ref, layoutDir); handled {
-		if err != nil {
-			return errResp(err)
-		}
-		return okResp("")
+		return err
 	}
 
 	// Normalize: append :latest if reference has no tag or digest
@@ -238,15 +290,12 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	if !isKnownOCIHost(host) {
 		probeClient := &http.Client{Timeout: 5 * time.Second}
 		if isKnownHFHost(host) || !isOCIRegistry(ctx, probeClient, host) {
-			if err := pullHF(ctx, ref, layoutDir); err != nil {
-				return errResp(err)
-			}
-			return okResp("")
+			return pullHF(ctx, ref, layoutDir)
 		}
 	}
 
 	if err := ensureLayout(layoutDir); err != nil {
-		return errResp(fmt.Errorf("init OCI layout: %w", err))
+		return fmt.Errorf("init OCI layout: %w", err)
 	}
 
 	resolver := newResolver(ctx)
@@ -257,49 +306,46 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	// Including ref here too just repeats it two or three times over.
 	name, manifestDesc, err := resolver.Resolve(ctx, ref)
 	if err != nil {
-		return errResp(fmt.Errorf("resolve: %w", err))
+		return fmt.Errorf("resolve: %w", err)
 	}
 	fetcher, err := resolver.Fetcher(ctx, name)
 	if err != nil {
-		return errResp(fmt.Errorf("create fetcher: %w", err))
+		return fmt.Errorf("create fetcher: %w", err)
 	}
 
 	// Fetch and store manifest
 	rc, err := fetcher.Fetch(ctx, manifestDesc)
 	if err != nil {
-		return errResp(fmt.Errorf("fetch manifest: %w", err))
+		return fmt.Errorf("fetch manifest: %w", err)
 	}
 	manifestData, err := io.ReadAll(rc)
 	rc.Close()
 	if err != nil {
-		return errResp(fmt.Errorf("read manifest: %w", err))
+		return fmt.Errorf("read manifest: %w", err)
 	}
 	if _, err := writeBlob(layoutDir, manifestDesc.MediaType, manifestData); err != nil {
-		return errResp(fmt.Errorf("write manifest blob: %w", err))
+		return fmt.Errorf("write manifest blob: %w", err)
 	}
 
 	// Decode manifest to learn about layers and config
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		// Could be an image index — store and return
-		if err2 := updateIndex(layoutDir, ref, manifestDesc); err2 != nil {
-			return errResp(err2)
-		}
-		return okResp("")
+		return updateIndex(layoutDir, ref, manifestDesc)
 	}
 
 	// Fetch config
 	configRC, err := fetcher.Fetch(ctx, manifest.Config)
 	if err != nil {
-		return errResp(fmt.Errorf("fetch config: %w", err))
+		return fmt.Errorf("fetch config: %w", err)
 	}
 	configData, readErr := io.ReadAll(configRC)
 	configRC.Close()
 	if readErr != nil {
-		return errResp(fmt.Errorf("read config: %w", readErr))
+		return fmt.Errorf("read config: %w", readErr)
 	}
 	if _, err := writeBlob(layoutDir, manifest.Config.MediaType, configData); err != nil {
-		return errResp(fmt.Errorf("write config blob: %w", err))
+		return fmt.Errorf("write config blob: %w", err)
 	}
 
 	// Fetch layers in parallel — up to 6 concurrent downloads, matching podman's
@@ -367,14 +413,11 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	}
 	if err := g.Wait(); err != nil {
 		prog.Wait()
-		return errResp(err)
+		return err
 	}
 	prog.Wait()
 
-	if err := updateIndex(layoutDir, ref, manifestDesc); err != nil {
-		return errResp(err)
-	}
-	return okResp("")
+	return updateIndex(layoutDir, ref, manifestDesc)
 }
 
 // llmman_inspect fetches and returns the raw manifest JSON for a remote reference.
@@ -409,4 +452,18 @@ func llmman_inspect(cRef *C.char) *C.char {
 		return okResp(string(data))
 	}
 	return okResp(buf.String())
+}
+
+// llmman_transfer copies an image directly from source to destination —
+// llmman's equivalent of `skopeo copy` — without ever writing it to the
+// persistent local store. See transfer.go for the three strategies this
+// picks between (streamed OCI→OCI, streamed HuggingFace→OCI, and a
+// staging-directory fallback for everything else) and why each exists.
+//
+//export llmman_transfer
+func llmman_transfer(cSource, cDestination *C.char) *C.char {
+	if err := dockerTransfer(context.Background(), C.GoString(cSource), C.GoString(cDestination)); err != nil {
+		return errResp(err)
+	}
+	return okResp("")
 }
