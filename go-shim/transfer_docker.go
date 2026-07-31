@@ -48,6 +48,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/vbauerster/mpb/v8"
 )
 
 // ---------------------------------------------------------------------------
@@ -127,28 +128,54 @@ func dockerTransferOCI(ctx context.Context, source, destination string) error {
 		return pushBytes(ctx, pusher, manifestDesc, manifestData)
 	}
 
-	streamOne := func(desc ocispec.Descriptor) error {
-		rc, err := fetcher.Fetch(ctx, desc)
-		if err != nil {
-			return fmt.Errorf("fetch %s: %w", desc.Digest, err)
+	// "Copying blob/config <digest>" progress bars, matching skopeo's own
+	// copy.Image output exactly (see copy/progress_bars.go upstream).
+	prog := mpb.New(mpb.WithWidth(40), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
+	streamOne := func(desc ocispec.Descriptor, kind string) error {
+		short := shortDigest(desc.Digest)
+		newBar := func() *mpb.Bar {
+			return addLayerBar(prog, "Copying "+kind+" "+short, "Copied  "+kind+" "+short, desc.Size)
 		}
-		defer rc.Close()
-		if err := pushStream(ctx, pusher, desc, rc); err != nil {
+		// pushStreamLazy: don't fetch from the source at all — or create
+		// a bar for it — unless the destination actually needs it; see
+		// pushStreamLazy's own comment for why (shared base layers across
+		// images are exactly the common case this matters for).
+		alreadyExists, err := pushStreamLazy(ctx, pusher, desc, newBar, func() (io.ReadCloser, error) {
+			rc, err := fetcher.Fetch(ctx, desc)
+			if err != nil {
+				return nil, fmt.Errorf("fetch %s: %w", desc.Digest, err)
+			}
+			return rc, nil
+		})
+		if err != nil {
 			return fmt.Errorf("push %s: %w", desc.Digest, err)
 		}
-		fmt.Fprintf(os.Stderr, "Copied   %s\n", shortDigest(desc.Digest))
+		if alreadyExists {
+			fmt.Fprintf(os.Stderr, "Copied  %s %s (already present)\n", kind, short)
+		}
 		return nil
 	}
 
 	for _, layer := range manifest.Layers {
-		if err := streamOne(layer); err != nil {
+		if err := streamOne(layer, "blob"); err != nil {
+			prog.Wait()
 			return err
 		}
 	}
-	if err := streamOne(manifest.Config); err != nil {
+	if err := streamOne(manifest.Config, "config"); err != nil {
+		prog.Wait()
 		return err
 	}
-	return pushBytes(ctx, pusher, manifestDesc, manifestData)
+	prog.Wait()
+
+	// Manifest push: no progress bar (a few hundred bytes of JSON),
+	// mirroring skopeo's own plain "Writing manifest to image
+	// destination" message instead of a bar for this step.
+	if err := pushBytes(ctx, pusher, manifestDesc, manifestData); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +227,11 @@ func dockerTransferHF(ctx context.Context, ref, destination string) error {
 		if err != nil {
 			return err
 		}
-		return pushCNCFSingleManifest(ctx, pusher, "gguf", owner+"/"+repo, chosen.Path, desc)
+		if err := pushCNCFSingleManifest(ctx, pusher, "gguf", owner+"/"+repo, chosen.Path, desc); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
+		return nil
 	}
 
 	var toSend []hfFile
@@ -224,7 +255,11 @@ func dockerTransferHF(ctx context.Context, ref, destination string) error {
 		desc.Annotations = map[string]string{"org.cncf.model.filepath": f.Path}
 		layers = append(layers, desc)
 	}
-	return pushCNCFMultiManifest(ctx, pusher, owner+"/"+repo, layers)
+	if err := pushCNCFMultiManifest(ctx, pusher, owner+"/"+repo, layers); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
+	return nil
 }
 
 // streamHFFileToRegistry copies one HuggingFace file directly into the
@@ -254,19 +289,46 @@ func streamHFFileToRegistry(
 	// pushed image unservable by `llmman run`/`llmman serve` afterwards.
 	annotations := map[string]string{"org.cncf.model.filepath": filepath.Base(file.Path)}
 
-	if dgst, size, ok, err := hfHeadMetadata(ctx, client, url, token); err == nil && ok {
+	// One progress pool per file (mirrors hf.go's own downloadHFBlob,
+	// used by `llmman pull`'s local-layout path, which does the same),
+	// with a "Copying blob <digest-or-filename>" / "Copied  blob ..." bar
+	// matching skopeo's own copy.Image output exactly.
+	prog := mpb.New(mpb.WithWidth(40), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
+
+	dgst, size, digestOK, headErr := hfHeadMetadata(ctx, client, url, token)
+	if headErr == nil && digestOK {
 		desc := ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: size, Annotations: annotations}
-		if err := streamHFGet(ctx, client, url, token, pusher, desc); err != nil {
+		short := shortDigest(dgst)
+		newBar := func() *mpb.Bar {
+			return addLayerBar(prog, "Copying blob "+short, "Copied  blob "+short, size)
+		}
+		alreadyExists, err := streamHFGet(ctx, client, url, token, pusher, desc, newBar)
+		if err != nil {
+			prog.Wait()
 			return ocispec.Descriptor{}, fmt.Errorf("stream %s: %w", file.Path, err)
 		}
-		fmt.Fprintf(os.Stderr, "Transferred %s\n", filepath.Base(file.Path))
+		if alreadyExists {
+			fmt.Fprintf(os.Stderr, "Copied  blob %s (already present)\n", short)
+		}
+		prog.Wait()
 		return desc, nil
 	}
 
-	data, err := hfGetBytes(ctx, client, url, token)
+	// Fallback: buffer a small, non-LFS file in memory. Its digest isn't
+	// known until after the download, so the bar is labeled by filename
+	// instead of digest (still shows real byte progress whenever the HEAD
+	// above did manage to learn a size, even though its digest wasn't
+	// usable — a HEAD failure (headErr != nil) leaves size at its zero
+	// value, so the bar just falls back to a spinner in that case).
+	label := filepath.Base(file.Path)
+	bar := addLayerBar(prog, "Copying blob "+label, "Copied  blob "+label, size)
+	data, err := hfGetBytes(ctx, client, url, token, bar)
 	if err != nil {
+		bar.Abort(false)
+		prog.Wait()
 		return ocispec.Descriptor{}, fmt.Errorf("download %s: %w", file.Path, err)
 	}
+	prog.Wait()
 	desc := ocispec.Descriptor{
 		MediaType:   mediaType,
 		Digest:      digest.FromBytes(data),
@@ -276,30 +338,36 @@ func streamHFFileToRegistry(
 	if err := pushBytes(ctx, pusher, desc, data); err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("push %s: %w", file.Path, err)
 	}
-	fmt.Fprintf(os.Stderr, "Transferred %s\n", filepath.Base(file.Path))
 	return desc, nil
 }
 
-func streamHFGet(ctx context.Context, client *http.Client, url, token string, pusher remotes.Pusher, desc ocispec.Descriptor) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return err
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 && resp.StatusCode != 206 {
-		return fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
-	}
-	return pushStream(ctx, pusher, desc, resp.Body)
+// streamHFGet pushes desc, only opening the GET against HuggingFace at all
+// if the destination doesn't already have this exact blob (see
+// pushStreamLazy) — the common case for re-transferring the same model, or
+// transferring a file whose content happens to match one already pushed
+// under a different name or tag.
+func streamHFGet(ctx context.Context, client *http.Client, url, token string, pusher remotes.Pusher, desc ocispec.Descriptor, newBar func() *mpb.Bar) (alreadyExists bool, err error) {
+	return pushStreamLazy(ctx, pusher, desc, newBar, func() (io.ReadCloser, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != 200 && resp.StatusCode != 206 {
+			resp.Body.Close()
+			return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
+		}
+		return resp.Body, nil
+	})
 }
 
-func hfGetBytes(ctx context.Context, client *http.Client, url, token string) ([]byte, error) {
+func hfGetBytes(ctx context.Context, client *http.Client, url, token string, bar *mpb.Bar) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -315,7 +383,12 @@ func hfGetBytes(ctx context.Context, client *http.Client, url, token string) ([]
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	var r io.Reader = resp.Body
+	if proxyRC := bar.ProxyReader(r); proxyRC != nil {
+		defer proxyRC.Close()
+		r = proxyRC
+	}
+	return io.ReadAll(r)
 }
 
 // ---------------------------------------------------------------------------

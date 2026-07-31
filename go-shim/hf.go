@@ -177,16 +177,10 @@ func hfHeadMetadata(ctx context.Context, client *http.Client, url, token string)
 		return "", 0, false, fmt.Errorf("HEAD %s: HTTP %d", url, resp.StatusCode)
 	}
 
-	etag := resp.Header.Get("X-Linked-Etag")
-	if etag == "" {
-		etag = resp.Header.Get("ETag")
-	}
-	etag = strings.TrimPrefix(etag, "W/")
-	etag = strings.Trim(etag, `"`)
-	if len(etag) != 64 {
-		return "", 0, false, nil // not a sha256 — not LFS, caller should buffer instead
-	}
-
+	// Read size first and independently of digest validity below: callers
+	// that fall back to buffering (small, non-LFS files) still want an
+	// accurate progress-bar size even though the digest can't be trusted
+	// yet — see transfer_docker.go's streamHFFileToRegistry.
 	sizeStr := resp.Header.Get("X-Linked-Size")
 	if sizeStr == "" && resp.StatusCode == 200 {
 		// Only trust a plain Content-Length when there was no redirect —
@@ -194,12 +188,20 @@ func hfHeadMetadata(ctx context.Context, client *http.Client, url, token string)
 		// body, not the file being redirected to.
 		sizeStr = resp.Header.Get("Content-Length")
 	}
-	if sizeStr == "" {
-		return "", 0, false, nil
+	if sizeStr != "" {
+		if n, convErr := parseInt64(sizeStr); convErr == nil {
+			size = n
+		}
 	}
-	size, convErr := parseInt64(sizeStr)
-	if convErr != nil {
-		return "", 0, false, nil
+
+	etag := resp.Header.Get("X-Linked-Etag")
+	if etag == "" {
+		etag = resp.Header.Get("ETag")
+	}
+	etag = strings.TrimPrefix(etag, "W/")
+	etag = strings.Trim(etag, `"`)
+	if len(etag) != 64 {
+		return "", size, false, nil // not a sha256 — not LFS, caller should buffer instead
 	}
 
 	return digest.NewDigestFromEncoded(digest.SHA256, strings.ToLower(etag)), size, true, nil

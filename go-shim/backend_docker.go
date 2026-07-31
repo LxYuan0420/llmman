@@ -136,56 +136,132 @@ func (r *fileReaderAt) ReadAt(p []byte, off int64) (int, error) { return r.f.Rea
 func (r *fileReaderAt) Close() error                            { return r.f.Close() }
 func (r *fileReaderAt) Size() int64                             { return r.size }
 
-// pushBlob pushes a single blob from the OCI layout to the registry pusher.
-func pushBlob(ctx context.Context, pusher remotes.Pusher, provider *ociProvider, desc ocispec.Descriptor) error {
+// pushLazy is the one place that actually talks to pusher.Push. It checks
+// whether the destination already has desc *before* calling open — open
+// returns the content to upload plus a cleanup func (call it even on a nil
+// reader/error, may be nil itself) — and open is only ever invoked once
+// that check has confirmed an upload is actually needed. Returns whether
+// the blob already existed, so callers can print their own "already
+// present" line instead of ever creating a progress bar for it.
+//
+// Checking existence first, unconditionally, matters for two different
+// reasons depending on the caller:
+//   - It avoids ever opening a (potentially multi-gigabyte) source reader
+//     for content that's just going to be thrown away unread — mattering
+//     beyond bandwidth, since leaving a large HTTP response body unread
+//     and then closing it can itself take as long as reading it would
+//     have (the transport may drain it to keep the connection reusable),
+//     which otherwise looks exactly like an unexplained hang.
+//   - It means a progress bar is only ever created for a blob that's
+//     actually going to be incremented. mpb's (*Bar).SetTotal is
+//     documented as a no-op for any bar constructed with a definite
+//     (>0) total — which every bar here is, since every desc.Size is
+//     already known up front — so there is no supported way to
+//     retroactively mark such a bar "already done" after creating it.
+//     Doing so anyway (an earlier version of this code did) silently
+//     leaves that bar incomplete forever, and mpb's pool.Wait() blocks
+//     forever waiting for every bar it knows about to finish — hanging
+//     the whole transfer with no error and no output to explain why.
+func pushLazy(
+	ctx context.Context,
+	pusher remotes.Pusher,
+	desc ocispec.Descriptor,
+	open func() (r io.Reader, bar *mpb.Bar, cleanup func(), err error),
+) (alreadyExists bool, err error) {
 	cw, err := pusher.Push(ctx, desc)
 	if err != nil {
 		if errdefs.IsAlreadyExists(err) {
-			return nil
+			return true, nil
 		}
-		return describeErr(err)
+		return false, describeErr(err)
 	}
 	defer cw.Close()
 
-	ra, err := provider.ReaderAt(ctx, desc)
-	if err != nil {
-		return err
+	r, bar, cleanup, err := open()
+	if cleanup != nil {
+		defer cleanup()
 	}
-	defer ra.Close()
+	if err != nil {
+		return false, err
+	}
+	if copyErr := describeErr(content.Copy(ctx, cw, r, desc.Size, desc.Digest)); copyErr != nil {
+		// A real failure partway through: the bar (if any) was already
+		// incremented some amount short of its total, and never will be
+		// any further — abort it explicitly so it doesn't likewise leave
+		// pool.Wait() hanging on a bar that's now never going anywhere.
+		if bar != nil {
+			bar.Abort(false)
+		}
+		return false, copyErr
+	}
+	return false, nil
+}
 
-	return describeErr(content.Copy(ctx, cw, io.NewSectionReader(ra, 0, ra.Size()), desc.Size, desc.Digest))
+// withBar wraps r in newBar's progress bar (if newBar is non-nil), and
+// returns that bar (so pushLazy can abort it on a copy failure) plus a
+// cleanup func that closes both the bar's proxy reader and r itself (if r
+// is an io.Closer) — for use as pushLazy's open callback.
+func withBar(r io.Reader, newBar func() *mpb.Bar) (io.Reader, *mpb.Bar, func()) {
+	var bar *mpb.Bar
+	closers := []io.Closer{}
+	if rc, ok := r.(io.Closer); ok {
+		closers = append(closers, rc)
+	}
+	if newBar != nil {
+		bar = newBar()
+		if proxyRC := bar.ProxyReader(r); proxyRC != nil {
+			r = proxyRC
+			closers = append(closers, proxyRC)
+		}
+	}
+	return r, bar, func() {
+		for _, c := range closers {
+			c.Close()
+		}
+	}
+}
+
+// pushBlob pushes a single blob from the OCI layout to the registry
+// pusher, reporting progress via newBar — called, and its resulting bar
+// wrapped around the read, only if the blob isn't already at the
+// destination (see pushLazy). Pass nil for no progress reporting.
+func pushBlob(ctx context.Context, pusher remotes.Pusher, provider *ociProvider, desc ocispec.Descriptor, newBar func() *mpb.Bar) (alreadyExists bool, err error) {
+	return pushLazy(ctx, pusher, desc, func() (io.Reader, *mpb.Bar, func(), error) {
+		ra, err := provider.ReaderAt(ctx, desc)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		r, bar, cleanup := withBar(io.NewSectionReader(ra, 0, ra.Size()), newBar)
+		return r, bar, func() { cleanup(); ra.Close() }, nil
+	})
 }
 
 // pushBytes pushes an in-memory blob (a manifest or a small config/metadata
 // file) directly to the registry pusher — no local file involved.
 func pushBytes(ctx context.Context, pusher remotes.Pusher, desc ocispec.Descriptor, data []byte) error {
-	cw, err := pusher.Push(ctx, desc)
-	if err != nil {
-		if errdefs.IsAlreadyExists(err) {
-			return nil
-		}
-		return describeErr(err)
-	}
-	defer cw.Close()
-	return describeErr(content.Copy(ctx, cw, bytes.NewReader(data), desc.Size, desc.Digest))
+	_, err := pushLazy(ctx, pusher, desc, func() (io.Reader, *mpb.Bar, func(), error) {
+		return bytes.NewReader(data), nil, nil, nil
+	})
+	return err
 }
 
-// pushStream pushes a blob whose digest and size are already known (see
-// hfHeadMetadata) directly from a live reader — typically an in-flight HTTP
-// GET response body — straight into the registry pusher, with no local
-// file or full in-memory buffer at any point. This is what makes
-// `llmman transfer` behave like `skopeo copy` for large HuggingFace files:
-// bytes flow source → destination without ever landing on disk in between.
-func pushStream(ctx context.Context, pusher remotes.Pusher, desc ocispec.Descriptor, r io.Reader) error {
-	cw, err := pusher.Push(ctx, desc)
-	if err != nil {
-		if errdefs.IsAlreadyExists(err) {
-			return nil
+// pushStreamLazy pushes a blob whose digest and size are already known
+// (see hfHeadMetadata) from a source opened lazily by openSource — called,
+// and its resulting reader wrapped in a progress bar via newBar, only if
+// the blob isn't already at the destination (see pushLazy). This is what
+// makes `llmman transfer` behave like `skopeo copy` for large HuggingFace
+// files: bytes flow source → destination without ever landing on disk (or
+// getting downloaded at all, if the destination turns out to already have
+// them) in between. Pass a nil newBar for no progress reporting.
+func pushStreamLazy(ctx context.Context, pusher remotes.Pusher, desc ocispec.Descriptor, newBar func() *mpb.Bar, openSource func() (io.ReadCloser, error)) (alreadyExists bool, err error) {
+	return pushLazy(ctx, pusher, desc, func() (io.Reader, *mpb.Bar, func(), error) {
+		rc, err := openSource()
+		if err != nil {
+			return nil, nil, nil, err
 		}
-		return describeErr(err)
-	}
-	defer cw.Close()
-	return describeErr(content.Copy(ctx, cw, r, desc.Size, desc.Digest))
+		r, bar, cleanup := withBar(rc, newBar)
+		return r, bar, cleanup, nil
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -280,20 +356,45 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 	}
 	provider := &ociProvider{dir: layoutDir}
 
+	// "Copying blob/config <digest>" progress bars, matching skopeo's own
+	// copy.Image output exactly (see copy/progress_bars.go upstream).
+	prog := mpb.New(mpb.WithWidth(40), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
+	pushWithBar := func(desc ocispec.Descriptor, kind string) error {
+		short := shortDigest(desc.Digest)
+		newBar := func() *mpb.Bar {
+			return addLayerBar(prog, "Copying "+kind+" "+short, "Copied  "+kind+" "+short, desc.Size)
+		}
+		alreadyExists, err := pushBlob(ctx, pusher, provider, desc, newBar)
+		if err != nil {
+			return err
+		}
+		if alreadyExists {
+			fmt.Fprintf(os.Stderr, "Copied  %s %s (already present)\n", kind, short)
+		}
+		return nil
+	}
+
 	// Push layers
 	for _, layer := range manifest.Layers {
-		if err := pushBlob(ctx, pusher, provider, layer); err != nil {
+		if err := pushWithBar(layer, "blob"); err != nil {
+			prog.Wait()
 			return fmt.Errorf("push layer %s: %w", layer.Digest, err)
 		}
 	}
 	// Push config
-	if err := pushBlob(ctx, pusher, provider, manifest.Config); err != nil {
+	if err := pushWithBar(manifest.Config, "config"); err != nil {
+		prog.Wait()
 		return fmt.Errorf("push config: %w", err)
 	}
-	// Push manifest
-	if err := pushBlob(ctx, pusher, provider, manifestDesc); err != nil {
+	prog.Wait()
+
+	// Push manifest — no progress bar (a few hundred bytes of JSON),
+	// mirroring skopeo's own plain "Writing manifest to image
+	// destination" message instead of a bar for this step.
+	if _, err := pushBlob(ctx, pusher, provider, manifestDesc, nil); err != nil {
 		return fmt.Errorf("push manifest: %w", err)
 	}
+	fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
 	return nil
 }
 
