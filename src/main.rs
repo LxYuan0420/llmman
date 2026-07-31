@@ -6,6 +6,7 @@ mod daemon;
 mod ffi;
 mod fmt;
 mod hf;
+mod oauth;
 mod shortnames;
 mod storage;
 pub mod webui;
