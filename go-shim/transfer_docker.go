@@ -245,9 +245,17 @@ func streamHFFileToRegistry(
 	mediaType string,
 ) (ocispec.Descriptor, error) {
 	url := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + file.Path
+	// org.cncf.model.filepath on the *layer* descriptor itself (not just
+	// the manifest) is what cmd::serve's layer_filepath/is_gguf_layer
+	// actually look at to recognize a servable GGUF/safetensors layer —
+	// see downloadAttempt in hf.go, which sets the same annotation for
+	// `llmman pull`'s local-layout path. Omitting it here doesn't fail
+	// the transfer itself (the push succeeds either way), but leaves the
+	// pushed image unservable by `llmman run`/`llmman serve` afterwards.
+	annotations := map[string]string{"org.cncf.model.filepath": filepath.Base(file.Path)}
 
 	if dgst, size, ok, err := hfHeadMetadata(ctx, client, url, token); err == nil && ok {
-		desc := ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: size}
+		desc := ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: size, Annotations: annotations}
 		if err := streamHFGet(ctx, client, url, token, pusher, desc); err != nil {
 			return ocispec.Descriptor{}, fmt.Errorf("stream %s: %w", file.Path, err)
 		}
@@ -259,7 +267,12 @@ func streamHFFileToRegistry(
 	if err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("download %s: %w", file.Path, err)
 	}
-	desc := ocispec.Descriptor{MediaType: mediaType, Digest: digest.FromBytes(data), Size: int64(len(data))}
+	desc := ocispec.Descriptor{
+		MediaType:   mediaType,
+		Digest:      digest.FromBytes(data),
+		Size:        int64(len(data)),
+		Annotations: annotations,
+	}
 	if err := pushBytes(ctx, pusher, desc, data); err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("push %s: %w", file.Path, err)
 	}
