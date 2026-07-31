@@ -128,13 +128,19 @@ func dockerTransferOCI(ctx context.Context, source, destination string) error {
 		return pushBytes(ctx, pusher, manifestDesc, manifestData)
 	}
 
-	// "Copying blob/config <digest>" progress bars, matching skopeo's own
-	// copy.Image output exactly (see copy/progress_bars.go upstream).
+	// "Transferring blob/config <digest>" progress bars — "Transferring",
+	// not skopeo's own "Copying", because this is genuinely simultaneous:
+	// the fetch from source and the push to destination happen at the
+	// same time, streamed straight through with nothing landing on local
+	// disk in between (see pushStreamLazy). "Copying" is left for
+	// llmman_push's own progress bars (pushToRegistry in this file),
+	// where the source is already sitting on local disk beforehand — an
+	// actual one-directional copy, not a simultaneous transfer.
 	prog := mpb.New(mpb.WithWidth(40), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
 	streamOne := func(desc ocispec.Descriptor, kind string) error {
 		short := shortDigest(desc.Digest)
 		newBar := func() *mpb.Bar {
-			return addLayerBar(prog, "Copying "+kind+" "+short, "Copied  "+kind+" "+short, desc.Size)
+			return addLayerBar(prog, "Transferring "+kind+" "+short, "Transferred  "+kind+" "+short, desc.Size)
 		}
 		// pushStreamLazy: don't fetch from the source at all — or create
 		// a bar for it — unless the destination actually needs it; see
@@ -151,7 +157,7 @@ func dockerTransferOCI(ctx context.Context, source, destination string) error {
 			return fmt.Errorf("push %s: %w", desc.Digest, err)
 		}
 		if alreadyExists {
-			fmt.Fprintf(os.Stderr, "Copied  %s %s (already present)\n", kind, short)
+			fmt.Fprintf(os.Stderr, "Transferred %s %s (already present)\n", kind, short)
 		}
 		return nil
 	}
@@ -290,17 +296,21 @@ func streamHFFileToRegistry(
 	annotations := map[string]string{"org.cncf.model.filepath": filepath.Base(file.Path)}
 
 	// One progress pool per file (mirrors hf.go's own downloadHFBlob,
-	// used by `llmman pull`'s local-layout path, which does the same),
-	// with a "Copying blob <digest-or-filename>" / "Copied  blob ..." bar
-	// matching skopeo's own copy.Image output exactly.
+	// used by `llmman pull`'s local-layout path, which does the same).
 	prog := mpb.New(mpb.WithWidth(40), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
 
 	dgst, size, digestOK, headErr := hfHeadMetadata(ctx, client, url, token)
 	if headErr == nil && digestOK {
 		desc := ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: size, Annotations: annotations}
 		short := shortDigest(dgst)
+		// "Transferring", not "Copying": the GET from HuggingFace and the
+		// push to the destination happen simultaneously here — streamed
+		// straight through with nothing landing on local disk in between
+		// (see pushStreamLazy) — unlike the buffered small-file fallback
+		// below, which really is download-then-push and keeps "Copying"
+		// for its (download-phase-only) bar accordingly.
 		newBar := func() *mpb.Bar {
-			return addLayerBar(prog, "Copying blob "+short, "Copied  blob "+short, size)
+			return addLayerBar(prog, "Transferring blob "+short, "Transferred  blob "+short, size)
 		}
 		alreadyExists, err := streamHFGet(ctx, client, url, token, pusher, desc, newBar)
 		if err != nil {
@@ -308,7 +318,7 @@ func streamHFFileToRegistry(
 			return ocispec.Descriptor{}, fmt.Errorf("stream %s: %w", file.Path, err)
 		}
 		if alreadyExists {
-			fmt.Fprintf(os.Stderr, "Copied  blob %s (already present)\n", short)
+			fmt.Fprintf(os.Stderr, "Transferred  blob %s (already present)\n", short)
 		}
 		prog.Wait()
 		return desc, nil
