@@ -9,6 +9,7 @@ package main
 import "C"
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"unsafe"
@@ -26,6 +27,32 @@ func init() {
 	if os.Getenv("LLMMAN_DEBUG") != "" {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
+	logrus.SetOutput(&filteredLogOutput{out: os.Stderr})
+}
+
+// filteredLogOutput drops specific known-benign containerd log lines that
+// would otherwise print unconditionally on every push/transfer and look
+// like something is wrong when nothing is. Every model layer/config
+// llmman pushes uses a custom CNCF ModelPack media type (e.g.
+// application/vnd.cncf.model.weight.v1.raw) rather than one of the
+// standard OCI media types containerd's remotes.MakeRefKey recognizes
+// (layer/config/manifest/index) — MakeRefKey only uses that recognition
+// to pick a prefix for an internal upload-tracking key, and falls back to
+// "unknown-<digest>" perfectly correctly when it doesn't recognize one,
+// but also unconditionally logs a warning on that path
+// (containerd/v2/core/remotes/handlers.go's MakeRefKey) with no way to
+// suppress it from the caller's side (it's not gated by log level, and
+// there's no exported option to opt out). The push/transfer itself is
+// entirely unaffected either way; the warning has no diagnostic value.
+type filteredLogOutput struct {
+	out *os.File
+}
+
+func (w *filteredLogOutput) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("reference for unknown type")) {
+		return len(p), nil
+	}
+	return w.out.Write(p)
 }
 
 // response is the JSON envelope returned by every exported function.
