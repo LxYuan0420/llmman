@@ -37,17 +37,51 @@ import (
 // Credential helpers
 // ---------------------------------------------------------------------------
 
+// dockerCredentials looks up stored credentials for host. containerd's
+// dockerAuthorizer calls this with the *actual connection host* it's
+// talking to (see AddResponses in containerd/v2/core/remotes/docker/
+// authorizer.go: `host := last.Request.URL.Host`) — which for Docker Hub
+// is "registry-1.docker.io" (containerd/dockerconfig.ConfigureHosts
+// rewrites "docker.io" to that for the connection itself, but the
+// Credentials callback still sees the post-rewrite host). `llmman login`/
+// `docker login` store credentials under "docker.io" (or the legacy
+// "index.docker.io"/"https://index.docker.io/v1/" keys real `docker
+// login` also writes), never under "registry-1.docker.io" — so without
+// this normalization, every push/pull that reaches an authenticated Hub
+// endpoint (bearer or basic) silently runs anonymously instead (a
+// credential-store miss isn't an error here, by design, so nothing ever
+// surfaced this beyond a confusing downstream "insufficient_scope" or
+// 401 on push).
 func dockerCredentials(host string) (string, string, error) {
 	cfg := dockercliconfig.LoadDefaultConfigFile(io.Discard)
-	store := cfg.GetCredentialsStore(host)
-	creds, err := store.Get(host)
-	if err != nil {
-		return "", "", nil // not an error — just not found
+	for _, lookup := range dockerHubCredentialKeys(host) {
+		store := cfg.GetCredentialsStore(lookup)
+		creds, err := store.Get(lookup)
+		if err != nil {
+			continue // not found under this key — try the next one
+		}
+		if creds.Username == "" && creds.Password == "" && creds.IdentityToken == "" {
+			continue
+		}
+		if creds.IdentityToken != "" {
+			return "", creds.IdentityToken, nil
+		}
+		return creds.Username, creds.Password, nil
 	}
-	if creds.IdentityToken != "" {
-		return "", creds.IdentityToken, nil
+	return "", "", nil // not an error — just not found under any key
+}
+
+// dockerHubCredentialKeys returns every credential-store key that could
+// plausibly hold Docker Hub credentials for a given connection host,
+// broadest/most-canonical first. For any non-Hub host this is just the
+// host itself, unchanged.
+func dockerHubCredentialKeys(host string) []string {
+	switch host {
+	case "registry-1.docker.io", "index.docker.io", "docker.io", "https://index.docker.io/v1/":
+		return []string{"docker.io", "index.docker.io", "https://index.docker.io/v1/", "registry-1.docker.io"}
+	default:
+		return []string{host}
 	}
-	return creds.Username, creds.Password, nil
 }
 
 func newResolver(ctx context.Context) remotes.Resolver {
@@ -236,7 +270,11 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 	}
 
 	resolver := newResolver(ctx)
-	pusher, err := resolver.Pusher(ctx, ref)
+	// normalizeTag: a tagless ref pushes the manifest addressable only by
+	// digest, with no tag ever created — silently, since containerd has
+	// no opinion on what a missing tag should default to. See
+	// transfer_docker.go's dockerTransfer for the same fix applied there.
+	pusher, err := resolver.Pusher(ctx, normalizeTag(ref))
 	if err != nil {
 		return fmt.Errorf("create pusher: %w", err)
 	}

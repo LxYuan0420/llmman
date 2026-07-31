@@ -10,8 +10,23 @@ import "C"
 
 import (
 	"encoding/json"
+	"os"
 	"unsafe"
+
+	"github.com/sirupsen/logrus"
 )
+
+// LLMMAN_DEBUG=1 (or any non-empty value) surfaces containerd's own
+// request/response debug logging — including the exact registry scope
+// requested and the token/auth challenge exchange — which is otherwise
+// only logged at debug level and invisible by default. Useful for
+// diagnosing registry-side auth/scope rejections (401/403/"insufficient_
+// scope") without needing to instrument anything by hand.
+func init() {
+	if os.Getenv("LLMMAN_DEBUG") != "" {
+		logrus.SetLevel(logrus.DebugLevel)
+	}
+}
 
 // response is the JSON envelope returned by every exported function.
 // Rust deserialises this to decide success/failure.

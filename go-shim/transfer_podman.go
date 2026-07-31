@@ -31,6 +31,9 @@ import (
 )
 
 func podmanTransfer(ctx context.Context, source, destination string) error {
+	// See transfer_docker.go's dockerTransfer for why a tagless
+	// destination must default to :latest explicitly here.
+	destination = normalizeTag(destination)
 	kind, normalized := classifySource(ctx, source)
 	if kind == sourceOCI {
 		return podmanTransferOCI(ctx, normalized, destination)

@@ -152,12 +152,28 @@ func hfHeadMetadata(ctx context.Context, client *http.Client, url, token string)
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	req.Header.Set("Accept-Encoding", "identity") // force the real, uncompressed size
-	resp, err := client.Do(req)
+
+	// Do NOT follow the redirect: huggingface.co sets X-Linked-Etag/
+	// X-Linked-Size on its own redirecting response (pointing at the real
+	// content's sha256/size before it hands off to a CDN); the CDN's own
+	// response has neither header and sets an unrelated ETag of its own
+	// (its storage object's identifier, not a content hash we can trust)
+	// — using that instead silently produces a wrong digest that a
+	// registry push then rejects as DIGEST_INVALID after fully uploading
+	// the (correct) bytes under the (wrong) declared name.
+	noRedirect := &http.Client{
+		Transport: client.Transport,
+		Timeout:   client.Timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := noRedirect.Do(req)
 	if err != nil {
 		return "", 0, false, fmt.Errorf("HEAD %s: %w", url, err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != 200 && (resp.StatusCode < 300 || resp.StatusCode >= 400) {
 		return "", 0, false, fmt.Errorf("HEAD %s: HTTP %d", url, resp.StatusCode)
 	}
 
@@ -172,8 +188,14 @@ func hfHeadMetadata(ctx context.Context, client *http.Client, url, token string)
 	}
 
 	sizeStr := resp.Header.Get("X-Linked-Size")
-	if sizeStr == "" {
+	if sizeStr == "" && resp.StatusCode == 200 {
+		// Only trust a plain Content-Length when there was no redirect —
+		// a redirect response's Content-Length describes its own (tiny)
+		// body, not the file being redirected to.
 		sizeStr = resp.Header.Get("Content-Length")
+	}
+	if sizeStr == "" {
+		return "", 0, false, nil
 	}
 	size, convErr := parseInt64(sizeStr)
 	if convErr != nil {

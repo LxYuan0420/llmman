@@ -100,8 +100,13 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 		return fmt.Errorf("parse src ref %q: %w", srcStr, err)
 	}
 
-	// Destination: Docker registry
-	dstStr := "docker://" + ref
+	// Destination: Docker registry. containers/image's docker transport
+	// already defaults a tagless ref to :latest internally, but
+	// normalizing here too keeps this consistent with the docker/
+	// containerd backend (whose resolver has no such default — see
+	// backend_docker.go's pushToRegistry) and the local index.json tag
+	// lookup above, which effectively assumes the same thing.
+	dstStr := "docker://" + normalizeTag(ref)
 	dstRef, err := alltransports.ParseImageName(dstStr)
 	if err != nil {
 		return fmt.Errorf("parse dst ref %q: %w", dstStr, err)

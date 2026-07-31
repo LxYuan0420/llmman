@@ -55,6 +55,14 @@ import (
 // ---------------------------------------------------------------------------
 
 func dockerTransfer(ctx context.Context, source, destination string) error {
+	// A tagless destination (e.g. "docker.io/owner/repo") must default to
+	// :latest here explicitly: unlike a local OCI layout's index.json
+	// (which always has some ref-name annotation to look up),
+	// resolver.Pusher parses the ref as given, and a repository object
+	// left empty pushes the manifest addressable only by digest — no tag
+	// is ever created, silently, so a plain `docker pull owner/repo`
+	// afterwards would find nothing.
+	destination = normalizeTag(destination)
 	kind, normalized := classifySource(ctx, source)
 	switch kind {
 	case sourceOCI:
