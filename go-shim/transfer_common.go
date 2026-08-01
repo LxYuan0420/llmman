@@ -4,9 +4,7 @@ package main
 
 import (
 	"context"
-	"net/http"
 	"strings"
-	"time"
 
 	digest "github.com/opencontainers/go-digest"
 )
@@ -43,14 +41,7 @@ func classifySource(ctx context.Context, ref string) (transferSourceKind, string
 
 	normalized := normalizeTag(ref)
 	host := strings.SplitN(normalized, "/", 2)[0]
-	if isKnownHFHost(host) {
-		return sourceHF, normalized
-	}
-	if isKnownOCIHost(host) {
-		return sourceOCI, normalized
-	}
-	probeClient := &http.Client{Timeout: 5 * time.Second}
-	if isOCIRegistry(ctx, probeClient, host) {
+	if isOCIHost(ctx, host) {
 		return sourceOCI, normalized
 	}
 	return sourceHF, normalized

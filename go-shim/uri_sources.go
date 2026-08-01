@@ -27,7 +27,6 @@ import (
 	"strings"
 	"time"
 
-	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
 
@@ -122,10 +121,51 @@ type modelPackFile struct {
 	mediaType    string // CNCF media type (empty → auto-detected)
 }
 
+// downloadToPackFile downloads one file into a temp blob path under
+// layoutDir/blobs, reporting progress via a bar added to prog, and returns a
+// modelPackFile referencing the downloaded temp path on success — the shared
+// inner-loop body of every cloud-source pull below (ModelScope, NGC, S3,
+// GCS). open performs the actual GET/GetObject call and returns the
+// response body; tmpPrefix namespaces the temp file per source kind (e.g.
+// "ms", "ngc") to avoid collisions, and kind labels error messages (e.g.
+// "ModelScope", "NGC"). Callers remain responsible for calling prog.Wait()
+// once, after the whole download loop finishes (successfully or not).
+func downloadToPackFile(prog *mpb.Progress, layoutDir, tmpPrefix, kind, relPath string, size int64, open func() (io.ReadCloser, error)) (modelPackFile, error) {
+	tmpPath := filepath.Join(layoutDir, "blobs", tmpPrefix+"-"+strings.ReplaceAll(relPath, "/", "_")+".part")
+	bar := addLayerBar(prog, "Pulling  "+filepath.Base(relPath), "Pulled   "+filepath.Base(relPath), size)
+
+	body, err := open()
+	if err != nil {
+		bar.Abort(false)
+		return modelPackFile{}, fmt.Errorf("%s download %s: %w", kind, relPath, err)
+	}
+
+	fh, err := os.Create(tmpPath)
+	if err != nil {
+		body.Close()
+		bar.Abort(false)
+		return modelPackFile{}, err
+	}
+	proxy := proxyOrNop(bar, body)
+	_, copyErr := io.Copy(fh, proxy)
+	proxy.Close()
+	fh.Close()
+	body.Close()
+	if copyErr != nil {
+		os.Remove(tmpPath)
+		return modelPackFile{}, fmt.Errorf("%s write %s: %w", kind, relPath, copyErr)
+	}
+
+	return modelPackFile{localPath: tmpPath, relativePath: relPath}, nil
+}
+
 // packFilesAsModelPack writes each file as a raw blob and creates a conformant
 // CNCF ModelPack OCI manifest referencing them all.  Reuses the same storage
-// primitives as the HF path so the format is identical.
-func packFilesAsModelPack(layoutDir, ref, modelRepo string, files []modelPackFile) error {
+// primitives as the HF path so the format is identical. verbose additionally
+// prints a "stored <path> (<size> bytes)" line per file — used by pullLocal's
+// local-directory import, which has no download progress bar to show the
+// work happening otherwise.
+func packFilesAsModelPack(layoutDir, ref, modelRepo string, files []modelPackFile, verbose bool) error {
 	var layers []ocispec.Descriptor
 
 	for _, f := range files {
@@ -134,33 +174,22 @@ func packFilesAsModelPack(layoutDir, ref, modelRepo string, files []modelPackFil
 			mt = classifyFile(f.relativePath)
 		}
 
-		// Stream the file into the content-addressed blob store.
-		fh, err := os.Open(f.localPath)
-		if err != nil {
-			return fmt.Errorf("open %s: %w", f.localPath, err)
-		}
-		fi, err := fh.Stat()
-		fh.Close()
-		if err != nil {
-			return fmt.Errorf("stat %s: %w", f.localPath, err)
-		}
-
 		data, err := os.ReadFile(f.localPath)
 		if err != nil {
 			return fmt.Errorf("read %s: %w", f.localPath, err)
 		}
 
-		dgst := digest.FromBytes(data)
 		desc, err := writeBlob(layoutDir, mt, data)
 		if err != nil {
 			return fmt.Errorf("store %s: %w", f.relativePath, err)
 		}
-		desc.Size = fi.Size()
-		desc.Digest = dgst
 		desc.Annotations = map[string]string{
 			"org.cncf.model.filepath": f.relativePath,
 		}
 		layers = append(layers, desc)
+		if verbose {
+			fmt.Fprintf(os.Stderr, "  stored %s (%d bytes)\n", f.relativePath, desc.Size)
+		}
 	}
 
 	return storeSafetensorsAsOCI(layoutDir, ref, modelRepo, layers)
@@ -203,8 +232,7 @@ func pullModelScope(ctx context.Context, msRef, layoutDir string) error {
 	storeRef := fmt.Sprintf("ms://%s/%s:%s", owner, repo, revision)
 
 	// Fast path: already cached.
-	if name := cachedLayerName(layoutDir, storeRef); name != "" {
-		fmt.Fprintf(os.Stderr, "Cached   %s/%s\n", owner, repo)
+	if reportCached(layoutDir, storeRef, owner+"/"+repo) {
 		return nil
 	}
 
@@ -254,46 +282,22 @@ func pullModelScope(ctx context.Context, msRef, layoutDir string) error {
 		dlURL := fmt.Sprintf("%s/%s/%s/resolve/%s/%s",
 			endpoint, owner, repo, revision, f.Path)
 
-		tmpPath := filepath.Join(layoutDir, "blobs", "ms-"+strings.ReplaceAll(f.Path, "/", "_")+".part")
-
-		bar := addLayerBar(prog, "Pulling  "+filepath.Base(f.Path), "Pulled   "+filepath.Base(f.Path), f.Size)
-
-		req2, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
-		if token != "" {
-			req2.Header.Set("Authorization", "Token "+token)
-		}
-		r, err := dlClient.Do(req2)
+		pf, err := downloadToPackFile(prog, layoutDir, "ms", "ModelScope", f.Path, f.Size, func() (io.ReadCloser, error) {
+			req2, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
+			if token != "" {
+				req2.Header.Set("Authorization", "Token "+token)
+			}
+			r, err := dlClient.Do(req2)
+			if err != nil {
+				return nil, err
+			}
+			return r.Body, nil
+		})
 		if err != nil {
-			bar.Abort(false)
-			prog.Wait()
-			return fmt.Errorf("download %s: %w", f.Path, err)
-		}
-
-		fh, err := os.Create(tmpPath)
-		if err != nil {
-			r.Body.Close()
-			bar.Abort(false)
 			prog.Wait()
 			return err
 		}
-		proxy := bar.ProxyReader(r.Body)
-		if proxy == nil {
-			proxy = io.NopCloser(r.Body)
-		}
-		_, copyErr := io.Copy(fh, proxy)
-		proxy.Close()
-		fh.Close()
-		r.Body.Close()
-		if copyErr != nil {
-			os.Remove(tmpPath)
-			prog.Wait()
-			return fmt.Errorf("write %s: %w", f.Path, copyErr)
-		}
-
-		packFiles = append(packFiles, modelPackFile{
-			localPath:    tmpPath,
-			relativePath: f.Path,
-		})
+		packFiles = append(packFiles, pf)
 	}
 	prog.Wait()
 
@@ -301,7 +305,7 @@ func pullModelScope(ctx context.Context, msRef, layoutDir string) error {
 		return fmt.Errorf("no model files found in ModelScope repo %s/%s", owner, repo)
 	}
 
-	err = packFilesAsModelPack(layoutDir, storeRef, owner+"/"+repo, packFiles)
+	err = packFilesAsModelPack(layoutDir, storeRef, owner+"/"+repo, packFiles, false)
 	for _, f := range packFiles {
 		os.Remove(f.localPath)
 	}
@@ -330,8 +334,7 @@ func pullNGC(ctx context.Context, ngcRef, layoutDir string) error {
 	}
 
 	storeRef := ngcRef
-	if name := cachedLayerName(layoutDir, storeRef); name != "" {
-		fmt.Fprintf(os.Stderr, "Cached   %s\n", modelPath)
+	if reportCached(layoutDir, storeRef, modelPath) {
 		return nil
 	}
 
@@ -395,32 +398,20 @@ func pullNGC(ctx context.Context, ngcRef, layoutDir string) error {
 				apiBase, pathSegs[0], pathSegs[1], pathSegs[2], version, f.Name)
 		}
 
-		tmpPath := filepath.Join(layoutDir, "blobs", "ngc-"+strings.ReplaceAll(f.Name, "/", "_")+".part")
-		bar := addLayerBar(prog, "Pulling  "+filepath.Base(f.Name), "Pulled   "+filepath.Base(f.Name), f.Size)
-
-		req2, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
-		req2.Header.Set("Authorization", "Bearer "+apiKey)
-		r, err := dlClient.Do(req2)
+		pf, err := downloadToPackFile(prog, layoutDir, "ngc", "NGC", f.Name, f.Size, func() (io.ReadCloser, error) {
+			req2, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
+			req2.Header.Set("Authorization", "Bearer "+apiKey)
+			r, err := dlClient.Do(req2)
+			if err != nil {
+				return nil, err
+			}
+			return r.Body, nil
+		})
 		if err != nil {
-			bar.Abort(false)
 			prog.Wait()
-			return fmt.Errorf("NGC download %s: %w", f.Name, err)
+			return err
 		}
-		fh, _ := os.Create(tmpPath)
-		proxy := bar.ProxyReader(r.Body)
-		if proxy == nil {
-			proxy = io.NopCloser(r.Body)
-		}
-		_, copyErr := io.Copy(fh, proxy)
-		proxy.Close()
-		fh.Close()
-		r.Body.Close()
-		if copyErr != nil {
-			os.Remove(tmpPath)
-			prog.Wait()
-			return fmt.Errorf("NGC write %s: %w", f.Name, copyErr)
-		}
-		packFiles = append(packFiles, modelPackFile{localPath: tmpPath, relativePath: f.Name})
+		packFiles = append(packFiles, pf)
 	}
 	prog.Wait()
 
@@ -428,7 +419,7 @@ func pullNGC(ctx context.Context, ngcRef, layoutDir string) error {
 		return fmt.Errorf("no model files found in NGC model %s", modelPath)
 	}
 
-	err = packFilesAsModelPack(layoutDir, storeRef, modelPath, packFiles)
+	err = packFilesAsModelPack(layoutDir, storeRef, modelPath, packFiles, false)
 	for _, f := range packFiles {
 		os.Remove(f.localPath)
 	}
@@ -450,8 +441,7 @@ func pullS3(ctx context.Context, s3Ref, layoutDir string) error {
 	prefix := withoutScheme[slashIdx+1:]
 
 	storeRef := s3Ref
-	if name := cachedLayerName(layoutDir, storeRef); name != "" {
-		fmt.Fprintf(os.Stderr, "Cached   %s\n", withoutScheme)
+	if reportCached(layoutDir, storeRef, withoutScheme) {
 		return nil
 	}
 
@@ -511,34 +501,22 @@ func pullS3(ctx context.Context, s3Ref, layoutDir string) error {
 			continue
 		}
 
-		tmpPath := filepath.Join(layoutDir, "blobs", "s3-"+strings.ReplaceAll(relPath, "/", "_")+".part")
-		bar := addLayerBar(prog, "Pulling  "+filepath.Base(relPath), "Pulled   "+filepath.Base(relPath), obj.size)
-
-		result, err := client.GetObject(ctx, &s3.GetObjectInput{
-			Bucket: &bucket,
-			Key:    &obj.key,
+		key := obj.key
+		pf, err := downloadToPackFile(prog, layoutDir, "s3", "S3", relPath, obj.size, func() (io.ReadCloser, error) {
+			result, err := client.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: &bucket,
+				Key:    &key,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return result.Body, nil
 		})
 		if err != nil {
-			bar.Abort(false)
 			prog.Wait()
-			return fmt.Errorf("S3 get %s: %w", obj.key, err)
+			return err
 		}
-
-		fh, _ := os.Create(tmpPath)
-		proxy := bar.ProxyReader(result.Body)
-		if proxy == nil {
-			proxy = io.NopCloser(result.Body)
-		}
-		_, copyErr := io.Copy(fh, proxy)
-		proxy.Close()
-		fh.Close()
-		result.Body.Close()
-		if copyErr != nil {
-			os.Remove(tmpPath)
-			prog.Wait()
-			return fmt.Errorf("S3 write %s: %w", relPath, copyErr)
-		}
-		packFiles = append(packFiles, modelPackFile{localPath: tmpPath, relativePath: relPath})
+		packFiles = append(packFiles, pf)
 	}
 	prog.Wait()
 
@@ -546,7 +524,7 @@ func pullS3(ctx context.Context, s3Ref, layoutDir string) error {
 		return fmt.Errorf("no model files found at s3://%s/%s", bucket, prefix)
 	}
 
-	err = packFilesAsModelPack(layoutDir, storeRef, withoutScheme, packFiles)
+	err = packFilesAsModelPack(layoutDir, storeRef, withoutScheme, packFiles, false)
 	for _, f := range packFiles {
 		os.Remove(f.localPath)
 	}
@@ -570,8 +548,7 @@ func pullGCS(ctx context.Context, gsRef, layoutDir string) error {
 	prefix := withoutScheme[slashIdx+1:]
 
 	storeRef := gsRef
-	if name := cachedLayerName(layoutDir, storeRef); name != "" {
-		fmt.Fprintf(os.Stderr, "Cached   %s\n", withoutScheme)
+	if reportCached(layoutDir, storeRef, withoutScheme) {
 		return nil
 	}
 
@@ -640,34 +617,22 @@ func pullGCS(ctx context.Context, gsRef, layoutDir string) error {
 		encodedName := strings.ReplaceAll(obj.Name, "/", "%2F")
 		dlURL := fmt.Sprintf("%s/b/%s/o/%s?alt=media", apiBase, bucket, encodedName)
 
-		tmpPath := filepath.Join(layoutDir, "blobs", "gs-"+strings.ReplaceAll(relPath, "/", "_")+".part")
-		bar := addLayerBar(prog, "Pulling  "+filepath.Base(relPath), "Pulled   "+filepath.Base(relPath), 0)
-
-		req2, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
-		if token != "" {
-			req2.Header.Set("Authorization", "Bearer "+token)
-		}
-		r, err := dlClient.Do(req2)
+		pf, err := downloadToPackFile(prog, layoutDir, "gs", "GCS", relPath, 0, func() (io.ReadCloser, error) {
+			req2, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
+			if token != "" {
+				req2.Header.Set("Authorization", "Bearer "+token)
+			}
+			r, err := dlClient.Do(req2)
+			if err != nil {
+				return nil, err
+			}
+			return r.Body, nil
+		})
 		if err != nil {
-			bar.Abort(false)
 			prog.Wait()
-			return fmt.Errorf("GCS download %s: %w", obj.Name, err)
+			return err
 		}
-		fh, _ := os.Create(tmpPath)
-		proxy := bar.ProxyReader(r.Body)
-		if proxy == nil {
-			proxy = io.NopCloser(r.Body)
-		}
-		_, copyErr := io.Copy(fh, proxy)
-		proxy.Close()
-		fh.Close()
-		r.Body.Close()
-		if copyErr != nil {
-			os.Remove(tmpPath)
-			prog.Wait()
-			return fmt.Errorf("GCS write %s: %w", relPath, copyErr)
-		}
-		packFiles = append(packFiles, modelPackFile{localPath: tmpPath, relativePath: relPath})
+		packFiles = append(packFiles, pf)
 	}
 	prog.Wait()
 
@@ -675,7 +640,7 @@ func pullGCS(ctx context.Context, gsRef, layoutDir string) error {
 		return fmt.Errorf("no model files found at gs://%s/%s", bucket, prefix)
 	}
 
-	err2 := packFilesAsModelPack(layoutDir, storeRef, withoutScheme, packFiles)
+	err2 := packFilesAsModelPack(layoutDir, storeRef, withoutScheme, packFiles, false)
 	for _, f := range packFiles {
 		os.Remove(f.localPath)
 	}
@@ -749,8 +714,7 @@ func pullLocal(localPath, layoutDir string) error {
 	}
 
 	storeRef := localPath
-	if name := cachedLayerName(layoutDir, storeRef); name != "" {
-		fmt.Fprintf(os.Stderr, "Cached   %s\n", localPath)
+	if reportCached(layoutDir, storeRef, localPath) {
 		return nil
 	}
 
@@ -779,54 +743,10 @@ func pullLocal(localPath, layoutDir string) error {
 
 	fmt.Fprintf(os.Stderr, "Importing %d files from %s\n", len(packFiles), localPath)
 
-	// For local files we reference by path directly — no temp copies needed.
-	// Override packFilesAsModelPack to avoid copying large weight files.
-	return packLocalFilesAsModelPack(layoutDir, storeRef, filepath.Base(localPath), packFiles)
-}
-
-// packLocalFilesAsModelPack is like packFilesAsModelPack but streams files
-// through writeBlobStream rather than reading them fully into memory.
-func packLocalFilesAsModelPack(layoutDir, ref, modelRepo string, files []modelPackFile) error {
-	var layers []ocispec.Descriptor
-
-	for _, f := range files {
-		mt := f.mediaType
-		if mt == "" {
-			mt = classifyFile(f.relativePath)
-		}
-
-		fi, err := os.Stat(f.localPath)
-		if err != nil {
-			return err
-		}
-
-		fh, err := os.Open(f.localPath)
-		if err != nil {
-			return err
-		}
-
-		dgstAlgo := digest.Canonical
-		digester := dgstAlgo.Digester()
-		data, err := io.ReadAll(fh)
-		fh.Close()
-		if err != nil {
-			return fmt.Errorf("read %s: %w", f.localPath, err)
-		}
-		digester.Hash().Write(data)
-
-		desc, err := writeBlob(layoutDir, mt, data)
-		if err != nil {
-			return fmt.Errorf("store %s: %w", f.relativePath, err)
-		}
-		desc.Size = fi.Size()
-		desc.Annotations = map[string]string{
-			"org.cncf.model.filepath": f.relativePath,
-		}
-		layers = append(layers, desc)
-		fmt.Fprintf(os.Stderr, "  stored %s (%d bytes)\n", f.relativePath, fi.Size())
-	}
-
-	return storeSafetensorsAsOCI(layoutDir, ref, modelRepo, layers)
+	// verbose=true: print a "stored <path>" line per file, since local
+	// import has no download progress bar to show the work happening
+	// otherwise.
+	return packFilesAsModelPack(layoutDir, storeRef, filepath.Base(localPath), packFiles, true)
 }
 
 

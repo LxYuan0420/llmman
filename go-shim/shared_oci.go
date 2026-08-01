@@ -180,6 +180,17 @@ func findManifestDesc(idx ocispec.Index, refName string) (ocispec.Descriptor, er
 	return ocispec.Descriptor{}, fmt.Errorf("no manifest found for %q", refName)
 }
 
+// proxyOrNop wraps r in bar's progress-tracking proxy reader, falling back to
+// a plain no-op-Close wrapper around r when the bar declines to proxy (e.g.
+// a zero-total spinner bar). Every downloader in this package that reports
+// progress via an mpb.Bar needs this same fallback.
+func proxyOrNop(bar *mpb.Bar, r io.Reader) io.ReadCloser {
+	if p := bar.ProxyReader(r); p != nil {
+		return p
+	}
+	return io.NopCloser(r)
+}
+
 // addLayerBar adds a progress bar into an existing mpb.Progress.
 func addLayerBar(p *mpb.Progress, prefix, onComplete string, size int64) *mpb.Bar {
 	bar := p.AddBar(size,

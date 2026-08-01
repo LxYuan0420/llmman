@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -154,7 +153,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	// protocol (their paths contain uppercase letters which containers/image
 	// rejects).  Delegate to the shared HF pull path instead.
 	host := strings.SplitN(ref, "/", 2)[0]
-	if isKnownHFHost(host) || (!isKnownOCIHost(host) && !isOCIRegistry(ctx, &http.Client{Timeout: 5 * time.Second}, host)) {
+	if !isOCIHost(ctx, host) {
 		if err := ensureLayout(layoutDir); err != nil {
 			return fmt.Errorf("init OCI layout: %w", err)
 		}

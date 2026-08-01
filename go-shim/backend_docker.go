@@ -423,14 +423,9 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	}
 
 	// Detect backend: probe the host to decide OCI registry vs HuggingFace-compatible.
-	// Known OCI hosts skip the probe; known HF hosts go straight to HF.
-	// Unknown hosts are probed via the OCI Distribution /v2/ endpoint.
 	host := strings.SplitN(ref, "/", 2)[0]
-	if !isKnownOCIHost(host) {
-		probeClient := &http.Client{Timeout: 5 * time.Second}
-		if isKnownHFHost(host) || !isOCIRegistry(ctx, probeClient, host) {
-			return pullHF(ctx, ref, layoutDir)
-		}
+	if !isOCIHost(ctx, host) {
+		return pullHF(ctx, ref, layoutDir)
 	}
 
 	if err := ensureLayout(layoutDir); err != nil {
@@ -537,10 +532,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 					}
 				}
 			}
-			proxyRC := bar.ProxyReader(layerRC)
-			if proxyRC == nil { // bar already done (zero-size layer)
-				proxyRC = io.NopCloser(layerRC)
-			}
+			proxyRC := proxyOrNop(bar, layerRC)
 			_, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size, layer.Digest, partOffset)
 			proxyRC.Close()
 			if writeErr != nil {

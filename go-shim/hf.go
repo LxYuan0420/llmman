@@ -66,6 +66,23 @@ func isOCIRegistry(ctx context.Context, client *http.Client, host string) bool {
 	return resp.Header.Get("Docker-Distribution-Api-Version") != ""
 }
 
+// isOCIHost reports whether host should be treated as an OCI Distribution
+// registry (true) or a HuggingFace-compatible host (false): known-host
+// shortcuts first, then a live /v2/ probe as the fallback for anything else.
+// This is the single decision table `llmman pull`'s docker and podman
+// backends (backend_docker.go, backend_podman.go) and `llmman transfer`'s
+// source classification (transfer_common.go) all need to agree on.
+func isOCIHost(ctx context.Context, host string) bool {
+	if isKnownHFHost(host) {
+		return false
+	}
+	if isKnownOCIHost(host) {
+		return true
+	}
+	probeClient := &http.Client{Timeout: 5 * time.Second}
+	return isOCIRegistry(ctx, probeClient, host)
+}
+
 // ---------------------------------------------------------------------------
 // HuggingFace API types and helpers
 // ---------------------------------------------------------------------------
@@ -76,6 +93,33 @@ type hfFile struct {
 	Size int64  `json:"size"`
 	OID  string `json:"oid"`
 	Type string `json:"type"` // "file" or "directory"
+}
+
+// hfAPIClient returns the HTTP client used for HuggingFace metadata requests
+// (commit lookup, file listing, HEAD digest probes) — a short total timeout
+// suffices since these responses are small. Shared by pullHF (this file) and
+// dockerTransferHF (transfer_docker.go), which both need one.
+func hfAPIClient() *http.Client {
+	return &http.Client{Timeout: 120 * time.Second}
+}
+
+// hfDownloadClient returns the HTTP client used for actually downloading (or
+// streaming) HuggingFace file content: no body read timeout so large files
+// can transfer without a deadline, but connection and header timeouts still
+// prevent hanging on a stalled server. Mirrors llama.cpp's
+// common/download.cpp approach. Shared by pullHF (this file) and
+// dockerTransferHF (transfer_docker.go).
+func hfDownloadClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   30 * time.Second,
+			ResponseHeaderTimeout: 60 * time.Second,
+		},
+	}
 }
 
 // hfEndpoint returns the HuggingFace API base URL for the host.
@@ -384,6 +428,23 @@ func cachedLayerName(layoutDir, ref string) string {
 	return ""
 }
 
+// reportCached prints "Cached <label>" and returns true if ref is already
+// fully cached in layoutDir (manifest blob + all layer blobs present) — the
+// signal every pull entry point in this package uses to skip all network
+// I/O. label defaults to the cached name cachedLayerName itself resolved
+// (e.g. a GGUF filename) when the empty string is passed.
+func reportCached(layoutDir, ref, label string) bool {
+	name := cachedLayerName(layoutDir, ref)
+	if name == "" {
+		return false
+	}
+	if label == "" {
+		label = name
+	}
+	fmt.Fprintf(os.Stderr, "Cached   %s\n", label)
+	return true
+}
+
 func pullHF(ctx context.Context, ref, layoutDir string) error {
 	host, owner, repo, tag, err := parseHFRef(ref)
 	if err != nil {
@@ -395,31 +456,15 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 	}
 
 	// Fast path: skip all network I/O if the ref is fully cached locally.
-	if name := cachedLayerName(layoutDir, ref); name != "" {
-		fmt.Fprintf(os.Stderr, "Cached   %s\n", name)
+	if reportCached(layoutDir, ref, "") {
 		return nil
 	}
 
 	endpoint := hfEndpoint(host)
 	token := hfToken()
 
-	// apiClient: short total timeout for metadata requests (commit, file list).
-	apiClient := &http.Client{Timeout: 120 * time.Second}
-
-	// dlClient: no body read timeout so large files can download without a
-	// deadline, but connection and header timeouts prevent hanging on stalls.
-	// Mirrors llama.cpp common/download.cpp approach.
-	dlClient := &http.Client{
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout:   30 * time.Second,
-			ResponseHeaderTimeout: 60 * time.Second,
-		},
-	}
-	_ = dlClient // used below
+	apiClient := hfAPIClient()
+	dlClient := hfDownloadClient()
 
 	commit, err := hfFetchCommit(ctx, apiClient, endpoint, owner, repo, token)
 	if err != nil {
@@ -480,18 +525,26 @@ func shouldDownloadSafetensors(path string) bool {
 	return false
 }
 
+// selectDownloadableHFFiles filters files down to the plain files that
+// shouldDownloadSafetensors accepts, ignoring directories. Shared by
+// pullHFSafetensors (this file) and dockerTransferHF (transfer_docker.go).
+func selectDownloadableHFFiles(files []hfFile) []hfFile {
+	var out []hfFile
+	for _, f := range files {
+		if f.Type == "file" && shouldDownloadSafetensors(f.Path) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 func pullHFSafetensors(
 	ctx context.Context,
 	client *http.Client,
 	ref, layoutDir, endpoint, owner, repo, commit, token string,
 	files []hfFile,
 ) error {
-	var toDownload []hfFile
-	for _, f := range files {
-		if f.Type == "file" && shouldDownloadSafetensors(f.Path) {
-			toDownload = append(toDownload, f)
-		}
-	}
+	toDownload := selectDownloadableHFFiles(files)
 	if len(toDownload) == 0 {
 		return fmt.Errorf("no model files found in repository %s/%s", owner, repo)
 	}
@@ -515,35 +568,9 @@ func pullHFSafetensors(
 }
 
 func storeSafetensorsAsOCI(layoutDir, ref, modelRepo string, layers []ocispec.Descriptor) error {
-	var cfg cncfModelConfig
-	cfg.Config.Format = "safetensors"
-	cfg.ModelFS.Type = "layers"
-	for _, l := range layers {
-		cfg.ModelFS.DiffIDs = append(cfg.ModelFS.DiffIDs, l.Digest.String())
-	}
-	cfgData, err := json.Marshal(cfg)
+	manifestDesc, err := buildCNCFManifest(layoutBlobSink(layoutDir), "safetensors", modelRepo, "", layers)
 	if err != nil {
-		return fmt.Errorf("marshal CNCF config: %w", err)
-	}
-	configDesc, err := writeBlob(layoutDir, "application/vnd.cncf.model.config.v1+json", cfgData)
-	if err != nil {
-		return fmt.Errorf("write CNCF config: %w", err)
-	}
-	manifest := ocispec.Manifest{
-		Versioned:    specs.Versioned{SchemaVersion: 2},
-		MediaType:    ocispec.MediaTypeImageManifest,
-		ArtifactType: "application/vnd.cncf.model.manifest.v1+json",
-		Config:       configDesc,
-		Layers:       layers,
-		Annotations:  map[string]string{"ai.model.repo": modelRepo},
-	}
-	manifestData, err := json.Marshal(manifest)
-	if err != nil {
-		return fmt.Errorf("marshal manifest: %w", err)
-	}
-	manifestDesc, err := writeBlob(layoutDir, ocispec.MediaTypeImageManifest, manifestData)
-	if err != nil {
-		return fmt.Errorf("write manifest: %w", err)
+		return err
 	}
 	return updateIndex(layoutDir, ref, manifestDesc)
 }
@@ -715,10 +742,7 @@ func downloadAttempt(ctx context.Context, client *http.Client, url, token, layou
 	sr := newStallReader(resp.Body, dlStallTimeout, cancel)
 	defer sr.stop()
 
-	proxyRC := bar.ProxyReader(sr)
-	if proxyRC == nil {
-		proxyRC = io.NopCloser(sr)
-	}
+	proxyRC := proxyOrNop(bar, sr)
 	written, copyErr := io.Copy(io.MultiWriter(f, digester.Hash()), proxyRC)
 	proxyRC.Close()
 	f.Close()
@@ -775,39 +799,76 @@ type cncfModelConfig struct {
 }
 
 func storeHFAsOCI(layoutDir, ref, modelRepo, filename string, ggufDesc ocispec.Descriptor) error {
-	// Build a conformant CNCF model-spec config blob.
-	var cfg cncfModelConfig
-	cfg.Config.Format = "gguf"
-	cfg.ModelFS.Type = "layers"
-	cfg.ModelFS.DiffIDs = []string{ggufDesc.Digest.String()}
+	manifestDesc, err := buildCNCFManifest(layoutBlobSink(layoutDir), "gguf", modelRepo, filepath.Base(filename), []ocispec.Descriptor{ggufDesc})
+	if err != nil {
+		return err
+	}
+	return updateIndex(layoutDir, ref, manifestDesc)
+}
 
+// ---------------------------------------------------------------------------
+// buildCNCFManifest — shared CNCF model-spec manifest+config construction,
+// used by both the local-OCI-layout store path above (storeHFAsOCI,
+// storeSafetensorsAsOCI) and transfer_docker.go's direct-to-registry push
+// path (pushCNCFSingleManifest, pushCNCFMultiManifest). The two paths differ
+// only in *where* a built blob ends up — a local content-addressed layout
+// vs. streamed straight to a registry pusher — which is exactly what the
+// cncfBlobSink abstraction below exists to hide.
+// ---------------------------------------------------------------------------
+
+// cncfBlobSink stores one marshaled CNCF blob (config or manifest JSON) and
+// returns its descriptor.
+type cncfBlobSink func(mediaType string, data []byte) (ocispec.Descriptor, error)
+
+// layoutBlobSink is the cncfBlobSink for storing blobs in a local OCI layout
+// directory.
+func layoutBlobSink(layoutDir string) cncfBlobSink {
+	return func(mediaType string, data []byte) (ocispec.Descriptor, error) {
+		return writeBlob(layoutDir, mediaType, data)
+	}
+}
+
+// buildCNCFManifest builds a conformant CNCF model-spec config blob and
+// manifest referencing layers, storing each via sink, and returns the
+// manifest's descriptor. filepathAnnotation sets the manifest-level
+// org.cncf.model.filepath annotation for the single-weight-file case (GGUF);
+// pass "" for the multi-layer safetensors case, which only sets
+// ai.model.repo.
+func buildCNCFManifest(sink cncfBlobSink, format, modelRepo, filepathAnnotation string, layers []ocispec.Descriptor) (ocispec.Descriptor, error) {
+	var cfg cncfModelConfig
+	cfg.Config.Format = format
+	cfg.ModelFS.Type = "layers"
+	for _, l := range layers {
+		cfg.ModelFS.DiffIDs = append(cfg.ModelFS.DiffIDs, l.Digest.String())
+	}
 	cfgData, err := json.Marshal(cfg)
 	if err != nil {
-		return fmt.Errorf("marshal CNCF model config: %w", err)
+		return ocispec.Descriptor{}, fmt.Errorf("marshal CNCF model config: %w", err)
 	}
-	configDesc, err := writeBlob(layoutDir, "application/vnd.cncf.model.config.v1+json", cfgData)
+	configDesc, err := sink("application/vnd.cncf.model.config.v1+json", cfgData)
 	if err != nil {
-		return fmt.Errorf("write CNCF model config: %w", err)
+		return ocispec.Descriptor{}, fmt.Errorf("store CNCF model config: %w", err)
 	}
 
+	annotations := map[string]string{"ai.model.repo": modelRepo}
+	if filepathAnnotation != "" {
+		annotations["org.cncf.model.filepath"] = filepathAnnotation
+	}
 	manifest := ocispec.Manifest{
 		Versioned:    specs.Versioned{SchemaVersion: 2},
 		MediaType:    ocispec.MediaTypeImageManifest,
 		ArtifactType: "application/vnd.cncf.model.manifest.v1+json",
 		Config:       configDesc,
-		Layers:       []ocispec.Descriptor{ggufDesc},
-		Annotations: map[string]string{
-			"org.cncf.model.filepath": filepath.Base(filename),
-			"ai.model.repo":           modelRepo,
-		},
+		Layers:       layers,
+		Annotations:  annotations,
 	}
 	manifestData, err := json.Marshal(manifest)
 	if err != nil {
-		return fmt.Errorf("marshal OCI manifest: %w", err)
+		return ocispec.Descriptor{}, fmt.Errorf("marshal CNCF manifest: %w", err)
 	}
-	manifestDesc, err := writeBlob(layoutDir, ocispec.MediaTypeImageManifest, manifestData)
+	manifestDesc, err := sink(ocispec.MediaTypeImageManifest, manifestData)
 	if err != nil {
-		return fmt.Errorf("write OCI manifest: %w", err)
+		return ocispec.Descriptor{}, fmt.Errorf("store CNCF manifest: %w", err)
 	}
-	return updateIndex(layoutDir, ref, manifestDesc)
+	return manifestDesc, nil
 }

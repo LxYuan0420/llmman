@@ -38,7 +38,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -46,7 +45,6 @@ import (
 
 	"github.com/containerd/containerd/v2/core/remotes"
 	digest "github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
 )
@@ -196,17 +194,8 @@ func dockerTransferHF(ctx context.Context, ref, destination string) error {
 	endpoint := hfEndpoint(host)
 	token := hfToken()
 
-	apiClient := &http.Client{Timeout: 120 * time.Second}
-	dlClient := &http.Client{
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout:   30 * time.Second,
-			ResponseHeaderTimeout: 60 * time.Second,
-		},
-	}
+	apiClient := hfAPIClient()
+	dlClient := hfDownloadClient()
 
 	commit, err := hfFetchCommit(ctx, apiClient, endpoint, owner, repo, token)
 	if err != nil {
@@ -240,12 +229,7 @@ func dockerTransferHF(ctx context.Context, ref, destination string) error {
 		return nil
 	}
 
-	var toSend []hfFile
-	for _, f := range files {
-		if f.Type == "file" && shouldDownloadSafetensors(f.Path) {
-			toSend = append(toSend, f)
-		}
-	}
+	toSend := selectDownloadableHFFiles(files)
 	if len(toSend) == 0 {
 		return fmt.Errorf("no model files found in repository %s/%s", owner, repo)
 	}
@@ -393,11 +377,8 @@ func hfGetBytes(ctx context.Context, client *http.Client, url, token string, bar
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
 	}
-	var r io.Reader = resp.Body
-	if proxyRC := bar.ProxyReader(r); proxyRC != nil {
-		defer proxyRC.Close()
-		r = proxyRC
-	}
+	r := proxyOrNop(bar, resp.Body)
+	defer r.Close()
 	return io.ReadAll(r)
 }
 
@@ -408,82 +389,28 @@ func hfGetBytes(ctx context.Context, client *http.Client, url, token string, bar
 // ---------------------------------------------------------------------------
 
 func pushCNCFSingleManifest(ctx context.Context, pusher remotes.Pusher, format, modelRepo, filename string, weightDesc ocispec.Descriptor) error {
-	var cfg cncfModelConfig
-	cfg.Config.Format = format
-	cfg.ModelFS.Type = "layers"
-	cfg.ModelFS.DiffIDs = []string{weightDesc.Digest.String()}
-	cfgData, err := json.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("marshal CNCF model config: %w", err)
-	}
-	configDesc := ocispec.Descriptor{
-		MediaType: "application/vnd.cncf.model.config.v1+json",
-		Digest:    digest.FromBytes(cfgData),
-		Size:      int64(len(cfgData)),
-	}
-	if err := pushBytes(ctx, pusher, configDesc, cfgData); err != nil {
-		return fmt.Errorf("push CNCF model config: %w", err)
-	}
-
-	manifest := ocispec.Manifest{
-		Versioned:    specs.Versioned{SchemaVersion: 2},
-		MediaType:    ocispec.MediaTypeImageManifest,
-		ArtifactType: "application/vnd.cncf.model.manifest.v1+json",
-		Config:       configDesc,
-		Layers:       []ocispec.Descriptor{weightDesc},
-		Annotations: map[string]string{
-			"org.cncf.model.filepath": filepath.Base(filename),
-			"ai.model.repo":           modelRepo,
-		},
-	}
-	manifestData, err := json.Marshal(manifest)
-	if err != nil {
-		return fmt.Errorf("marshal OCI manifest: %w", err)
-	}
-	manifestDesc := ocispec.Descriptor{
-		MediaType: ocispec.MediaTypeImageManifest,
-		Digest:    digest.FromBytes(manifestData),
-		Size:      int64(len(manifestData)),
-	}
-	return pushBytes(ctx, pusher, manifestDesc, manifestData)
+	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher), format, modelRepo, filepath.Base(filename), []ocispec.Descriptor{weightDesc})
+	return err
 }
 
 func pushCNCFMultiManifest(ctx context.Context, pusher remotes.Pusher, modelRepo string, layers []ocispec.Descriptor) error {
-	var cfg cncfModelConfig
-	cfg.Config.Format = "safetensors"
-	cfg.ModelFS.Type = "layers"
-	for _, l := range layers {
-		cfg.ModelFS.DiffIDs = append(cfg.ModelFS.DiffIDs, l.Digest.String())
-	}
-	cfgData, err := json.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("marshal CNCF config: %w", err)
-	}
-	configDesc := ocispec.Descriptor{
-		MediaType: "application/vnd.cncf.model.config.v1+json",
-		Digest:    digest.FromBytes(cfgData),
-		Size:      int64(len(cfgData)),
-	}
-	if err := pushBytes(ctx, pusher, configDesc, cfgData); err != nil {
-		return fmt.Errorf("push CNCF config: %w", err)
-	}
+	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher), "safetensors", modelRepo, "", layers)
+	return err
+}
 
-	manifest := ocispec.Manifest{
-		Versioned:    specs.Versioned{SchemaVersion: 2},
-		MediaType:    ocispec.MediaTypeImageManifest,
-		ArtifactType: "application/vnd.cncf.model.manifest.v1+json",
-		Config:       configDesc,
-		Layers:       layers,
-		Annotations:  map[string]string{"ai.model.repo": modelRepo},
+// pusherBlobSink is the cncfBlobSink for pushing blobs directly to a
+// registry pusher (see buildCNCFManifest in hf.go), mirroring
+// layoutBlobSink's local-OCI-layout equivalent.
+func pusherBlobSink(ctx context.Context, pusher remotes.Pusher) cncfBlobSink {
+	return func(mediaType string, data []byte) (ocispec.Descriptor, error) {
+		desc := ocispec.Descriptor{
+			MediaType: mediaType,
+			Digest:    digest.FromBytes(data),
+			Size:      int64(len(data)),
+		}
+		if err := pushBytes(ctx, pusher, desc, data); err != nil {
+			return ocispec.Descriptor{}, err
+		}
+		return desc, nil
 	}
-	manifestData, err := json.Marshal(manifest)
-	if err != nil {
-		return fmt.Errorf("marshal manifest: %w", err)
-	}
-	manifestDesc := ocispec.Descriptor{
-		MediaType: ocispec.MediaTypeImageManifest,
-		Digest:    digest.FromBytes(manifestData),
-		Size:      int64(len(manifestData)),
-	}
-	return pushBytes(ctx, pusher, manifestDesc, manifestData)
 }
