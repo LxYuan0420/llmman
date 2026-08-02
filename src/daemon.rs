@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::Context;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
 /// The fixed loopback origin `llmman serve` always binds to (see
@@ -117,19 +118,40 @@ fn detach(cmd: &mut Command) {
 }
 
 /// A single line of Ollama's streamed NDJSON progress protocol (see
-/// api.ProgressResponse) — status text plus an optional error. Every other
-/// field (digest/total/completed) is omitted server-side; see
-/// cmd::serve::stream_ffi_progress.
+/// api.ProgressResponse) — status text plus an optional error, and
+/// (unlike real Ollama's per-layer digest/total/completed) our own
+/// aggregate total/completed byte counts across the whole pull/push, once
+/// cmd::serve's stream_ffi_progress has one to report — see that
+/// function's own doc comment for where these come from.
 #[derive(Deserialize)]
 struct ProgressLine {
     status: Option<String>,
     error: Option<String>,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    completed: Option<u64>,
+}
+
+/// The indicatif template shared by `llmman pull`/`llmman push`'s
+/// byte-level bar — deliberately similar in shape to `llmman transfer`'s
+/// own mpb bars (go-shim/shared_oci.go's addLayerBar) so both commands'
+/// output looks like the same family of progress bar.
+fn progress_bar_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{msg:<20} [{bar:32.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12}",
+    )
+    .unwrap_or_else(|_| ProgressStyle::default_bar())
+    .progress_chars("=> ")
 }
 
 /// POSTs `{"model": reference}` to `path` (e.g. "/api/pull" or "/api/push")
-/// on the local daemon and prints each streamed status line to stdout as
-/// it arrives. Returns an error if the stream reports one, or if it ends
-/// without ever reporting "success".
+/// on the local daemon and renders each streamed line to stderr as it
+/// arrives: a real byte-level progress bar for any line carrying a nonzero
+/// `total` (see ProgressLine), or a plain status line otherwise — matching
+/// how `llmman transfer`'s own mpb bars render foreground FFI progress.
+/// Returns an error if the stream reports one, or if it ends without ever
+/// reporting "success".
 pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(None) // model transfers can take much longer than any sane fixed timeout
@@ -149,6 +171,7 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
 
     let mut saw_success = false;
     let mut last_status = String::new();
+    let mut bar: Option<ProgressBar> = None;
     for line in std::io::BufReader::new(resp).lines() {
         let line = line.context("read response stream")?;
         let line = line.trim();
@@ -159,6 +182,9 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
             continue; // tolerate stray non-JSON keepalive output
         };
         if let Some(err) = msg.error.filter(|e| !e.is_empty()) {
+            if let Some(b) = bar.take() {
+                b.abandon(); // leave whatever was drawn in place instead of clearing it
+            }
             // Only prefix with `reference` if the error doesn't already
             // mention it — many pull failures (e.g. containerd's "not
             // found") already embed the exact reference themselves, and
@@ -169,6 +195,28 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
             }
             anyhow::bail!("{reference}: {err}");
         }
+
+        if let Some(total) = msg.total.filter(|&t| t > 0) {
+            // A byte-level progress line: render/update the bar instead of
+            // printing a new line for every update.
+            let pb = bar.get_or_insert_with(|| {
+                let pb = ProgressBar::new(total);
+                pb.set_style(progress_bar_style());
+                pb
+            });
+            pb.set_length(total);
+            pb.set_position(msg.completed.unwrap_or(0).min(total));
+            if let Some(status) = &msg.status {
+                pb.set_message(status.clone());
+            }
+            continue;
+        }
+        // No byte counts on this line: finish/clear any bar in progress
+        // before falling back to plain status text, so the two don't
+        // interleave on the same terminal lines.
+        if let Some(b) = bar.take() {
+            b.finish_and_clear();
+        }
         if let Some(status) = msg.status {
             if !status.is_empty() && status != last_status {
                 println!("{status}");
@@ -176,6 +224,9 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
             }
             saw_success = last_status == "success";
         }
+    }
+    if let Some(b) = bar.take() {
+        b.finish_and_clear();
     }
     if !saw_success {
         anyhow::bail!("{reference}: stream ended without a success status");

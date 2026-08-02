@@ -28,6 +28,7 @@ toml       = { version = "0.8", default-features = false, features = ["parse"] }
 tokio      = { version = "1", features = ["full"] }
 reqwest    = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls", "http2", "charset"] }
 futures    = "0.3"
+indicatif  = "0.18"
 
 [features]
 default = ["docker"]

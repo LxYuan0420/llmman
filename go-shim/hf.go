@@ -497,6 +497,7 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 	if err != nil {
 		return err
 	}
+	progressSetStatus("pulling")
 
 	// Try GGUF first; fall back to safetensors if the repo has none.
 	chosen, err := selectGGUF(files, tag)
@@ -626,6 +627,18 @@ func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layout
 	bar := addLayerBar(prog, label, doneLbl, file.Size)
 
 	var lastErr error
+	// creditedResume tracks how much of the .part file's already-downloaded
+	// prefix has already been folded into progressState's completed count
+	// (see progress_state.go), so a retry that finds the same partial file
+	// it left behind doesn't get double-credited for it — only the delta
+	// since the last attempt's startOffset is ever added. (One rare edge
+	// case isn't covered: downloadAttempt's own "server ignored Range
+	// header, restart from zero" fallback resets the bar but has no way to
+	// tell this loop to un-credit what was already added; recovering from
+	// a non-range-supporting server mid-retry is rare enough that a
+	// possibly-early 100% on the aggregate bar is an acceptable trade-off
+	// for not threading extra state through downloadAttempt for it.)
+	var creditedResume int64
 	for attempt := 0; attempt < dlMaxAttempts; attempt++ {
 		if attempt > 0 {
 			delay := dlRetryBase * time.Duration(1<<uint(attempt-1)) // 2s, 4s
@@ -646,6 +659,10 @@ func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layout
 			startOffset = fi.Size()
 		}
 		bar.SetCurrent(startOffset)
+		if startOffset > creditedResume {
+			progressAddCompleted(startOffset - creditedResume)
+			creditedResume = startOffset
+		}
 
 		desc, err := downloadAttempt(ctx, client, url, token, layoutDir, tmpPath, startOffset, file, bar)
 		if err == nil {

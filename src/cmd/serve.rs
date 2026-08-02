@@ -1397,14 +1397,25 @@ async fn handle_push(
 }
 
 /// Runs `task` (a blocking FFI call already dispatched via spawn_blocking)
-/// to completion, streaming an immediate `first_status` line, then a
-/// `{"status": "<verb>ing <model>"}` heartbeat every 2s until it finishes,
-/// then a final `{"status": "success"}` or `{"error": ...}` line. Shared by
-/// handle_pull and handle_push. Real per-layer progress (Ollama's
-/// `digest`/`total`/`completed` fields) isn't available: the Go shim's
-/// `llmman_pull`/`llmman_push` are single opaque blocking calls with no
-/// progress callback, so this reports coarse status only — every other
-/// field on api.ProgressResponse is `omitempty` on the client side.
+/// to completion, streaming an immediate `first_status` line, then polling
+/// `ffi::progress()` every 200ms (matching the Go shim's own mpb refresh
+/// rate) until the task finishes, then a final `{"status": "success"}` or
+/// `{"error": ...}` line. Shared by handle_pull and handle_push.
+///
+/// Each polled line includes real `total`/`completed` byte counts (mirroring
+/// Ollama's own api.ProgressResponse fields) once the shim's shared
+/// `progressState` (go-shim/progress_state.go) has learned a nonzero total
+/// — before that, or if the FFI call is a kind that doesn't track
+/// byte-level progress at all, only `status` text is included, exactly
+/// like the old heartbeat-only version of this function. This is what
+/// lets `llmman pull`/`llmman push` render a real progress bar instead of
+/// just printing status text: the Go shim's own mpb bars
+/// (go-shim/shared_oci.go) already draw real bars for these exact
+/// numbers, but only reach an interactive terminal when the FFI call runs
+/// in the foreground CLI process (e.g. `llmman transfer`) — here it runs
+/// inside the daemon, whose stdio is redirected to a log file (see
+/// daemon::ensure_server), so polling and relaying over this NDJSON
+/// stream is the only way those numbers reach `llmman pull`/`llmman push`.
 fn stream_ffi_progress(
     model: String,
     verb: &'static str,
@@ -1426,9 +1437,17 @@ fn stream_ffi_progress(
                         };
                         Some((Bytes::from(line + "\n"), None))
                     }
-                    _ = sleep(Duration::from_secs(2)) => {
-                        let line = serde_json::json!({"status": format!("{verb}ing {model}")}).to_string() + "\n";
-                        Some((Bytes::from(line), Some(task)))
+                    _ = sleep(Duration::from_millis(200)) => {
+                        let line = match crate::ffi::progress() {
+                            Ok(p) if p.total > 0 => serde_json::json!({
+                                "status": if p.status.is_empty() { format!("{verb}ing {model}") } else { p.status },
+                                "total": p.total.max(0),
+                                "completed": p.completed.clamp(0, p.total),
+                            }),
+                            Ok(p) if !p.status.is_empty() => serde_json::json!({"status": p.status}),
+                            _ => serde_json::json!({"status": format!("{verb}ing {model}")}),
+                        };
+                        Some((Bytes::from(line.to_string() + "\n"), Some(task)))
                     }
                 }
             }

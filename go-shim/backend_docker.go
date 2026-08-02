@@ -197,10 +197,12 @@ func pushLazy(
 	return false, nil
 }
 
-// withBar wraps r in newBar's progress bar (if newBar is non-nil), and
-// returns that bar (so pushLazy can abort it on a copy failure) plus a
-// cleanup func that closes both the bar's proxy reader and r itself (if r
-// is an io.Closer) — for use as pushLazy's open callback.
+// withBar wraps r in newBar's progress bar (if newBar is non-nil, via the
+// same proxyOrNop every other progress-reporting download/upload path in
+// this package uses — see shared_oci.go), and returns that bar (so
+// pushLazy can abort it on a copy failure) plus a cleanup func that closes
+// both the proxy reader and r itself (if r is an io.Closer) — for use as
+// pushLazy's open callback.
 func withBar(r io.Reader, newBar func() *mpb.Bar) (io.Reader, *mpb.Bar, func()) {
 	var bar *mpb.Bar
 	closers := []io.Closer{}
@@ -209,10 +211,9 @@ func withBar(r io.Reader, newBar func() *mpb.Bar) (io.Reader, *mpb.Bar, func()) 
 	}
 	if newBar != nil {
 		bar = newBar()
-		if proxyRC := bar.ProxyReader(r); proxyRC != nil {
-			r = proxyRC
-			closers = append(closers, proxyRC)
-		}
+		proxyRC := proxyOrNop(bar, r)
+		r = proxyRC
+		closers = append(closers, proxyRC)
 	}
 	return r, bar, func() {
 		for _, c := range closers {
@@ -314,6 +315,7 @@ func llmman_logout(cServer *C.char) *C.char {
 //
 //export llmman_push
 func llmman_push(cLayoutDir, cRef *C.char) *C.char {
+	progressReset("retrieving manifest")
 	if err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), C.GoString(cRef)); err != nil {
 		return errResp(err)
 	}
@@ -375,6 +377,7 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 	}
 
 	// Push layers
+	progressSetStatus("pushing")
 	for _, layer := range manifest.Layers {
 		if err := pushWithBar(layer, "blob"); err != nil {
 			prog.Wait()
@@ -402,6 +405,7 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 //
 //export llmman_pull
 func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
+	progressReset("pulling manifest")
 	if err := pullToLayout(context.Background(), C.GoString(cRef), C.GoString(cLayoutDir)); err != nil {
 		return errResp(err)
 	}
@@ -478,6 +482,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	// decorators flip each bar to "Pulled   <digest>" when done so the final static
 	// line is always correct regardless of render-tick timing.
 	const maxParallel = 6
+	progressSetStatus("pulling")
 	prog := mpb.New(
 		mpb.WithWidth(80),
 		mpb.WithOutput(os.Stderr),
@@ -520,6 +525,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 					if _, seekErr := seeker.Seek(fi.Size(), io.SeekStart); seekErr == nil {
 						partOffset = fi.Size()
 						bar.IncrInt64(partOffset)
+						progressAddCompleted(partOffset)
 					}
 				}
 			}

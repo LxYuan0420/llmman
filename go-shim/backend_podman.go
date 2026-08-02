@@ -79,6 +79,7 @@ func llmman_logout(cServer *C.char) *C.char {
 //
 //export llmman_push
 func llmman_push(cLayoutDir, cRef *C.char) *C.char {
+	progressReset("retrieving manifest")
 	if err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), C.GoString(cRef)); err != nil {
 		return errResp(err)
 	}
@@ -116,10 +117,8 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 	}
 	defer pctx.Destroy()
 
-	_, err = copy.Image(ctx, pctx, dstRef, srcRef, &copy.Options{
-		ReportWriter: os.Stderr,
-	})
-	if err != nil {
+	progressSetStatus("pushing")
+	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pushing", "Pushed", &copy.Options{}); err != nil {
 		return fmt.Errorf("copy image: %w", err)
 	}
 	return nil
@@ -129,6 +128,7 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 //
 //export llmman_pull
 func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
+	progressReset("pulling manifest")
 	if err := pullToLayout(context.Background(), C.GoString(cRef), C.GoString(cLayoutDir)); err != nil {
 		return errResp(err)
 	}
@@ -179,6 +179,24 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	}
 	defer pctx.Destroy()
 
+	progressSetStatus("pulling")
+	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pulling", "Pulled", &copy.Options{
+		MaxParallelDownloads: 6,
+	}); err != nil {
+		return fmt.Errorf("copy image: %w", err)
+	}
+	return nil
+}
+
+// copyImageWithProgress runs copy.Image with an mpb bar per artifact (for
+// direct/foreground FFI callers, e.g. `llmman transfer`'s podman backend —
+// though transfer_podman.go's own copy.Image calls don't currently go
+// through this, only pull/push do) and folds the same byte counts into the
+// shared progressState snapshot (see progress_state.go) that lets
+// cmd::serve poll them out of the daemon process — two consumers of the
+// same underlying containers/image progress channel. present/pastTense
+// label each artifact's bar (e.g. "Pulling"/"Pulled", "Pushing"/"Pushed").
+func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options) error {
 	prog := mpb.New(mpb.WithOutput(os.Stderr))
 	ch := make(chan types.ProgressProperties)
 	bars := make(map[string]*mpb.Bar)
@@ -193,6 +211,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 				if total < 0 {
 					total = 0
 				}
+				progressAddTotal(total)
 				short := p.Artifact.Digest.Hex()
 				if len(short) > 12 {
 					short = short[:12]
@@ -200,7 +219,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 				bar := prog.AddBar(total,
 					mpb.BarFillerClearOnComplete(),
 					mpb.PrependDecorators(
-						decor.OnComplete(decor.Name("Pulling  "+short), "Pulled   "+short),
+						decor.OnComplete(decor.Name(present+"  "+short), pastTense+"   "+short),
 					),
 					mpb.AppendDecorators(
 						decor.OnComplete(decor.CountersKibiByte("% .1f / % .1f"), ""),
@@ -213,6 +232,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 				}
 				bars[key] = bar
 			case types.ProgressEventRead:
+				progressAddCompleted(int64(p.OffsetUpdate))
 				if bar, ok := bars[key]; ok {
 					bar.IncrInt64(int64(p.OffsetUpdate))
 				}
@@ -224,6 +244,11 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 					delete(bars, key)
 				}
 			case types.ProgressEventSkipped:
+				// This artifact turned out to already exist at the
+				// destination — no bytes will ever flow for it via
+				// ProgressEventRead, so undo the provisional total
+				// ProgressEventNewArtifact already added above.
+				progressAddTotal(-p.Artifact.Size)
 				if bar, ok := bars[key]; ok {
 					bar.Abort(true)
 					delete(bars, key)
@@ -233,19 +258,14 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 		}
 	}()
 
-	_, err = copy.Image(ctx, pctx, dstRef, srcRef, &copy.Options{
-		Progress:             ch,
-		ProgressInterval:     200 * time.Millisecond,
-		MaxParallelDownloads: 6,
-	})
+	opts.Progress = ch
+	opts.ProgressInterval = 200 * time.Millisecond
+
+	_, err := copy.Image(ctx, pctx, dst, src, opts)
 	close(ch)
 	<-progDone
 	prog.Wait()
-
-	if err != nil {
-		return fmt.Errorf("copy image: %w", err)
-	}
-	return nil
+	return err
 }
 
 // llmman_inspect fetches and returns the raw manifest JSON for a remote reference.

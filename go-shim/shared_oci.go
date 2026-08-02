@@ -302,13 +302,31 @@ func retryStream(ctx context.Context, label string, isPermanent func(error) bool
 	return fmt.Errorf("%s failed after %d attempts: %w", label, dlMaxAttempts, lastErr)
 }
 
+// progressTrackingReadCloser wraps an io.ReadCloser, feeding every
+// successfully-read byte count into progressAddCompleted (see
+// progress_state.go) alongside whatever else it's already being used for
+// (usually incrementing an mpb bar, via bar.ProxyReader — see
+// proxyOrNop). This is what lets cmd::serve poll real byte-level pull/push
+// progress out of the daemon process: every code path in this package
+// that reports progress via an mpb bar goes through proxyOrNop, so this
+// one wrapper covers all of them.
+type progressTrackingReadCloser struct{ io.ReadCloser }
+
+func (p progressTrackingReadCloser) Read(b []byte) (int, error) {
+	n, err := p.ReadCloser.Read(b)
+	if n > 0 {
+		progressAddCompleted(int64(n))
+	}
+	return n, err
+}
+
 // proxyOrNop wraps r in bar's progress-tracking proxy reader, falling back to
 // a plain no-op-Close wrapper around r when the bar declines to proxy (e.g.
 // a zero-total spinner bar). Every downloader in this package that reports
 // progress via an mpb.Bar needs this same fallback.
 func proxyOrNop(bar *mpb.Bar, r io.Reader) io.ReadCloser {
 	if p := bar.ProxyReader(r); p != nil {
-		return p
+		return progressTrackingReadCloser{p}
 	}
 	return io.NopCloser(r)
 }
@@ -320,8 +338,13 @@ func newProgressPool(width int) *mpb.Progress {
 	return mpb.New(mpb.WithWidth(width), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
 }
 
-// addLayerBar adds a progress bar into an existing mpb.Progress.
+// addLayerBar adds a progress bar into an existing mpb.Progress, and folds
+// its size into the shared progressState total (see progress_state.go) —
+// every call site only ever creates a bar for a blob that's actually going
+// to be transferred (see pushLazy's own comment on why), so this is the
+// one place that needs to feed progressAddTotal.
 func addLayerBar(p *mpb.Progress, prefix, onComplete string, size int64) *mpb.Bar {
+	progressAddTotal(size)
 	bar := p.AddBar(size,
 		mpb.BarFillerClearOnComplete(),
 		mpb.PrependDecorators(

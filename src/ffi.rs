@@ -21,6 +21,7 @@ extern "C" {
     fn llmman_pull(reference: *const c_char, layout_dir: *const c_char) -> *mut c_char;
     fn llmman_inspect(reference: *const c_char) -> *mut c_char;
     fn llmman_transfer(source: *const c_char, destination: *const c_char) -> *mut c_char;
+    fn llmman_progress() -> *mut c_char;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,4 +104,26 @@ pub fn transfer(source: &str, destination: &str) -> anyhow::Result<()> {
     let s = cstr(source)?;
     let d = cstr(destination)?;
     consume(unsafe { llmman_transfer(s.as_ptr(), d.as_ptr()) }).map(|_| ())
+}
+
+/// A byte-level snapshot of whichever pull/push is currently running
+/// inside this process, as tracked by the Go shim's `progressState` (see
+/// go-shim/progress_state.go). `total`/`completed` are 0 until the shim
+/// learns a blob's size and starts transferring it.
+#[derive(Deserialize)]
+pub struct ProgressSnapshot {
+    pub status: String,
+    pub total: i64,
+    pub completed: i64,
+}
+
+/// Polls the Go shim's process-wide pull/push progress snapshot. Called
+/// by `cmd::serve` every ~200ms while a `/api/pull` or `/api/push` task is
+/// in flight, to relay real byte counts over its NDJSON stream instead of
+/// just a coarse "pulling <model>" heartbeat — see llmman_progress's own
+/// doc comment for why the daemon can't just let the shim's own mpb bars
+/// (go-shim/shared_oci.go) reach an interactive terminal directly.
+pub fn progress() -> anyhow::Result<ProgressSnapshot> {
+    let data = consume(unsafe { llmman_progress() })?;
+    serde_json::from_str(&data).context("failed to decode progress snapshot")
 }
