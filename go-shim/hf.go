@@ -598,42 +598,18 @@ func storeSafetensorsAsOCI(layoutDir, ref, modelRepo string, layers []ocispec.De
 }
 
 // ---------------------------------------------------------------------------
-// stallReader — cancels the context if no bytes arrive within timeout.
-// Mirrors llama.cpp's implicit stall detection via cpp-httplib timeouts.
-// ---------------------------------------------------------------------------
-
-type stallReader struct {
-	r      io.Reader
-	timer  *time.Timer
-	cancel context.CancelFunc
-}
-
-func newStallReader(r io.Reader, timeout time.Duration, cancel context.CancelFunc) *stallReader {
-	sr := &stallReader{r: r, cancel: cancel}
-	sr.timer = time.AfterFunc(timeout, cancel)
-	return sr
-}
-
-func (sr *stallReader) Read(p []byte) (int, error) {
-	n, err := sr.r.Read(p)
-	if n > 0 {
-		sr.timer.Reset(60 * time.Second) // bytes arrived, reset stall clock
-	}
-	return n, err
-}
-
-func (sr *stallReader) stop() { sr.timer.Stop() }
-
-// ---------------------------------------------------------------------------
 // downloadHFBlob — HTTP download with resume, retry, and stall detection.
 // Mirrors llama.cpp common/download.cpp: 3 attempts, 2s/4s backoff.
+//
+// dlMaxAttempts/dlRetryBase/dlStallTimeout/stallReader/isHTTP4xx/retryStream
+// now live in shared_oci.go — they're used here for the local-disk pull
+// path (which can resume a partial download with a Range request against
+// its own .part file) and by transfer_docker.go's streaming push path
+// (which, lacking a resumable registry upload — see that file's own
+// comment on containerd's docker Pusher — can only retry a failed blob
+// from scratch, not resume it, but still benefits from the same
+// backoff/stall/permanent-vs-transient logic).
 // ---------------------------------------------------------------------------
-
-const (
-	dlMaxAttempts  = 3
-	dlRetryBase    = 2 * time.Second // doubles each retry: 2s, 4s
-	dlStallTimeout = 60 * time.Second
-)
 
 func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layoutDir, owner, repo, commit string, file hfFile) (ocispec.Descriptor, error) {
 	if err := os.MkdirAll(filepath.Join(layoutDir, "blobs"), 0o755); err != nil {
@@ -691,20 +667,6 @@ func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layout
 	os.Remove(tmpPath) // exhausted retries
 	return ocispec.Descriptor{}, fmt.Errorf("download %s failed after %d attempts: %w",
 		filepath.Base(file.Path), dlMaxAttempts, lastErr)
-}
-
-// isHTTP4xx returns true for permanent HTTP client errors (no point retrying).
-func isHTTP4xx(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	for _, code := range []string{"HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"} {
-		if strings.Contains(s, code) {
-			return true
-		}
-	}
-	return false
 }
 
 // downloadAttempt performs one download attempt with stall detection.

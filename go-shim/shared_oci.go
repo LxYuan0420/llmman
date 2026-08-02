@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -193,6 +194,112 @@ func findManifestDesc(idx ocispec.Index, refName string) (ocispec.Descriptor, er
 		return idx.Manifests[0], nil
 	}
 	return ocispec.Descriptor{}, fmt.Errorf("no manifest found for %q", refName)
+}
+
+// ---------------------------------------------------------------------------
+// Retry/stall-detection primitives shared by every download/transfer path:
+// hf.go's downloadHFBlob (pull, HF → local disk, resumable via a .part
+// file + Range request) and transfer_docker.go's streamHFFileToRegistry /
+// dockerTransferOCI (transfer, streamed straight into a registry push,
+// NOT resumable — see transfer_docker.go's own comment on why — so these
+// retry a failed blob from scratch instead of resuming it).
+// ---------------------------------------------------------------------------
+
+const (
+	dlMaxAttempts  = 3
+	dlRetryBase    = 2 * time.Second // doubles each retry: 2s, 4s
+	dlStallTimeout = 60 * time.Second
+)
+
+// stallReader cancels the context if no bytes arrive within timeout.
+// Mirrors llama.cpp's implicit stall detection via cpp-httplib timeouts.
+type stallReader struct {
+	r      io.Reader
+	timer  *time.Timer
+	cancel context.CancelFunc
+}
+
+func newStallReader(r io.Reader, timeout time.Duration, cancel context.CancelFunc) *stallReader {
+	sr := &stallReader{r: r, cancel: cancel}
+	sr.timer = time.AfterFunc(timeout, cancel)
+	return sr
+}
+
+func (sr *stallReader) Read(p []byte) (int, error) {
+	n, err := sr.r.Read(p)
+	if n > 0 {
+		sr.timer.Reset(dlStallTimeout) // bytes arrived, reset stall clock
+	}
+	return n, err
+}
+
+func (sr *stallReader) stop() { sr.timer.Stop() }
+
+// stallReadCloser pairs a stallReader with the underlying response body's
+// Close, so callers can pass it around as a plain io.ReadCloser and have
+// the stall timer stopped automatically whenever the body is closed
+// (success, error, or early abandonment all go through Close).
+type stallReadCloser struct {
+	*stallReader
+	body io.Closer
+}
+
+func newStallReadCloser(rc io.ReadCloser, timeout time.Duration, cancel context.CancelFunc) *stallReadCloser {
+	return &stallReadCloser{stallReader: newStallReader(rc, timeout, cancel), body: rc}
+}
+
+func (s *stallReadCloser) Close() error {
+	s.stop()
+	return s.body.Close()
+}
+
+// isHTTP4xx returns true for permanent HTTP client errors (no point retrying).
+func isHTTP4xx(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, code := range []string{"HTTP 400", "HTTP 401", "HTTP 403", "HTTP 404"} {
+		if strings.Contains(s, code) {
+			return true
+		}
+	}
+	return false
+}
+
+// retryStream calls attempt up to dlMaxAttempts times with exponential
+// backoff (2s, 4s, ...) between tries, stopping immediately (no further
+// retries) once isPermanent reports the most recent error isn't worth
+// retrying (e.g. a 404 — see isHTTP4xx). Every attempt is expected to
+// restart its work entirely from scratch: unlike downloadHFBlob's local
+// .part-file resume, there's no partial state to pick up from here (see
+// the callers' own comments for why) — this only saves the operator from
+// having to notice a transient failure and manually re-run the whole
+// command, it doesn't avoid re-sending bytes a failed attempt already
+// sent.
+func retryStream(ctx context.Context, label string, isPermanent func(error) bool, attempt func() error) error {
+	var lastErr error
+	for i := 0; i < dlMaxAttempts; i++ {
+		if i > 0 {
+			delay := dlRetryBase * time.Duration(1<<uint(i-1)) // 2s, 4s
+			fmt.Fprintf(os.Stderr, "\n[llmman] retrying %s (attempt %d/%d, wait %v)\n", label, i+1, dlMaxAttempts, delay)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		err := attempt()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if isPermanent != nil && isPermanent(err) {
+			break
+		}
+		fmt.Fprintf(os.Stderr, "[llmman] %s error: %v\n", label, err)
+	}
+	return fmt.Errorf("%s failed after %d attempts: %w", label, dlMaxAttempts, lastErr)
 }
 
 // proxyOrNop wraps r in bar's progress-tracking proxy reader, falling back to

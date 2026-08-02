@@ -116,22 +116,28 @@ func dockerTransferOCI(ctx context.Context, source, destination string) error {
 	// llmman_push's own progress bars (pushToRegistry in this file),
 	// where the source is already sitting on local disk beforehand — an
 	// actual one-directional copy, not a simultaneous transfer.
-	prog := newProgressPool(40)
+	//
+	// Each blob gets its own progress pool (rather than one pool shared
+	// across the whole manifest) because retryStream may need to restart
+	// a blob's transfer from scratch after a transient failure — see
+	// streamBlobFromFetcher — and a bar that's already partway through
+	// can't be rewound back to zero for a retry; a fresh pool per attempt
+	// sidesteps that instead of fighting it.
 	streamOne := func(desc ocispec.Descriptor, kind string) error {
 		short := shortDigest(desc.Digest)
-		newBar := func() *mpb.Bar {
-			return addLayerBar(prog, "Transferring "+kind+" "+short, "Transferred  "+kind+" "+short, desc.Size)
-		}
-		// pushStreamLazy: don't fetch from the source at all — or create
-		// a bar for it — unless the destination actually needs it; see
-		// pushStreamLazy's own comment for why (shared base layers across
-		// images are exactly the common case this matters for).
-		alreadyExists, err := pushStreamLazy(ctx, pusher, desc, newBar, func() (io.ReadCloser, error) {
-			rc, err := fetcher.Fetch(ctx, desc)
-			if err != nil {
-				return nil, fmt.Errorf("fetch %s: %w", desc.Digest, err)
+		var alreadyExists bool
+		err := retryStream(ctx, kind+" "+short, isHTTP4xx, func() error {
+			prog := newProgressPool(40)
+			newBar := func() *mpb.Bar {
+				return addLayerBar(prog, "Transferring "+kind+" "+short, "Transferred  "+kind+" "+short, desc.Size)
 			}
-			return rc, nil
+			exists, err := streamBlobFromFetcher(ctx, fetcher, pusher, desc, newBar)
+			prog.Wait()
+			if err != nil {
+				return err
+			}
+			alreadyExists = exists
+			return nil
 		})
 		if err != nil {
 			return fmt.Errorf("push %s: %w", desc.Digest, err)
@@ -144,15 +150,12 @@ func dockerTransferOCI(ctx context.Context, source, destination string) error {
 
 	for _, layer := range manifest.Layers {
 		if err := streamOne(layer, "blob"); err != nil {
-			prog.Wait()
 			return err
 		}
 	}
 	if err := streamOne(manifest.Config, "config"); err != nil {
-		prog.Wait()
 		return err
 	}
-	prog.Wait()
 
 	// Manifest push: no progress bar (a few hundred bytes of JSON),
 	// mirroring skopeo's own plain "Writing manifest to image
@@ -162,6 +165,24 @@ func dockerTransferOCI(ctx context.Context, source, destination string) error {
 	}
 	fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
 	return nil
+}
+
+// streamBlobFromFetcher streams one blob from an OCI registry fetcher
+// straight into a registry pusher, same disk-free property as
+// streamHFFileToRegistry below. Wrapped in a per-attempt context so a
+// stalled source read (no bytes for dlStallTimeout) cancels this attempt
+// instead of hanging forever — the caller (streamOne) is what actually
+// retries a failed attempt from scratch via retryStream.
+func streamBlobFromFetcher(ctx context.Context, fetcher remotes.Fetcher, pusher remotes.Pusher, desc ocispec.Descriptor, newBar func() *mpb.Bar) (alreadyExists bool, err error) {
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	return pushStreamLazy(attemptCtx, pusher, desc, newBar, func() (io.ReadCloser, error) {
+		rc, err := fetcher.Fetch(attemptCtx, desc)
+		if err != nil {
+			return nil, fmt.Errorf("fetch %s: %w", desc.Digest, err)
+		}
+		return newStallReadCloser(rc, dlStallTimeout, cancel), nil
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -260,33 +281,54 @@ func streamHFFileToRegistry(
 	// the transfer itself (the push succeeds either way), but leaves the
 	// pushed image unservable by `llmman run`/`llmman serve` afterwards.
 	annotations := map[string]string{"org.cncf.model.filepath": filepath.Base(file.Path)}
-
-	// One progress pool per file (mirrors hf.go's own downloadHFBlob,
-	// used by `llmman pull`'s local-layout path, which does the same).
-	prog := newProgressPool(40)
+	label := filepath.Base(file.Path)
 
 	dgst, size, digestOK, headErr := hfHeadMetadata(ctx, client, url, token)
 	if headErr == nil && digestOK {
 		desc := ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: size, Annotations: annotations}
 		short := shortDigest(dgst)
-		// "Transferring", not "Copying": the GET from HuggingFace and the
-		// push to the destination happen simultaneously here — streamed
-		// straight through with nothing landing on local disk in between
-		// (see pushStreamLazy) — unlike the buffered small-file fallback
-		// below, which really is download-then-push and keeps "Copying"
-		// for its (download-phase-only) bar accordingly.
-		newBar := func() *mpb.Bar {
-			return addLayerBar(prog, "Transferring blob "+short, "Transferred  blob "+short, size)
-		}
-		alreadyExists, err := streamHFGet(ctx, client, url, token, pusher, desc, newBar)
-		if err != nil {
+		var alreadyExists bool
+		// retryStream: a network blip partway through a multi-gigabyte
+		// weight file — very plausible for the kind of file this path
+		// exists for — otherwise kills this file's transfer outright and
+		// (before this) the whole `llmman transfer` invocation with it.
+		// This restarts the failed attempt from byte zero rather than
+		// resuming it: containerd's docker Pusher has no chunked/resumable
+		// upload support (see backend_docker.go's package doc and
+		// pushStreamLazy), so there's no partial destination state to
+		// resume into. Still meaningfully better than the prior
+		// single-shot behavior — see the comment on retryStream itself.
+		err := retryStream(ctx, label, isHTTP4xx, func() error {
+			// One progress pool per attempt: a bar can't be rewound back
+			// to zero for a retry (mpb has no supported way to do that
+			// once a bar has a definite total — see pushLazy's own
+			// comment on this), so each retry gets its own pool/bar
+			// instead of trying to reuse one across attempts.
+			prog := newProgressPool(40)
+			// "Transferring", not "Copying": the GET from HuggingFace and
+			// the push to the destination happen simultaneously here —
+			// streamed straight through with nothing landing on local
+			// disk in between (see pushStreamLazy) — unlike the buffered
+			// small-file fallback below, which really is
+			// download-then-push and keeps "Copying" for its
+			// (download-phase-only) bar accordingly.
+			newBar := func() *mpb.Bar {
+				return addLayerBar(prog, "Transferring blob "+short, "Transferred  blob "+short, size)
+			}
+			exists, err := streamHFGet(ctx, client, url, token, pusher, desc, newBar)
 			prog.Wait()
+			if err != nil {
+				return err
+			}
+			alreadyExists = exists
+			return nil
+		})
+		if err != nil {
 			return ocispec.Descriptor{}, fmt.Errorf("stream %s: %w", file.Path, err)
 		}
 		if alreadyExists {
 			fmt.Fprintf(os.Stderr, "Transferred  blob %s (already present)\n", short)
 		}
-		prog.Wait()
 		return desc, nil
 	}
 
@@ -295,16 +337,26 @@ func streamHFFileToRegistry(
 	// instead of digest (still shows real byte progress whenever the HEAD
 	// above did manage to learn a size, even though its digest wasn't
 	// usable — a HEAD failure (headErr != nil) leaves size at its zero
-	// value, so the bar just falls back to a spinner in that case).
-	label := filepath.Base(file.Path)
-	bar := addLayerBar(prog, "Copying blob "+label, "Copied  blob "+label, size)
-	data, err := hfGetBytes(ctx, client, url, token, bar)
-	if err != nil {
-		bar.Abort(false)
+	// value, so the bar just falls back to a spinner in that case). These
+	// files are small enough (config.json, tokenizer files, ...) that a
+	// full-file retry is cheap regardless.
+	var data []byte
+	err := retryStream(ctx, label, isHTTP4xx, func() error {
+		prog := newProgressPool(40)
+		bar := addLayerBar(prog, "Copying blob "+label, "Copied  blob "+label, size)
+		d, err := hfGetBytes(ctx, client, url, token, bar)
+		if err != nil {
+			bar.Abort(false)
+			prog.Wait()
+			return err
+		}
 		prog.Wait()
+		data = d
+		return nil
+	})
+	if err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("download %s: %w", file.Path, err)
 	}
-	prog.Wait()
 	desc := ocispec.Descriptor{
 		MediaType:   mediaType,
 		Digest:      digest.FromBytes(data),
@@ -321,10 +373,17 @@ func streamHFFileToRegistry(
 // if the destination doesn't already have this exact blob (see
 // pushStreamLazy) — the common case for re-transferring the same model, or
 // transferring a file whose content happens to match one already pushed
-// under a different name or tag.
+// under a different name or tag. Runs under its own cancelable context so
+// a stalled read (no bytes for dlStallTimeout — a connection that's gone
+// dead without an actual TCP-level error, which a plain http.Client won't
+// notice on its own) aborts this attempt instead of hanging indefinitely;
+// the caller (streamHFFileToRegistry) is what retries a failed attempt
+// from scratch via retryStream.
 func streamHFGet(ctx context.Context, client *http.Client, url, token string, pusher remotes.Pusher, desc ocispec.Descriptor, newBar func() *mpb.Bar) (alreadyExists bool, err error) {
-	return pushStreamLazy(ctx, pusher, desc, newBar, func() (io.ReadCloser, error) {
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	return pushStreamLazy(attemptCtx, pusher, desc, newBar, func() (io.ReadCloser, error) {
+		req, err := http.NewRequestWithContext(attemptCtx, "GET", url, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -339,12 +398,14 @@ func streamHFGet(ctx context.Context, client *http.Client, url, token string, pu
 			resp.Body.Close()
 			return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
 		}
-		return resp.Body, nil
+		return newStallReadCloser(resp.Body, dlStallTimeout, cancel), nil
 	})
 }
 
 func hfGetBytes(ctx context.Context, client *http.Client, url, token string, bar *mpb.Bar) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(attemptCtx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -359,7 +420,9 @@ func hfGetBytes(ctx context.Context, client *http.Client, url, token string, bar
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
 	}
-	r := proxyOrNop(bar, resp.Body)
+	sr := newStallReadCloser(resp.Body, dlStallTimeout, cancel)
+	defer sr.Close()
+	r := proxyOrNop(bar, sr)
 	defer r.Close()
 	return io.ReadAll(r)
 }

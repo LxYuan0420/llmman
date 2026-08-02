@@ -59,18 +59,46 @@ impl Default for Index {
 pub struct Manifest {
     pub schema_version: u32,
     pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
     pub config: Descriptor,
     pub layers: Vec<Descriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<std::collections::HashMap<String, String>>,
 }
 
+/// `application/vnd.cncf.model.config.v1+json` — the CNCF Model Format Spec
+/// (<https://github.com/modelpack/model-spec>) config document. Mirrors the
+/// `cncfModelConfig` struct in `go-shim/hf.go`, which builds the same shape
+/// for HuggingFace/cloud-source pulls; this is the equivalent for `llmman
+/// build`'s local-directory packaging path.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CncfConfigDescriptor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CncfConfigConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImageConfig {
-    pub created: String,
-    pub architecture: String,
-    pub os: String,
-    pub labels: std::collections::HashMap<String, String>,
+#[serde(rename_all = "camelCase")]
+pub struct CncfModelFs {
+    #[serde(rename = "type")]
+    pub fs_type: String,
+    pub diff_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CncfModelConfig {
+    pub descriptor: CncfConfigDescriptor,
+    pub config: CncfConfigConfig,
+    pub modelfs: CncfModelFs,
 }
 
 /// Summary of a locally stored image shown by `list`.
@@ -326,8 +354,13 @@ impl OciStore {
     // Build helpers
     // ------------------------------------------------------------------
 
-    /// Package all files in `src_dir` as an OCI image stored in this layout.
-    /// Each file becomes one uncompressed tar layer.
+    /// Package all files in `src_dir` as a CNCF Model Format Spec
+    /// (<https://github.com/modelpack/model-spec>) OCI artifact stored in
+    /// this layout. Each file becomes one uncompressed tar layer, classified
+    /// into the appropriate `application/vnd.cncf.model.*` media type by
+    /// extension (mirroring `classifyFile` in `go-shim/uri_sources.go`, the
+    /// equivalent classifier used when pulling from HuggingFace/cloud
+    /// sources), with `org.cncf.model.filepath` recording its path.
     /// Returns the manifest descriptor.
     pub fn build(
         &self,
@@ -339,8 +372,9 @@ impl OciStore {
 
         let src_dir = src_dir.as_ref();
         let mut layers: Vec<Descriptor> = Vec::new();
+        let mut format: Option<&'static str> = None;
 
-        // One layer per file (uncompressed tar, filename preserved via annotation)
+        // One layer per file (uncompressed tar, filename preserved via annotations)
         for entry in WalkDir::new(src_dir).follow_links(true) {
             let entry = entry?;
             if !entry.file_type().is_file() {
@@ -353,14 +387,22 @@ impl OciStore {
                 .to_string_lossy()
                 .into_owned();
 
+            let media_type = classify_model_layer(&rel);
+            if media_type == WEIGHT_TAR_MEDIA_TYPE {
+                let lower = rel.to_lowercase();
+                if lower.ends_with(".gguf") || lower.ends_with(".ggml") {
+                    format = Some("gguf");
+                } else if lower.ends_with(".safetensors") && format.is_none() {
+                    format = Some("safetensors");
+                }
+            }
+
             // Build a minimal tar with a single entry
             let tar_data = make_single_file_tar(entry.path(), &rel)?;
-            let mut desc = self.write_blob(
-                "application/vnd.oci.image.layer.v1.tar",
-                &tar_data,
-            )?;
+            let mut desc = self.write_blob(media_type, &tar_data)?;
             desc.annotations = Some({
                 let mut m = std::collections::HashMap::new();
+                m.insert("org.cncf.model.filepath".into(), rel.clone());
                 m.insert("org.opencontainers.image.title".into(), rel);
                 m
             });
@@ -371,28 +413,91 @@ impl OciStore {
             return Err(anyhow!("no files found in {}", src_dir.display()));
         }
 
-        // Config
-        let config = ImageConfig {
-            created: chrono::Utc::now().to_rfc3339(),
-            architecture: std::env::consts::ARCH.to_string(),
-            os: std::env::consts::OS.to_string(),
-            labels: labels.clone(),
+        // `application/vnd.cncf.model.config.v1+json` config. Since every
+        // layer above is an uncompressed tar, each layer's DiffID (hash of
+        // its uncompressed content) is simply its own digest.
+        let cncf_config = CncfModelConfig {
+            descriptor: CncfConfigDescriptor {
+                created_at: Some(chrono::Utc::now().to_rfc3339()),
+            },
+            config: CncfConfigConfig {
+                format: format.map(str::to_string),
+            },
+            modelfs: CncfModelFs {
+                fs_type: "layers".into(),
+                diff_ids: layers.iter().map(|l| l.digest.clone()).collect(),
+            },
         };
-        let config_data = serde_json::to_vec(&config)?;
-        let config_desc =
-            self.write_blob("application/vnd.oci.image.config.v1+json", &config_data)?;
+        let config_data = serde_json::to_vec(&cncf_config)?;
+        let config_desc = self.write_blob(
+            "application/vnd.cncf.model.config.v1+json",
+            &config_data,
+        )?;
+
+        // `--label key=value` pairs have no dedicated slot in the model
+        // config schema, so they're carried as manifest annotations instead.
+        let manifest_annotations = if labels.is_empty() {
+            None
+        } else {
+            Some(labels.clone())
+        };
 
         // Manifest
         let manifest = Manifest {
             schema_version: 2,
             media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            artifact_type: Some("application/vnd.cncf.model.manifest.v1+json".into()),
             config: config_desc,
             layers,
-            annotations: None,
+            annotations: manifest_annotations,
         };
         let manifest_desc = self.write_manifest(&manifest)?;
         self.tag(manifest_desc.clone(), reference)?;
         Ok(manifest_desc)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CNCF Model Format Spec layer classification
+// ---------------------------------------------------------------------------
+
+const WEIGHT_TAR_MEDIA_TYPE: &str = "application/vnd.cncf.model.weight.v1.tar";
+const WEIGHT_CONFIG_TAR_MEDIA_TYPE: &str = "application/vnd.cncf.model.weight.config.v1.tar";
+const DOC_TAR_MEDIA_TYPE: &str = "application/vnd.cncf.model.doc.v1.tar";
+const CODE_TAR_MEDIA_TYPE: &str = "application/vnd.cncf.model.code.v1.tar";
+
+/// Maps a file's relative path to the appropriate CNCF model layer media
+/// type by extension, mirroring `classifyFile` in `go-shim/uri_sources.go`
+/// (used for HuggingFace/cloud-source pulls). Uses the `.tar` variants
+/// because `build()` wraps each file in its own uncompressed tar archive,
+/// rather than the `.raw` variants the Go side uses for un-archived blobs.
+fn classify_model_layer(rel_path: &str) -> &'static str {
+    let lower = rel_path.to_lowercase();
+    let base = Path::new(&lower)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(lower.as_str());
+    let ext = Path::new(base).extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    match ext {
+        "safetensors" | "bin" | "pt" | "pth" | "gguf" | "ggml" | "ot" | "engine" | "trt"
+        | "onnx" => WEIGHT_TAR_MEDIA_TYPE,
+        "json" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "conf" | "model" | "tiktoken"
+        | "vocab" | "merges" | "spm" => WEIGHT_CONFIG_TAR_MEDIA_TYPE,
+        "txt" => {
+            if base.contains("vocab") || base.contains("merges") {
+                WEIGHT_CONFIG_TAR_MEDIA_TYPE
+            } else {
+                DOC_TAR_MEDIA_TYPE
+            }
+        }
+        "py" | "sh" | "js" | "ts" => CODE_TAR_MEDIA_TYPE,
+        "md" | "rst" | "pdf" => DOC_TAR_MEDIA_TYPE,
+        _ => {
+            // README, LICENSE, and anything unrecognized default to doc,
+            // same as the Go classifier's fallback.
+            DOC_TAR_MEDIA_TYPE
+        }
     }
 }
 
