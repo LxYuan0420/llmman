@@ -4,10 +4,31 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strings"
 
 	digest "github.com/opencontainers/go-digest"
 )
+
+// transferViaStaging implements source→destination transfers that can't be
+// done as a direct registry-to-registry blob copy (e.g. HuggingFace or
+// another non-OCI source) by pulling into a temporary local OCI layout and
+// then pushing that layout to the destination registry. Identical for both
+// the docker and podman backends since it only calls the shared
+// pullToLayout/pushToRegistry entry points.
+func transferViaStaging(ctx context.Context, source, destination string) error {
+	tmp, err := os.MkdirTemp("", "llmman-transfer-")
+	if err != nil {
+		return fmt.Errorf("create staging directory: %w", err)
+	}
+	defer os.RemoveAll(tmp)
+
+	if err := pullToLayout(ctx, source, tmp); err != nil {
+		return err
+	}
+	return pushToRegistry(ctx, tmp, destination)
+}
 
 type transferSourceKind int
 

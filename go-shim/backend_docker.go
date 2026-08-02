@@ -358,7 +358,7 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 
 	// "Copying blob/config <digest>" progress bars, matching skopeo's own
 	// copy.Image output exactly (see copy/progress_bars.go upstream).
-	prog := mpb.New(mpb.WithWidth(40), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
+	prog := newProgressPool(40)
 	pushWithBar := func(desc ocispec.Descriptor, kind string) error {
 		short := shortDigest(desc.Digest)
 		newBar := func() *mpb.Bar {
@@ -411,20 +411,11 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 // pullToLayout is llmman_pull's implementation, factored out so
 // llmman_transfer's staging-directory fallback can reuse it.
 func pullToLayout(ctx context.Context, ref, layoutDir string) error {
-	// URI-scheme dispatch: hf://, ms://, ngc://, s3://, gs://, /absolute/path.
-	// These bypass the OCI registry probe and HF host detection below.
-	if handled, err := dispatchPull(ctx, ref, layoutDir); handled {
+	ref, isOCI, handled, err := classifyPullRef(ctx, ref, layoutDir)
+	if handled {
 		return err
 	}
-
-	// Normalize: append :latest if reference has no tag or digest
-	if strings.LastIndex(ref, ":") <= strings.LastIndex(ref, "/") {
-		ref = ref + ":latest"
-	}
-
-	// Detect backend: probe the host to decide OCI registry vs HuggingFace-compatible.
-	host := strings.SplitN(ref, "/", 2)[0]
-	if !isOCIHost(ctx, host) {
+	if !isOCI {
 		return pullHF(ctx, ref, layoutDir)
 	}
 

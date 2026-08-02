@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
@@ -60,6 +61,40 @@ func writeBlob(layoutDir string, mediaType string, data []byte) (ocispec.Descrip
 	return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: int64(len(data))}, nil
 }
 
+// openForResume opens path for appending if a previously-partial download of
+// resumeFrom bytes already exists there, re-hashing those bytes into the
+// returned digester so the digest computed over subsequent writes still
+// spans the whole file; otherwise (no existing partial, or re-hashing it
+// fails) it creates path fresh with a zeroed digester. The returned offset is
+// resumeFrom on a successful resume, or 0 if resume wasn't possible. Shared
+// by writeBlobStream (OCI-to-OCI transfer) and downloadAttempt (HuggingFace
+// pull), which both append to a deterministic ".part" file across retries.
+func openForResume(path string, resumeFrom int64) (f *os.File, digester digest.Digester, offset int64, err error) {
+	digester = digest.Canonical.Digester()
+
+	if resumeFrom > 0 {
+		if pf, openErr := os.Open(path); openErr == nil {
+			_, hashErr := io.Copy(digester.Hash(), pf)
+			pf.Close()
+			if hashErr == nil {
+				if af, appendErr := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644); appendErr == nil {
+					f = af
+					offset = resumeFrom
+				}
+			}
+		}
+		if f == nil {
+			digester = digest.Canonical.Digester()
+		}
+	}
+	if f == nil {
+		if f, err = os.Create(path); err != nil {
+			return nil, nil, 0, err
+		}
+	}
+	return f, digester, offset, nil
+}
+
 // writeBlobStream writes a large stream to the OCI layout blobs directory with
 // resume support via a deterministic .part file.
 func writeBlobStream(layoutDir, mediaType string, r io.Reader, size int64, dgst digest.Digest, partOffset int64) (ocispec.Descriptor, error) {
@@ -72,30 +107,10 @@ func writeBlobStream(layoutDir, mediaType string, r io.Reader, size int64, dgst 
 		return ocispec.Descriptor{MediaType: mediaType, Digest: dgst, Size: fi.Size()}, nil
 	}
 	tmp := dest + ".part"
-	digester := digest.Canonical.Digester()
-	var f *os.File
-	startOffset := int64(0)
 
-	if partOffset > 0 {
-		if pf, err := os.Open(tmp); err == nil {
-			_, hashErr := io.Copy(digester.Hash(), pf)
-			pf.Close()
-			if hashErr == nil {
-				f, err = os.OpenFile(tmp, os.O_APPEND|os.O_WRONLY, 0o644)
-				if err == nil {
-					startOffset = partOffset
-				}
-			}
-		}
-		if f == nil {
-			digester = digest.Canonical.Digester()
-		}
-	}
-	if f == nil {
-		var err error
-		if f, err = os.Create(tmp); err != nil {
-			return ocispec.Descriptor{}, err
-		}
+	f, digester, startOffset, err := openForResume(tmp, partOffset)
+	if err != nil {
+		return ocispec.Descriptor{}, err
 	}
 
 	written, err := io.Copy(io.MultiWriter(f, digester.Hash()), r)
@@ -189,6 +204,13 @@ func proxyOrNop(bar *mpb.Bar, r io.Reader) io.ReadCloser {
 		return p
 	}
 	return io.NopCloser(r)
+}
+
+// newProgressPool creates an mpb.Progress bar pool with the output/refresh
+// settings shared by every download/transfer path in llmman; only the bar
+// width varies by call site (80 for pull, 40 for transfer).
+func newProgressPool(width int) *mpb.Progress {
+	return mpb.New(mpb.WithWidth(width), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
 }
 
 // addLayerBar adds a progress bar into an existing mpb.Progress.

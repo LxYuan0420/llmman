@@ -442,6 +442,15 @@ enum ModelPath {
     SafeTensors(PathBuf),
 }
 
+/// Splits an OCI digest ("sha256:abcd...") down to just its hex portion,
+/// which is what the blob store's on-disk layout uses as the filename.
+fn digest_hex(digest: &str) -> anyhow::Result<&str> {
+    digest
+        .split_once(':')
+        .map(|(_, hex)| hex)
+        .ok_or_else(|| anyhow!("malformed digest: {digest}"))
+}
+
 fn layer_filepath(l: &crate::storage::oci::Descriptor) -> Option<&str> {
     l.annotations.as_ref().and_then(|a| {
         a.get("org.cncf.model.filepath")
@@ -469,8 +478,7 @@ fn resolve_model(store_path: &Path, cache_path: &Path, model_ref: &str) -> anyho
     // ── GGUF → llama-server ────────────────────────────────────────────────
     if let Some(gguf_layer) = manifest.layers.iter().find(|l| is_gguf_layer(l)) {
         let title = layer_filepath(gguf_layer).unwrap_or("model.gguf").to_owned();
-        let (_, layer_hex) = gguf_layer.digest.split_once(':')
-            .ok_or_else(|| anyhow!("malformed digest: {}", gguf_layer.digest))?;
+        let layer_hex = digest_hex(&gguf_layer.digest)?;
 
         // HF blobs are stored as raw GGUF — use directly.
         if gguf_layer.media_type == HF_GGUF_MEDIA_TYPE {
@@ -550,8 +558,7 @@ fn extract_safetensors_dir(
     manifest_digest: &str,
     manifest: &crate::storage::oci::Manifest,
 ) -> anyhow::Result<PathBuf> {
-    let (_, hex) = manifest_digest.split_once(':')
-        .ok_or_else(|| anyhow!("malformed manifest digest"))?;
+    let hex = digest_hex(manifest_digest)?;
     let cache_dir = cache_path.join(hex);
 
     for layer in &manifest.layers {
@@ -568,8 +575,7 @@ fn extract_safetensors_dir(
         if dest.exists() { continue; }
 
         std::fs::create_dir_all(dest.parent().context("no parent")?)?;
-        let (_, layer_hex) = layer.digest.split_once(':')
-            .ok_or_else(|| anyhow!("malformed layer digest"))?;
+        let layer_hex = digest_hex(&layer.digest)?;
         let blob = store_path.join("blobs").join("sha256").join(layer_hex);
         std::fs::copy(&blob, &dest)
             .with_context(|| format!("copy {rel_path} from blob store"))?;
@@ -823,17 +829,7 @@ async fn collect_completion(
     // when llama-server has already closed the idle connection on its end.
     let client = reqwest::Client::new();
 
-    let resp = client
-        .post(url)
-        .json(&oai)
-        .send()
-        .await
-        .context("send to llama-server")?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(AppError(anyhow!("inference backend {status}: {body}")));
-    }
+    let resp = post_chat(&client, url, &oai).await?;
     let raw = resp.bytes().await.context("read llama-server response")?;
     eprintln!("[llmman] llama-server raw {} bytes", raw.len());
     if raw.is_empty() {
@@ -922,18 +918,17 @@ fn oai_chunk_to_content(payload: &str) -> Option<(String, Option<String>, bool)>
 }
 
 // ---------------------------------------------------------------------------
-// Streaming conversion: OpenAI SSE → Ollama NDJSON (chat)
+// Shared "POST an OpenAI chat request, fail on non-2xx" helper
 // ---------------------------------------------------------------------------
 
-async fn stream_ollama_chat(
-    client: Client,
-    url: String,
-    oai_req: OAIChatRequest,
-    model: String,
-) -> Result<Response, AppError> {
+/// POSTs oai_req to url and returns the still-streaming response, converting
+/// a non-2xx status into an AppError carrying the backend's error body.
+/// Shared by every route that streams llama-server's OpenAI-style SSE output
+/// back out in some other shape (stream_ollama, stream_anthropic below).
+async fn post_chat(client: &Client, url: &str, oai_req: &OAIChatRequest) -> Result<reqwest::Response, AppError> {
     let resp = client
-        .post(&url)
-        .json(&oai_req)
+        .post(url)
+        .json(oai_req)
         .send()
         .await
         .context("send to llama-server")?;
@@ -942,64 +937,31 @@ async fn stream_ollama_chat(
         let body = resp.text().await.unwrap_or_default();
         return Err(AppError(anyhow!("inference backend {status}: {body}")));
     }
+    Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming conversion: OpenAI SSE → Ollama NDJSON (chat + generate)
+//
+// The chat and generate endpoints differ only in which Ollama chunk struct
+// wraps each token (OllamaChatChunk's nested `message.content` vs
+// OllamaGenerateChunk's flat `response`), so both go through this one
+// generic driver; build_chunk supplies just that piece.
+// ---------------------------------------------------------------------------
+
+async fn stream_ollama<T: Serialize + Send + 'static>(
+    client: Client,
+    url: String,
+    oai_req: OAIChatRequest,
+    build_chunk: impl Fn(String, Option<String>, bool) -> T + Send + 'static,
+) -> Result<Response, AppError> {
+    let resp = post_chat(&client, &url, &oai_req).await?;
 
     let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
         let out = line.strip_prefix("data: ")
             .and_then(|p| oai_chunk_to_content(p))
             .map(|(content, thinking, done)| {
-                let chunk = OllamaChatChunk {
-                    model: model.clone(),
-                    created_at: now_rfc3339(),
-                    message: OllamaMessage { role: "assistant".into(), content, thinking },
-                    done,
-                    done_reason: done.then_some("stop".into()),
-                };
-                serde_json::to_string(&chunk).unwrap_or_default() + "\n"
-            })
-            .unwrap_or_default();
-        Ok::<_, std::convert::Infallible>(Bytes::from(out))
-    });
-
-    Ok(Response::builder()
-        .header("content-type", "application/x-ndjson")
-        .body(Body::from_stream(stream))
-        .unwrap())
-}
-
-// ---------------------------------------------------------------------------
-// Streaming conversion: OpenAI SSE → Ollama NDJSON (generate)
-// ---------------------------------------------------------------------------
-
-async fn stream_ollama_generate(
-    client: Client,
-    url: String,
-    oai_req: OAIChatRequest,
-    model: String,
-) -> Result<Response, AppError> {
-    let resp = client
-        .post(&url)
-        .json(&oai_req)
-        .send()
-        .await
-        .context("send to llama-server")?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(AppError(anyhow!("inference backend {status}: {body}")));
-    }
-
-    let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
-        let out = line.strip_prefix("data: ")
-            .and_then(|p| oai_chunk_to_content(p))
-            .map(|(response, thinking, done)| {
-                let chunk = OllamaGenerateChunk {
-                    model: model.clone(),
-                    created_at: now_rfc3339(),
-                    response,
-                    thinking,
-                    done,
-                    done_reason: done.then_some("stop".into()),
-                };
+                let chunk = build_chunk(content, thinking, done);
                 serde_json::to_string(&chunk).unwrap_or_default() + "\n"
             })
             .unwrap_or_default();
@@ -1022,17 +984,7 @@ async fn stream_anthropic(
     oai_req: OAIChatRequest,
     model: String,
 ) -> Result<Response, AppError> {
-    let resp = client
-        .post(&url)
-        .json(&oai_req)
-        .send()
-        .await
-        .context("send to llama-server")?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(AppError(anyhow!("inference backend {status}: {body}")));
-    }
+    let resp = post_chat(&client, &url, &oai_req).await?;
 
     let msg_id = gen_id();
     let preamble = {
@@ -1527,7 +1479,17 @@ async fn handle_ollama_chat(
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
     };
-    stream_ollama_chat(state.0.client.clone(), url, oai, req.model).await
+    let model = req.model;
+    stream_ollama(state.0.client.clone(), url, oai, move |content, thinking, done| {
+        OllamaChatChunk {
+            model: model.clone(),
+            created_at: now_rfc3339(),
+            message: OllamaMessage { role: "assistant".into(), content, thinking },
+            done,
+            done_reason: done.then_some("stop".into()),
+        }
+    })
+    .await
 }
 
 // -- Ollama /api/generate -----------------------------------------------------
@@ -1582,7 +1544,18 @@ async fn handle_ollama_generate(
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
     };
-    stream_ollama_generate(state.0.client.clone(), url, oai, req.model).await
+    let model = req.model;
+    stream_ollama(state.0.client.clone(), url, oai, move |response, thinking, done| {
+        OllamaGenerateChunk {
+            model: model.clone(),
+            created_at: now_rfc3339(),
+            response,
+            thinking,
+            done,
+            done_reason: done.then_some("stop".into()),
+        }
+    })
+    .await
 }
 
 // -- OpenAI pass-through handlers --------------------------------------------
@@ -1612,17 +1585,31 @@ async fn handle_openai_models(
 
 
 
+/// Shared body of every plain OpenAI-passthrough route: parse just enough of
+/// the request to find `model`, make sure it's loaded, then proxy the
+/// untouched request body straight through to llama-server's equivalent
+/// endpoint. `llama_path` is the only thing that differs between
+/// handle_openai_chat/completions/embeddings below.
+async fn proxy_openai(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Bytes,
+    llama_path: &str,
+) -> Result<Response, AppError> {
+    let req: serde_json::Value =
+        serde_json::from_slice(&body).context("parse OpenAI request body")?;
+    let model = req["model"].as_str().unwrap_or("").to_string();
+    let port = ensure_model(state, &model).await?;
+    let url = format!("http://127.0.0.1:{port}{llama_path}");
+    proxy(&state.0.client, &url, headers, body).await
+}
+
 async fn handle_openai_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let req: serde_json::Value =
-        serde_json::from_slice(&body).context("parse OpenAI request body")?;
-    let model = req["model"].as_str().unwrap_or("").to_string();
-    let port = ensure_model(&state, &model).await?;
-    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
-    proxy(&state.0.client, &url, &headers, body).await
+    proxy_openai(&state, &headers, body, "/v1/chat/completions").await
 }
 
 async fn handle_openai_completions(
@@ -1630,12 +1617,7 @@ async fn handle_openai_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let req: serde_json::Value =
-        serde_json::from_slice(&body).context("parse OpenAI request body")?;
-    let model = req["model"].as_str().unwrap_or("").to_string();
-    let port = ensure_model(&state, &model).await?;
-    let url = format!("http://127.0.0.1:{port}/v1/completions");
-    proxy(&state.0.client, &url, &headers, body).await
+    proxy_openai(&state, &headers, body, "/v1/completions").await
 }
 
 async fn handle_openai_embeddings(
@@ -1643,12 +1625,7 @@ async fn handle_openai_embeddings(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let req: serde_json::Value =
-        serde_json::from_slice(&body).context("parse OpenAI request body")?;
-    let model = req["model"].as_str().unwrap_or("").to_string();
-    let port = ensure_model(&state, &model).await?;
-    let url = format!("http://127.0.0.1:{port}/v1/embeddings");
-    proxy(&state.0.client, &url, &headers, body).await
+    proxy_openai(&state, &headers, body, "/v1/embeddings").await
 }
 
 // -- Anthropic /v1/messages --------------------------------------------------

@@ -83,6 +83,28 @@ func isOCIHost(ctx context.Context, host string) bool {
 	return isOCIRegistry(ctx, probeClient, host)
 }
 
+// classifyPullRef runs the URI-scheme dispatch and OCI-vs-HuggingFace host
+// classification shared by both backends' pullToLayout (backend_docker.go,
+// backend_podman.go). If handled is true, dispatchPull has already fully
+// processed ref (via one of hf://, ms://, ngc://, s3://, gs://, or a local
+// path) and the caller should return dispatchErr immediately without doing
+// anything else. Otherwise normalizedRef is ref with a ":latest" tag
+// defaulted in, and isOCI reports whether normalizedRef's host should be
+// pulled via the OCI registry protocol (true) or the shared HF path (false).
+func classifyPullRef(ctx context.Context, ref, layoutDir string) (normalizedRef string, isOCI, handled bool, dispatchErr error) {
+	if handled, err := dispatchPull(ctx, ref, layoutDir); handled {
+		return ref, false, true, err
+	}
+
+	// Normalize: append :latest if reference has no tag or digest.
+	if strings.LastIndex(ref, ":") <= strings.LastIndex(ref, "/") {
+		ref = ref + ":latest"
+	}
+
+	host := strings.SplitN(ref, "/", 2)[0]
+	return ref, isOCIHost(ctx, host), false, nil
+}
+
 // ---------------------------------------------------------------------------
 // HuggingFace API types and helpers
 // ---------------------------------------------------------------------------
@@ -624,7 +646,7 @@ func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layout
 
 	label := "Pulling  " + filepath.Base(file.Path)
 	doneLbl := "Pulled   " + filepath.Base(file.Path)
-	prog := mpb.New(mpb.WithWidth(80), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
+	prog := newProgressPool(80)
 	bar := addLayerBar(prog, label, doneLbl, file.Size)
 
 	var lastErr error
@@ -717,25 +739,9 @@ func downloadAttempt(ctx context.Context, client *http.Client, url, token, layou
 		bar.SetCurrent(0)
 	}
 
-	digester := digest.Canonical.Digester()
-	var f *os.File
-	if startOffset > 0 {
-		if pf, err := os.Open(tmpPath); err == nil {
-			_, hashErr := io.Copy(digester.Hash(), pf)
-			pf.Close()
-			if hashErr == nil {
-				f, _ = os.OpenFile(tmpPath, os.O_APPEND|os.O_WRONLY, 0o644)
-			}
-		}
-		if f == nil {
-			digester = digest.Canonical.Digester()
-			startOffset = 0
-		}
-	}
-	if f == nil {
-		if f, err = os.Create(tmpPath); err != nil {
-			return ocispec.Descriptor{}, err
-		}
+	f, digester, startOffset, err := openForResume(tmpPath, startOffset)
+	if err != nil {
+		return ocispec.Descriptor{}, err
 	}
 
 	// Wrap with stall detector: cancel attemptCtx if no bytes for 60s.

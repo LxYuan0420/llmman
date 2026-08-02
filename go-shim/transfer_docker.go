@@ -41,7 +41,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/containerd/containerd/v2/core/remotes"
 	digest "github.com/opencontainers/go-digest"
@@ -71,23 +70,6 @@ func dockerTransfer(ctx context.Context, source, destination string) error {
 	default:
 		return transferViaStaging(ctx, source, destination)
 	}
-}
-
-// transferViaStaging is the fallback path for source kinds that don't have
-// a streaming implementation (yet): pull into a throwaway local OCI
-// layout, then push from it, mirroring what `llmman transfer` did before
-// this file existed.
-func transferViaStaging(ctx context.Context, source, destination string) error {
-	tmp, err := os.MkdirTemp("", "llmman-transfer-")
-	if err != nil {
-		return fmt.Errorf("create staging directory: %w", err)
-	}
-	defer os.RemoveAll(tmp)
-
-	if err := pullToLayout(ctx, source, tmp); err != nil {
-		return err
-	}
-	return pushToRegistry(ctx, tmp, destination)
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +116,7 @@ func dockerTransferOCI(ctx context.Context, source, destination string) error {
 	// llmman_push's own progress bars (pushToRegistry in this file),
 	// where the source is already sitting on local disk beforehand — an
 	// actual one-directional copy, not a simultaneous transfer.
-	prog := mpb.New(mpb.WithWidth(40), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
+	prog := newProgressPool(40)
 	streamOne := func(desc ocispec.Descriptor, kind string) error {
 		short := shortDigest(desc.Digest)
 		newBar := func() *mpb.Bar {
@@ -281,7 +263,7 @@ func streamHFFileToRegistry(
 
 	// One progress pool per file (mirrors hf.go's own downloadHFBlob,
 	// used by `llmman pull`'s local-layout path, which does the same).
-	prog := mpb.New(mpb.WithWidth(40), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
+	prog := newProgressPool(40)
 
 	dgst, size, digestOK, headErr := hfHeadMetadata(ctx, client, url, token)
 	if headErr == nil && digestOK {

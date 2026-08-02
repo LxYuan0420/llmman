@@ -69,19 +69,3 @@ func podmanTransferOCI(ctx context.Context, source, destination string) error {
 	}
 	return nil
 }
-
-// transferViaStaging is the fallback path for source kinds containers/image
-// has no transport for (HuggingFace, ms://, ngc://, s3://, gs://, a local
-// path): pull into a throwaway local OCI layout, then push from it.
-func transferViaStaging(ctx context.Context, source, destination string) error {
-	tmp, err := os.MkdirTemp("", "llmman-transfer-")
-	if err != nil {
-		return fmt.Errorf("create staging directory: %w", err)
-	}
-	defer os.RemoveAll(tmp)
-
-	if err := pullToLayout(ctx, source, tmp); err != nil {
-		return err
-	}
-	return pushToRegistry(ctx, tmp, destination)
-}

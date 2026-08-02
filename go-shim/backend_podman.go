@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/vbauerster/mpb/v8"
@@ -139,21 +138,14 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 // pullToLayout is llmman_pull's implementation, factored out so
 // llmman_transfer's staging-directory fallback can reuse it.
 func pullToLayout(ctx context.Context, ref, layoutDir string) error {
-	// URI-scheme dispatch: hf://, ms://, ngc://, s3://, gs://, /absolute/path.
-	if handled, err := dispatchPull(ctx, ref, layoutDir); handled {
+	ref, isOCI, handled, err := classifyPullRef(ctx, ref, layoutDir)
+	if handled {
 		return err
 	}
-
-	// Normalize: append :latest if reference has no tag or digest
-	if strings.LastIndex(ref, ":") <= strings.LastIndex(ref, "/") {
-		ref = ref + ":latest"
-	}
-
 	// HuggingFace and similar hosts cannot be pulled via the OCI registry
 	// protocol (their paths contain uppercase letters which containers/image
 	// rejects).  Delegate to the shared HF pull path instead.
-	host := strings.SplitN(ref, "/", 2)[0]
-	if !isOCIHost(ctx, host) {
+	if !isOCI {
 		if err := ensureLayout(layoutDir); err != nil {
 			return fmt.Errorf("init OCI layout: %w", err)
 		}

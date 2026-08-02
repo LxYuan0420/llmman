@@ -159,6 +159,55 @@ func downloadToPackFile(prog *mpb.Progress, layoutDir, tmpPrefix, kind, relPath 
 	return modelPackFile{localPath: tmpPath, relativePath: relPath}, nil
 }
 
+// cloudDownloadClient returns the HTTP client used for downloading file
+// content from the cloud sources below (ModelScope, NGC, GCS): no body read
+// timeout so large files can transfer without a deadline, but a response
+// header timeout still prevents hanging on a stalled server. S3 goes through
+// the AWS SDK's own client instead, so it doesn't use this.
+func cloudDownloadClient() *http.Client {
+	return &http.Client{Transport: &http.Transport{
+		ResponseHeaderTimeout: 60 * time.Second,
+	}}
+}
+
+// downloadItem describes one file to be fetched by downloadItemsAsModelPack.
+type downloadItem struct {
+	relPath string
+	size    int64
+	open    func() (io.ReadCloser, error)
+}
+
+// downloadItemsAsModelPack runs the shared "download every item with a
+// progress bar, then pack the results as a CNCF ModelPack" loop used by every
+// cloud pull source (ModelScope, NGC, S3, GCS). tmpPrefix disambiguates
+// staging file names between sources (e.g. "ms", "ngc"); kind labels error
+// messages (e.g. "ModelScope", "NGC"); noFilesErr is returned verbatim if no
+// items were downloaded (each source phrases this error slightly differently).
+func downloadItemsAsModelPack(layoutDir, tmpPrefix, kind string, items []downloadItem, storeRef, modelRepo string, noFilesErr error) error {
+	prog := newProgressPool(80)
+	var packFiles []modelPackFile
+
+	for _, it := range items {
+		pf, err := downloadToPackFile(prog, layoutDir, tmpPrefix, kind, it.relPath, it.size, it.open)
+		if err != nil {
+			prog.Wait()
+			return err
+		}
+		packFiles = append(packFiles, pf)
+	}
+	prog.Wait()
+
+	if len(packFiles) == 0 {
+		return noFilesErr
+	}
+
+	err := packFilesAsModelPack(layoutDir, storeRef, modelRepo, packFiles, false)
+	for _, f := range packFiles {
+		os.Remove(f.localPath)
+	}
+	return err
+}
+
 // packFilesAsModelPack writes each file as a raw blob and creates a conformant
 // CNCF ModelPack OCI manifest referencing them all.  Reuses the same storage
 // primitives as the HF path so the format is identical. verbose additionally
@@ -265,51 +314,34 @@ func pullModelScope(ctx context.Context, msRef, layoutDir string) error {
 		return fmt.Errorf("ModelScope list decode: %w", err)
 	}
 
-	dlClient := &http.Client{Transport: &http.Transport{
-		ResponseHeaderTimeout: 60 * time.Second,
-	}}
+	dlClient := cloudDownloadClient()
 
-	var packFiles []modelPackFile
-	prog := mpb.New(mpb.WithWidth(80), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
-
+	var items []downloadItem
 	for _, f := range result.Data.Files {
-		if f.Type != "file" {
-			continue
-		}
-		if !shouldDownloadSafetensors(f.Path) {
+		if f.Type != "file" || !shouldDownloadSafetensors(f.Path) {
 			continue
 		}
 		dlURL := fmt.Sprintf("%s/%s/%s/resolve/%s/%s",
 			endpoint, owner, repo, revision, f.Path)
-
-		pf, err := downloadToPackFile(prog, layoutDir, "ms", "ModelScope", f.Path, f.Size, func() (io.ReadCloser, error) {
-			req2, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
-			if token != "" {
-				req2.Header.Set("Authorization", "Token "+token)
-			}
-			r, err := dlClient.Do(req2)
-			if err != nil {
-				return nil, err
-			}
-			return r.Body, nil
+		items = append(items, downloadItem{
+			relPath: f.Path,
+			size:    f.Size,
+			open: func() (io.ReadCloser, error) {
+				req2, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
+				if token != "" {
+					req2.Header.Set("Authorization", "Token "+token)
+				}
+				r, err := dlClient.Do(req2)
+				if err != nil {
+					return nil, err
+				}
+				return r.Body, nil
+			},
 		})
-		if err != nil {
-			prog.Wait()
-			return err
-		}
-		packFiles = append(packFiles, pf)
-	}
-	prog.Wait()
-
-	if len(packFiles) == 0 {
-		return fmt.Errorf("no model files found in ModelScope repo %s/%s", owner, repo)
 	}
 
-	err = packFilesAsModelPack(layoutDir, storeRef, owner+"/"+repo, packFiles, false)
-	for _, f := range packFiles {
-		os.Remove(f.localPath)
-	}
-	return err
+	return downloadItemsAsModelPack(layoutDir, "ms", "ModelScope", items, storeRef, owner+"/"+repo,
+		fmt.Errorf("no model files found in ModelScope repo %s/%s", owner, repo))
 }
 
 // ---------------------------------------------------------------------------
@@ -377,13 +409,9 @@ func pullNGC(ctx context.Context, ngcRef, layoutDir string) error {
 		return fmt.Errorf("NGC list decode: %w", err)
 	}
 
-	dlClient := &http.Client{Transport: &http.Transport{
-		ResponseHeaderTimeout: 60 * time.Second,
-	}}
+	dlClient := cloudDownloadClient()
 
-	var packFiles []modelPackFile
-	prog := mpb.New(mpb.WithWidth(80), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
-
+	var items []downloadItem
 	for _, f := range listing.ModelFiles {
 		if !shouldDownloadSafetensors(f.Name) {
 			continue
@@ -397,33 +425,23 @@ func pullNGC(ctx context.Context, ngcRef, layoutDir string) error {
 			dlURL = fmt.Sprintf("%s/models/%s/%s/%s/versions/%s/files/%s",
 				apiBase, pathSegs[0], pathSegs[1], pathSegs[2], version, f.Name)
 		}
-
-		pf, err := downloadToPackFile(prog, layoutDir, "ngc", "NGC", f.Name, f.Size, func() (io.ReadCloser, error) {
-			req2, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
-			req2.Header.Set("Authorization", "Bearer "+apiKey)
-			r, err := dlClient.Do(req2)
-			if err != nil {
-				return nil, err
-			}
-			return r.Body, nil
+		items = append(items, downloadItem{
+			relPath: f.Name,
+			size:    f.Size,
+			open: func() (io.ReadCloser, error) {
+				req2, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
+				req2.Header.Set("Authorization", "Bearer "+apiKey)
+				r, err := dlClient.Do(req2)
+				if err != nil {
+					return nil, err
+				}
+				return r.Body, nil
+			},
 		})
-		if err != nil {
-			prog.Wait()
-			return err
-		}
-		packFiles = append(packFiles, pf)
-	}
-	prog.Wait()
-
-	if len(packFiles) == 0 {
-		return fmt.Errorf("no model files found in NGC model %s", modelPath)
 	}
 
-	err = packFilesAsModelPack(layoutDir, storeRef, modelPath, packFiles, false)
-	for _, f := range packFiles {
-		os.Remove(f.localPath)
-	}
-	return err
+	return downloadItemsAsModelPack(layoutDir, "ngc", "NGC", items, storeRef, modelPath,
+		fmt.Errorf("no model files found in NGC model %s", modelPath))
 }
 
 // ---------------------------------------------------------------------------
@@ -491,9 +509,7 @@ func pullS3(ctx context.Context, s3Ref, layoutDir string) error {
 		return fmt.Errorf("no objects found at s3://%s/%s", bucket, prefix)
 	}
 
-	prog := mpb.New(mpb.WithWidth(80), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
-	var packFiles []modelPackFile
-
+	var items []downloadItem
 	for _, obj := range objects {
 		relPath := strings.TrimPrefix(obj.key, prefix)
 		relPath = strings.TrimPrefix(relPath, "/")
@@ -502,33 +518,24 @@ func pullS3(ctx context.Context, s3Ref, layoutDir string) error {
 		}
 
 		key := obj.key
-		pf, err := downloadToPackFile(prog, layoutDir, "s3", "S3", relPath, obj.size, func() (io.ReadCloser, error) {
-			result, err := client.GetObject(ctx, &s3.GetObjectInput{
-				Bucket: &bucket,
-				Key:    &key,
-			})
-			if err != nil {
-				return nil, err
-			}
-			return result.Body, nil
+		items = append(items, downloadItem{
+			relPath: relPath,
+			size:    obj.size,
+			open: func() (io.ReadCloser, error) {
+				result, err := client.GetObject(ctx, &s3.GetObjectInput{
+					Bucket: &bucket,
+					Key:    &key,
+				})
+				if err != nil {
+					return nil, err
+				}
+				return result.Body, nil
+			},
 		})
-		if err != nil {
-			prog.Wait()
-			return err
-		}
-		packFiles = append(packFiles, pf)
-	}
-	prog.Wait()
-
-	if len(packFiles) == 0 {
-		return fmt.Errorf("no model files found at s3://%s/%s", bucket, prefix)
 	}
 
-	err = packFilesAsModelPack(layoutDir, storeRef, withoutScheme, packFiles, false)
-	for _, f := range packFiles {
-		os.Remove(f.localPath)
-	}
-	return err
+	return downloadItemsAsModelPack(layoutDir, "s3", "S3", items, storeRef, withoutScheme,
+		fmt.Errorf("no model files found at s3://%s/%s", bucket, prefix))
 }
 
 // ---------------------------------------------------------------------------
@@ -600,12 +607,9 @@ func pullGCS(ctx context.Context, gsRef, layoutDir string) error {
 		return fmt.Errorf("no objects found at gs://%s/%s", bucket, prefix)
 	}
 
-	dlClient := &http.Client{Transport: &http.Transport{
-		ResponseHeaderTimeout: 60 * time.Second,
-	}}
-	prog := mpb.New(mpb.WithWidth(80), mpb.WithOutput(os.Stderr), mpb.WithRefreshRate(180*time.Millisecond))
-	var packFiles []modelPackFile
+	dlClient := cloudDownloadClient()
 
+	var items []downloadItem
 	for _, obj := range objects {
 		relPath := strings.TrimPrefix(obj.Name, prefix)
 		relPath = strings.TrimPrefix(relPath, "/")
@@ -617,34 +621,25 @@ func pullGCS(ctx context.Context, gsRef, layoutDir string) error {
 		encodedName := strings.ReplaceAll(obj.Name, "/", "%2F")
 		dlURL := fmt.Sprintf("%s/b/%s/o/%s?alt=media", apiBase, bucket, encodedName)
 
-		pf, err := downloadToPackFile(prog, layoutDir, "gs", "GCS", relPath, 0, func() (io.ReadCloser, error) {
-			req2, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
-			if token != "" {
-				req2.Header.Set("Authorization", "Bearer "+token)
-			}
-			r, err := dlClient.Do(req2)
-			if err != nil {
-				return nil, err
-			}
-			return r.Body, nil
+		items = append(items, downloadItem{
+			relPath: relPath,
+			size:    0,
+			open: func() (io.ReadCloser, error) {
+				req2, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
+				if token != "" {
+					req2.Header.Set("Authorization", "Bearer "+token)
+				}
+				r, err := dlClient.Do(req2)
+				if err != nil {
+					return nil, err
+				}
+				return r.Body, nil
+			},
 		})
-		if err != nil {
-			prog.Wait()
-			return err
-		}
-		packFiles = append(packFiles, pf)
-	}
-	prog.Wait()
-
-	if len(packFiles) == 0 {
-		return fmt.Errorf("no model files found at gs://%s/%s", bucket, prefix)
 	}
 
-	err2 := packFilesAsModelPack(layoutDir, storeRef, withoutScheme, packFiles, false)
-	for _, f := range packFiles {
-		os.Remove(f.localPath)
-	}
-	return err2
+	return downloadItemsAsModelPack(layoutDir, "gs", "GCS", items, storeRef, withoutScheme,
+		fmt.Errorf("no model files found at gs://%s/%s", bucket, prefix))
 }
 
 // gcsAccessToken returns a GCS Bearer token from the environment.
