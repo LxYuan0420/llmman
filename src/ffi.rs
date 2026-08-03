@@ -100,10 +100,17 @@ pub fn inspect_remote(reference: &str) -> anyhow::Result<String> {
 /// implements this (streamed blob-for-blob where possible, exactly like
 /// skopeo itself does, falling back to a throwaway local staging
 /// directory only for source kinds that transport has no way to stream).
-pub fn transfer(source: &str, destination: &str) -> anyhow::Result<()> {
+///
+/// Returns whether anything was actually pushed: every real weight file
+/// (and the manifest built from it) is content-addressed by digest, so
+/// re-running a transfer for a source that hasn't changed since the last
+/// one pushes nothing at all — this lets `cmd::transfer` report that
+/// accurately instead of unconditionally printing "Transferred ...".
+pub fn transfer(source: &str, destination: &str) -> anyhow::Result<bool> {
     let s = cstr(source)?;
     let d = cstr(destination)?;
-    consume(unsafe { llmman_transfer(s.as_ptr(), d.as_ptr()) }).map(|_| ())
+    let data = consume(unsafe { llmman_transfer(s.as_ptr(), d.as_ptr()) })?;
+    Ok(data == "changed")
 }
 
 /// A byte-level snapshot of whichever pull/push is currently running

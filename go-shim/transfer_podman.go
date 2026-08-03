@@ -30,7 +30,10 @@ import (
 	"go.podman.io/image/v5/transports/alltransports"
 )
 
-func podmanTransfer(ctx context.Context, source, destination string) error {
+// podmanTransfer returns whether anything was actually pushed to
+// destination — see dockerTransfer's doc comment (transfer_docker.go) for
+// why this matters for a re-run against an unchanged source.
+func podmanTransfer(ctx context.Context, source, destination string) (changed bool, err error) {
 	// See transfer_docker.go's dockerTransfer for why a tagless
 	// destination must default to :latest explicitly here.
 	destination = normalizeTag(destination)
@@ -42,30 +45,33 @@ func podmanTransfer(ctx context.Context, source, destination string) error {
 }
 
 // podmanTransferOCI streams directly between two registries via
-// containers/image's copy.Image — no local OCI layout involved.
-func podmanTransferOCI(ctx context.Context, source, destination string) error {
+// containers/image's copy.Image — no local OCI layout involved. Routed
+// through copyImageWithProgress (backend_podman.go), rather than a bare
+// copy.Image call, purely so its ProgressEventDone/Skipped events can
+// report whether anything was actually copied — see that function's doc
+// comment.
+func podmanTransferOCI(ctx context.Context, source, destination string) (changed bool, err error) {
 	srcStr := "docker://" + source
 	srcRef, err := alltransports.ParseImageName(srcStr)
 	if err != nil {
-		return fmt.Errorf("parse src ref %q: %w", srcStr, err)
+		return false, fmt.Errorf("parse src ref %q: %w", srcStr, err)
 	}
 	dstStr := "docker://" + destination
 	dstRef, err := alltransports.ParseImageName(dstStr)
 	if err != nil {
-		return fmt.Errorf("parse dst ref %q: %w", dstStr, err)
+		return false, fmt.Errorf("parse dst ref %q: %w", dstStr, err)
 	}
 
 	pctx, err := insecurePolicy()
 	if err != nil {
-		return fmt.Errorf("policy context: %w", err)
+		return false, fmt.Errorf("policy context: %w", err)
 	}
 	defer pctx.Destroy()
 
-	_, err = copy.Image(ctx, pctx, dstRef, srcRef, &copy.Options{
+	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Transferring", "Transferred", &copy.Options{
 		ReportWriter: os.Stderr,
-	})
-	if err != nil {
-		return fmt.Errorf("copy image: %w", err)
+	}, &changed); err != nil {
+		return false, fmt.Errorf("copy image: %w", err)
 	}
-	return nil
+	return changed, nil
 }

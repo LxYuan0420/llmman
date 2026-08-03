@@ -11,21 +11,32 @@ import (
 	digest "github.com/opencontainers/go-digest"
 )
 
+// transferStatusChanged/transferStatusUnchanged are the `data` values
+// llmman_transfer's response envelope carries back to the Rust CLI layer
+// (see ffi::transfer / cmd::transfer::run) to report whether a transfer
+// actually pushed anything new, or found the destination already up to
+// date with the source and did nothing.
+const (
+	transferStatusChanged   = "changed"
+	transferStatusUnchanged = "unchanged"
+)
+
 // transferViaStaging implements source→destination transfers that can't be
 // done as a direct registry-to-registry blob copy (e.g. HuggingFace or
 // another non-OCI source) by pulling into a temporary local OCI layout and
 // then pushing that layout to the destination registry. Identical for both
 // the docker and podman backends since it only calls the shared
-// pullToLayout/pushToRegistry entry points.
-func transferViaStaging(ctx context.Context, source, destination string) error {
+// pullToLayout/pushToRegistry entry points. Returns whether anything was
+// actually pushed — see pushToRegistry.
+func transferViaStaging(ctx context.Context, source, destination string) (changed bool, err error) {
 	tmp, err := os.MkdirTemp("", "llmman-transfer-")
 	if err != nil {
-		return fmt.Errorf("create staging directory: %w", err)
+		return false, fmt.Errorf("create staging directory: %w", err)
 	}
 	defer os.RemoveAll(tmp)
 
 	if err := pullToLayout(ctx, source, tmp); err != nil {
-		return err
+		return false, err
 	}
 	return pushToRegistry(ctx, tmp, destination)
 }

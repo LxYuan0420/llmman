@@ -46,8 +46,12 @@ pub fn run(args: &TransferArgs) -> anyhow::Result<()> {
     let source = crate::shortnames::resolve(&args.source);
     let destination = crate::shortnames::resolve(&args.destination);
 
-    ffi::transfer(&source, &destination)?;
+    let changed = ffi::transfer(&source, &destination)?;
 
-    println!("Transferred {source} to {destination}");
+    if changed {
+        println!("Transferred {source} to {destination}");
+    } else {
+        println!("{destination} already up to date with {source}");
+    }
     Ok(())
 }

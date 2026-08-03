@@ -238,12 +238,13 @@ func pushBlob(ctx context.Context, pusher remotes.Pusher, provider *ociProvider,
 }
 
 // pushBytes pushes an in-memory blob (a manifest or a small config/metadata
-// file) directly to the registry pusher — no local file involved.
-func pushBytes(ctx context.Context, pusher remotes.Pusher, desc ocispec.Descriptor, data []byte) error {
-	_, err := pushLazy(ctx, pusher, desc, func() (io.Reader, *mpb.Bar, func(), error) {
+// file) directly to the registry pusher — no local file involved. Returns
+// whether the destination already had this exact blob (by digest), so
+// callers can tell whether anything actually changed.
+func pushBytes(ctx context.Context, pusher remotes.Pusher, desc ocispec.Descriptor, data []byte) (alreadyExists bool, err error) {
+	return pushLazy(ctx, pusher, desc, func() (io.Reader, *mpb.Bar, func(), error) {
 		return bytes.NewReader(data), nil, nil, nil
 	})
-	return err
 }
 
 // pushStreamLazy pushes a blob whose digest and size are already known
@@ -316,7 +317,7 @@ func llmman_logout(cServer *C.char) *C.char {
 //export llmman_push
 func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 	progressReset("retrieving manifest")
-	if err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), C.GoString(cRef)); err != nil {
+	if _, err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), C.GoString(cRef)); err != nil {
 		return errResp(err)
 	}
 	return okResp("")
@@ -324,27 +325,31 @@ func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 
 // pushToRegistry is llmman_push's implementation, factored out so
 // llmman_transfer's staging-directory fallback (see transferViaStaging in
-// transfer.go) can reuse it without going through CGO.
-func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
+// transfer.go) can reuse it without going through CGO. Returns whether
+// anything was actually pushed — false if every layer, the config, and
+// the manifest were all already present at the destination by digest
+// (e.g. re-running a transfer/push for content that hasn't changed since
+// the last one).
+func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, err error) {
 	// Locate the manifest in the local index
 	idx, err := readIndex(layoutDir)
 	if err != nil {
-		return fmt.Errorf("read OCI index: %w", err)
+		return false, fmt.Errorf("read OCI index: %w", err)
 	}
 	tag := tagFromRef(ref)
 	manifestDesc, err := findManifestDesc(idx, tag)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// Read manifest
 	manifestData, err := readBlob(layoutDir, manifestDesc.Digest)
 	if err != nil {
-		return fmt.Errorf("read manifest blob: %w", err)
+		return false, fmt.Errorf("read manifest blob: %w", err)
 	}
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
-		return fmt.Errorf("parse manifest: %w", err)
+		return false, fmt.Errorf("parse manifest: %w", err)
 	}
 
 	resolver := newResolver(ctx)
@@ -354,13 +359,14 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 	// transfer_docker.go's dockerTransfer for the same fix applied there.
 	pusher, err := resolver.Pusher(ctx, normalizeTag(ref))
 	if err != nil {
-		return fmt.Errorf("create pusher: %w", err)
+		return false, fmt.Errorf("create pusher: %w", err)
 	}
 	provider := &ociProvider{dir: layoutDir}
 
 	// "Copying blob/config <digest>" progress bars, matching skopeo's own
 	// copy.Image output exactly (see copy/progress_bars.go upstream).
 	prog := newProgressPool(40)
+	changed = false
 	pushWithBar := func(desc ocispec.Descriptor, kind string) error {
 		short := shortDigest(desc.Digest)
 		newBar := func() *mpb.Bar {
@@ -372,6 +378,8 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 		}
 		if alreadyExists {
 			fmt.Fprintf(os.Stderr, "Copied  %s %s (already present)\n", kind, short)
+		} else {
+			changed = true
 		}
 		return nil
 	}
@@ -381,24 +389,30 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 	for _, layer := range manifest.Layers {
 		if err := pushWithBar(layer, "blob"); err != nil {
 			prog.Wait()
-			return fmt.Errorf("push layer %s: %w", layer.Digest, err)
+			return false, fmt.Errorf("push layer %s: %w", layer.Digest, err)
 		}
 	}
 	// Push config
 	if err := pushWithBar(manifest.Config, "config"); err != nil {
 		prog.Wait()
-		return fmt.Errorf("push config: %w", err)
+		return false, fmt.Errorf("push config: %w", err)
 	}
 	prog.Wait()
 
 	// Push manifest — no progress bar (a few hundred bytes of JSON),
 	// mirroring skopeo's own plain "Writing manifest to image
 	// destination" message instead of a bar for this step.
-	if _, err := pushBlob(ctx, pusher, provider, manifestDesc, nil); err != nil {
-		return fmt.Errorf("push manifest: %w", err)
+	manifestAlreadyExists, err := pushBlob(ctx, pusher, provider, manifestDesc, nil)
+	if err != nil {
+		return false, fmt.Errorf("push manifest: %w", err)
 	}
-	fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
-	return nil
+	if !manifestAlreadyExists {
+		changed = true
+	}
+	if changed {
+		fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
+	}
+	return changed, nil
 }
 
 // llmman_pull pulls an image from a registry into a local OCI layout directory.
@@ -590,8 +604,16 @@ func llmman_inspect(cRef *C.char) *C.char {
 //
 //export llmman_transfer
 func llmman_transfer(cSource, cDestination *C.char) *C.char {
-	if err := dockerTransfer(context.Background(), C.GoString(cSource), C.GoString(cDestination)); err != nil {
+	changed, err := dockerTransfer(context.Background(), C.GoString(cSource), C.GoString(cDestination))
+	if err != nil {
 		return errResp(err)
 	}
-	return okResp("")
+	// data carries whether anything was actually pushed, so the Rust CLI
+	// layer (cmd::transfer) can report "already up to date" instead of
+	// "Transferred" when re-running a transfer for content that hasn't
+	// changed since the last one — see transferStatusChanged/Unchanged.
+	if changed {
+		return okResp(transferStatusChanged)
+	}
+	return okResp(transferStatusUnchanged)
 }

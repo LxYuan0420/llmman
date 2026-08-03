@@ -80,7 +80,7 @@ func llmman_logout(cServer *C.char) *C.char {
 //export llmman_push
 func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 	progressReset("retrieving manifest")
-	if err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), C.GoString(cRef)); err != nil {
+	if _, err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), C.GoString(cRef)); err != nil {
 		return errResp(err)
 	}
 	return okResp("")
@@ -89,14 +89,14 @@ func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 // pushToRegistry is llmman_push's implementation, factored out so
 // llmman_transfer's staging-directory fallback (see transfer_podman.go)
 // can reuse it without going through CGO.
-func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
+func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, err error) {
 	tag := tagFromRef(ref)
 
 	// Source: OCI layout directory
 	srcStr := fmt.Sprintf("oci:%s:%s", layoutDir, tag)
 	srcRef, err := alltransports.ParseImageName(srcStr)
 	if err != nil {
-		return fmt.Errorf("parse src ref %q: %w", srcStr, err)
+		return false, fmt.Errorf("parse src ref %q: %w", srcStr, err)
 	}
 
 	// Destination: Docker registry. containers/image's docker transport
@@ -108,20 +108,20 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) error {
 	dstStr := "docker://" + normalizeTag(ref)
 	dstRef, err := alltransports.ParseImageName(dstStr)
 	if err != nil {
-		return fmt.Errorf("parse dst ref %q: %w", dstStr, err)
+		return false, fmt.Errorf("parse dst ref %q: %w", dstStr, err)
 	}
 
 	pctx, err := insecurePolicy()
 	if err != nil {
-		return fmt.Errorf("policy context: %w", err)
+		return false, fmt.Errorf("policy context: %w", err)
 	}
 	defer pctx.Destroy()
 
 	progressSetStatus("pushing")
-	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pushing", "Pushed", &copy.Options{}); err != nil {
-		return fmt.Errorf("copy image: %w", err)
+	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pushing", "Pushed", &copy.Options{}, &changed); err != nil {
+		return false, fmt.Errorf("copy image: %w", err)
 	}
-	return nil
+	return changed, nil
 }
 
 // llmman_pull pulls an image from a registry into a local OCI layout directory.
@@ -182,7 +182,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	progressSetStatus("pulling")
 	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pulling", "Pulled", &copy.Options{
 		MaxParallelDownloads: 6,
-	}); err != nil {
+	}, nil); err != nil {
 		return fmt.Errorf("copy image: %w", err)
 	}
 	return nil
@@ -196,7 +196,14 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 // cmd::serve poll them out of the daemon process — two consumers of the
 // same underlying containers/image progress channel. present/pastTense
 // label each artifact's bar (e.g. "Pulling"/"Pulled", "Pushing"/"Pushed").
-func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options) error {
+//
+// If changed is non-nil, it's set to true whenever at least one artifact
+// actually completes a copy (types.ProgressEventDone) rather than turning
+// out to already exist at the destination (types.ProgressEventSkipped,
+// which never leads to a Done for that same artifact) — letting a caller
+// like pushToRegistry/podmanTransferOCI tell whether anything was really
+// pushed, e.g. to report "already up to date" for a no-op re-transfer.
+func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool) error {
 	prog := mpb.New(mpb.WithOutput(os.Stderr))
 	ch := make(chan types.ProgressProperties)
 	bars := make(map[string]*mpb.Bar)
@@ -237,6 +244,9 @@ func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, d
 					bar.IncrInt64(int64(p.OffsetUpdate))
 				}
 			case types.ProgressEventDone:
+				if changed != nil {
+					*changed = true
+				}
 				if bar, ok := bars[key]; ok {
 					// SetTotal with triggerComplete forces current=total regardless of
 					// timing, then fires done() — the OnComplete decorators take over.
@@ -310,10 +320,15 @@ func llmman_inspect(cRef *C.char) *C.char {
 //
 //export llmman_transfer
 func llmman_transfer(cSource, cDestination *C.char) *C.char {
-	if err := podmanTransfer(context.Background(), C.GoString(cSource), C.GoString(cDestination)); err != nil {
+	changed, err := podmanTransfer(context.Background(), C.GoString(cSource), C.GoString(cDestination))
+	if err != nil {
 		return errResp(err)
 	}
-	return okResp("")
+	// See backend_docker.go's llmman_transfer for why data carries this.
+	if changed {
+		return okResp(transferStatusChanged)
+	}
+	return okResp(transferStatusUnchanged)
 }
 
 // Ensure io is used (imported via shared helpers but referenced here for the build)

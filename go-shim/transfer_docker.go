@@ -52,7 +52,11 @@ import (
 // Entry point
 // ---------------------------------------------------------------------------
 
-func dockerTransfer(ctx context.Context, source, destination string) error {
+// dockerTransfer returns whether anything was actually pushed to
+// destination — false if the source turned out to already be identical
+// (by digest) to what's already there, e.g. re-running a transfer for a
+// model that hasn't been updated at its source since the last transfer.
+func dockerTransfer(ctx context.Context, source, destination string) (changed bool, err error) {
 	// A tagless destination (e.g. "docker.io/owner/repo") must default to
 	// :latest here explicitly: unlike a local OCI layout's index.json
 	// (which always has some ref-name annotation to look up),
@@ -76,36 +80,37 @@ func dockerTransfer(ctx context.Context, source, destination string) error {
 // OCI registry → OCI registry
 // ---------------------------------------------------------------------------
 
-func dockerTransferOCI(ctx context.Context, source, destination string) error {
+func dockerTransferOCI(ctx context.Context, source, destination string) (changed bool, err error) {
 	resolver := newResolver(ctx)
 	name, manifestDesc, err := resolver.Resolve(ctx, source)
 	if err != nil {
-		return fmt.Errorf("resolve %s: %w", source, err)
+		return false, fmt.Errorf("resolve %s: %w", source, err)
 	}
 	fetcher, err := resolver.Fetcher(ctx, name)
 	if err != nil {
-		return fmt.Errorf("create fetcher: %w", err)
+		return false, fmt.Errorf("create fetcher: %w", err)
 	}
 	pusher, err := resolver.Pusher(ctx, destination)
 	if err != nil {
-		return fmt.Errorf("create pusher: %w", err)
+		return false, fmt.Errorf("create pusher: %w", err)
 	}
 
 	rc, err := fetcher.Fetch(ctx, manifestDesc)
 	if err != nil {
-		return fmt.Errorf("fetch manifest: %w", err)
+		return false, fmt.Errorf("fetch manifest: %w", err)
 	}
 	manifestData, err := io.ReadAll(rc)
 	rc.Close()
 	if err != nil {
-		return fmt.Errorf("read manifest: %w", err)
+		return false, fmt.Errorf("read manifest: %w", err)
 	}
 
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		// An image index (manifest list): push it as-is. Per-instance
 		// selection (skopeo's --multi-arch) isn't implemented here.
-		return pushBytes(ctx, pusher, manifestDesc, manifestData)
+		alreadyExists, err := pushBytes(ctx, pusher, manifestDesc, manifestData)
+		return !alreadyExists, err
 	}
 
 	// "Transferring blob/config <digest>" progress bars — "Transferring",
@@ -123,6 +128,7 @@ func dockerTransferOCI(ctx context.Context, source, destination string) error {
 	// streamBlobFromFetcher — and a bar that's already partway through
 	// can't be rewound back to zero for a retry; a fresh pool per attempt
 	// sidesteps that instead of fighting it.
+	changed = false
 	streamOne := func(desc ocispec.Descriptor, kind string) error {
 		short := shortDigest(desc.Digest)
 		var alreadyExists bool
@@ -144,27 +150,35 @@ func dockerTransferOCI(ctx context.Context, source, destination string) error {
 		}
 		if alreadyExists {
 			fmt.Fprintf(os.Stderr, "Transferred %s %s (already present)\n", kind, short)
+		} else {
+			changed = true
 		}
 		return nil
 	}
 
 	for _, layer := range manifest.Layers {
 		if err := streamOne(layer, "blob"); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if err := streamOne(manifest.Config, "config"); err != nil {
-		return err
+		return false, err
 	}
 
 	// Manifest push: no progress bar (a few hundred bytes of JSON),
 	// mirroring skopeo's own plain "Writing manifest to image
 	// destination" message instead of a bar for this step.
-	if err := pushBytes(ctx, pusher, manifestDesc, manifestData); err != nil {
-		return err
+	manifestAlreadyExists, err := pushBytes(ctx, pusher, manifestDesc, manifestData)
+	if err != nil {
+		return false, err
 	}
-	fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
-	return nil
+	if !manifestAlreadyExists {
+		changed = true
+	}
+	if changed {
+		fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
+	}
+	return changed, nil
 }
 
 // streamBlobFromFetcher streams one blob from an OCI registry fetcher
@@ -189,10 +203,15 @@ func streamBlobFromFetcher(ctx context.Context, fetcher remotes.Fetcher, pusher 
 // HuggingFace → OCI registry
 // ---------------------------------------------------------------------------
 
-func dockerTransferHF(ctx context.Context, ref, destination string) error {
+// dockerTransferHF returns whether anything was actually pushed — false
+// if the chosen HuggingFace file(s) and the CNCF manifest built from them
+// all turned out to already be present at destination by digest (i.e.
+// the repo's commit for this file hasn't changed since the last transfer
+// to this destination).
+func dockerTransferHF(ctx context.Context, ref, destination string) (changed bool, err error) {
 	host, owner, repo, tag, err := parseHFRef(ref)
 	if err != nil {
-		return err
+		return false, err
 	}
 	endpoint := hfEndpoint(host)
 	token := hfToken()
@@ -202,57 +221,65 @@ func dockerTransferHF(ctx context.Context, ref, destination string) error {
 
 	commit, err := hfFetchCommit(ctx, apiClient, endpoint, owner, repo, token)
 	if err != nil {
-		return err
+		return false, err
 	}
 	files, err := hfFetchFiles(ctx, apiClient, endpoint, owner, repo, commit, token)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	resolver := newResolver(ctx)
 	pusher, err := resolver.Pusher(ctx, destination)
 	if err != nil {
-		return fmt.Errorf("create pusher: %w", err)
+		return false, fmt.Errorf("create pusher: %w", err)
 	}
 
 	// Try GGUF first; fall back to safetensors if the repo has none — same
 	// selection logic pullHF uses.
 	if chosen, err := selectGGUF(files, tag); err == nil {
-		desc, err := streamHFFileToRegistry(
+		desc, blobChanged, err := streamHFFileToRegistry(
 			ctx, dlClient, pusher, endpoint, owner, repo, commit, token,
 			chosen, "application/vnd.cncf.model.weight.v1.raw",
 		)
 		if err != nil {
-			return err
+			return false, err
 		}
-		if err := pushCNCFSingleManifest(ctx, pusher, "gguf", owner+"/"+repo, chosen.Path, desc); err != nil {
-			return err
+		changed = blobChanged
+		if err := pushCNCFSingleManifest(ctx, pusher, "gguf", owner+"/"+repo, chosen.Path, desc, &changed); err != nil {
+			return false, err
 		}
-		fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
-		return nil
+		if changed {
+			fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
+		}
+		return changed, nil
 	}
 
 	toSend := selectDownloadableHFFiles(files)
 	if len(toSend) == 0 {
-		return fmt.Errorf("no model files found in repository %s/%s", owner, repo)
+		return false, fmt.Errorf("no model files found in repository %s/%s", owner, repo)
 	}
 	var layers []ocispec.Descriptor
 	for _, f := range toSend {
-		desc, err := streamHFFileToRegistry(
+		desc, blobChanged, err := streamHFFileToRegistry(
 			ctx, dlClient, pusher, endpoint, owner, repo, commit, token,
 			f, safetensorsMediaType(f.Path),
 		)
 		if err != nil {
-			return fmt.Errorf("transfer %s: %w", f.Path, err)
+			return false, fmt.Errorf("transfer %s: %w", f.Path, err)
+		}
+		if blobChanged {
+			changed = true
 		}
 		desc.Annotations = map[string]string{"org.cncf.model.filepath": f.Path}
 		layers = append(layers, desc)
 	}
-	if err := pushCNCFMultiManifest(ctx, pusher, owner+"/"+repo, layers); err != nil {
-		return err
+	if err := pushCNCFMultiManifest(ctx, pusher, owner+"/"+repo, layers, &changed); err != nil {
+		return false, err
 	}
-	fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
-	return nil
+	if changed {
+		fmt.Fprintln(os.Stderr, "Writing manifest to image destination")
+	}
+	return changed, nil
 }
 
 // streamHFFileToRegistry copies one HuggingFace file directly into the
@@ -271,7 +298,7 @@ func streamHFFileToRegistry(
 	endpoint, owner, repo, commit, token string,
 	file hfFile,
 	mediaType string,
-) (ocispec.Descriptor, error) {
+) (ocispec.Descriptor, bool, error) {
 	url := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + file.Path
 	// org.cncf.model.filepath on the *layer* descriptor itself (not just
 	// the manifest) is what cmd::serve's layer_filepath/is_gguf_layer
@@ -324,12 +351,12 @@ func streamHFFileToRegistry(
 			return nil
 		})
 		if err != nil {
-			return ocispec.Descriptor{}, fmt.Errorf("stream %s: %w", file.Path, err)
+			return ocispec.Descriptor{}, false, fmt.Errorf("stream %s: %w", file.Path, err)
 		}
 		if alreadyExists {
 			fmt.Fprintf(os.Stderr, "Transferred  blob %s (already present)\n", short)
 		}
-		return desc, nil
+		return desc, !alreadyExists, nil
 	}
 
 	// Fallback: buffer a small, non-LFS file in memory. Its digest isn't
@@ -355,7 +382,7 @@ func streamHFFileToRegistry(
 		return nil
 	})
 	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("download %s: %w", file.Path, err)
+		return ocispec.Descriptor{}, false, fmt.Errorf("download %s: %w", file.Path, err)
 	}
 	desc := ocispec.Descriptor{
 		MediaType:   mediaType,
@@ -363,10 +390,11 @@ func streamHFFileToRegistry(
 		Size:        int64(len(data)),
 		Annotations: annotations,
 	}
-	if err := pushBytes(ctx, pusher, desc, data); err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("push %s: %w", file.Path, err)
+	alreadyExists, err := pushBytes(ctx, pusher, desc, data)
+	if err != nil {
+		return ocispec.Descriptor{}, false, fmt.Errorf("push %s: %w", file.Path, err)
 	}
-	return desc, nil
+	return desc, !alreadyExists, nil
 }
 
 // streamHFGet pushes desc, only opening the GET against HuggingFace at all
@@ -433,28 +461,42 @@ func hfGetBytes(ctx context.Context, client *http.Client, url, token string, bar
 // which do the local-layout equivalent for `llmman pull`).
 // ---------------------------------------------------------------------------
 
-func pushCNCFSingleManifest(ctx context.Context, pusher remotes.Pusher, format, modelRepo, filename string, weightDesc ocispec.Descriptor) error {
-	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher), format, modelRepo, filepath.Base(filename), []ocispec.Descriptor{weightDesc})
+// pushCNCFSingleManifest builds and pushes the CNCF manifest/config for a
+// single-weight-file (GGUF) model. If changed is non-nil, it's set to true
+// whenever the config or manifest blob wasn't already present at the
+// destination — see pusherBlobSink.
+func pushCNCFSingleManifest(ctx context.Context, pusher remotes.Pusher, format, modelRepo, filename string, weightDesc ocispec.Descriptor, changed *bool) error {
+	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher, changed), format, modelRepo, filepath.Base(filename), []ocispec.Descriptor{weightDesc})
 	return err
 }
 
-func pushCNCFMultiManifest(ctx context.Context, pusher remotes.Pusher, modelRepo string, layers []ocispec.Descriptor) error {
-	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher), "safetensors", modelRepo, "", layers)
+// pushCNCFMultiManifest is pushCNCFSingleManifest's multi-layer
+// (safetensors) equivalent.
+func pushCNCFMultiManifest(ctx context.Context, pusher remotes.Pusher, modelRepo string, layers []ocispec.Descriptor, changed *bool) error {
+	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher, changed), "safetensors", modelRepo, "", layers)
 	return err
 }
 
 // pusherBlobSink is the cncfBlobSink for pushing blobs directly to a
 // registry pusher (see buildCNCFManifest in hf.go), mirroring
-// layoutBlobSink's local-OCI-layout equivalent.
-func pusherBlobSink(ctx context.Context, pusher remotes.Pusher) cncfBlobSink {
+// layoutBlobSink's local-OCI-layout equivalent. If changed is non-nil,
+// it's set to true whenever a blob this sink stores (the CNCF config or
+// manifest JSON) wasn't already present at the destination by digest —
+// letting callers tell whether a transfer actually pushed anything new,
+// even when every weight-file layer turned out to already be present too.
+func pusherBlobSink(ctx context.Context, pusher remotes.Pusher, changed *bool) cncfBlobSink {
 	return func(mediaType string, data []byte) (ocispec.Descriptor, error) {
 		desc := ocispec.Descriptor{
 			MediaType: mediaType,
 			Digest:    digest.FromBytes(data),
 			Size:      int64(len(data)),
 		}
-		if err := pushBytes(ctx, pusher, desc, data); err != nil {
+		alreadyExists, err := pushBytes(ctx, pusher, desc, data)
+		if err != nil {
 			return ocispec.Descriptor{}, err
+		}
+		if !alreadyExists && changed != nil {
+			*changed = true
 		}
 		return desc, nil
 	}
