@@ -241,7 +241,11 @@ func packFilesAsModelPack(layoutDir, ref, modelRepo string, files []modelPackFil
 		}
 	}
 
-	return storeSafetensorsAsOCI(layoutDir, ref, modelRepo, layers)
+	// No HuggingFace-style model card to read a license from for these
+	// generic file-based sources (ms://, ngc://, s3://, gs://, a local
+	// path) — same "safetensors" format label buildCNCFManifest always
+	// used here before modelMeta existed.
+	return storeSafetensorsAsOCI(layoutDir, ref, modelRepo, modelMeta{Format: "safetensors"}, layers)
 }
 
 // ---------------------------------------------------------------------------

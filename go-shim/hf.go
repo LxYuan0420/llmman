@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	modelspec "github.com/modelpack/model-spec/specs-go/v1"
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -301,19 +302,95 @@ func hfGet(ctx context.Context, client *http.Client, url, token string, dst any)
 	return json.NewDecoder(resp.Body).Decode(dst)
 }
 
-// hfFetchCommit returns the current commit SHA for owner/repo.
-func hfFetchCommit(ctx context.Context, client *http.Client, endpoint, owner, repo, token string) (string, error) {
-	var info struct {
-		SHA string `json:"sha"`
-	}
+// hfModelInfo is the subset of HuggingFace's GET /api/models/{owner}/{repo}
+// response this package needs: the current commit SHA (for pinning
+// resolve URLs to an exact revision, same as before) plus enough of the
+// model card to populate the CNCF config's descriptor.licenses — see
+// license() below. cardData.license is present on essentially every real
+// model repo (it's what renders as the license badge on the repo's own
+// HuggingFace page); the "license:<slug>" tag is checked as a fallback
+// for the rare repo that has tags but no full cardData block.
+type hfModelInfo struct {
+	SHA      string   `json:"sha"`
+	Tags     []string `json:"tags"`
+	CardData struct {
+		License string `json:"license"`
+	} `json:"cardData"`
+}
+
+// hfFetchModelInfo fetches hfModelInfo for owner/repo.
+func hfFetchModelInfo(ctx context.Context, client *http.Client, endpoint, owner, repo, token string) (hfModelInfo, error) {
+	var info hfModelInfo
 	url := endpoint + "api/models/" + owner + "/" + repo
 	if err := hfGet(ctx, client, url, token, &info); err != nil {
-		return "", fmt.Errorf("HF model info: %w", err)
+		return hfModelInfo{}, fmt.Errorf("HF model info: %w", err)
 	}
+	return info, nil
+}
+
+// commit returns the commit SHA to pin resolve URLs to, falling back to
+// "main" if HuggingFace didn't report one.
+func (info hfModelInfo) commit() string {
 	if info.SHA == "" {
-		return "main", nil // graceful fallback
+		return "main"
 	}
-	return info.SHA, nil
+	return info.SHA
+}
+
+// license returns the model's license as a best-effort SPDX license
+// expression (see normalizeSPDXLicense), and false if the repo doesn't
+// declare one usable at all (no cardData.license/license: tag, or a
+// value like "other"/"unknown" that isn't a real license identifier).
+func (info hfModelInfo) license() (string, bool) {
+	if info.CardData.License != "" {
+		if id := normalizeSPDXLicense(info.CardData.License); id != "" {
+			return id, true
+		}
+	}
+	for _, t := range info.Tags {
+		if slug, ok := strings.CutPrefix(t, "license:"); ok && slug != "" {
+			if id := normalizeSPDXLicense(slug); id != "" {
+				return id, true
+			}
+		}
+	}
+	return "", false
+}
+
+// spdxLicenseIDs maps a HuggingFace license slug (cardData.license or a
+// "license:<slug>" tag — always lowercase and hyphenated) to its proper
+// SPDX license expression, for the licenses these model pipelines
+// actually use in practice. "other" and "unknown" are HuggingFace's own
+// catch-all slugs for "not a real license identifier" and deliberately
+// map to "" so license() reports them as not usable rather than
+// fabricating a bogus SPDX expression. Anything else not in this table
+// falls through unchanged — not guaranteed to be a valid SPDX identifier,
+// but a closer guess than omitting it entirely, and HuggingFace's own
+// slugs are already SPDX identifiers lowercased for most of the common
+// ones this table doesn't need to list.
+var spdxLicenseIDs = map[string]string{
+	"apache-2.0":   "Apache-2.0",
+	"mit":          "MIT",
+	"bsd-2-clause": "BSD-2-Clause",
+	"bsd-3-clause": "BSD-3-Clause",
+	"gpl-2.0":      "GPL-2.0-only",
+	"gpl-3.0":      "GPL-3.0-only",
+	"lgpl-2.1":     "LGPL-2.1-only",
+	"lgpl-3.0":     "LGPL-3.0-only",
+	"mpl-2.0":      "MPL-2.0",
+	"cc-by-4.0":    "CC-BY-4.0",
+	"cc-by-sa-4.0": "CC-BY-SA-4.0",
+	"cc0-1.0":      "CC0-1.0",
+	"other":        "",
+	"unknown":      "",
+}
+
+func normalizeSPDXLicense(slug string) string {
+	slug = strings.ToLower(strings.TrimSpace(slug))
+	if id, ok := spdxLicenseIDs[slug]; ok {
+		return id
+	}
+	return slug
 }
 
 // hfFetchFiles returns the recursive file listing for owner/repo at commit.
@@ -445,6 +522,78 @@ func ggufList(files []hfFile) string {
 }
 
 // ---------------------------------------------------------------------------
+// Multimodal projector (mmproj) and LICENSE selection
+//
+// A GGUF repo's mmproj-*.gguf and LICENSE files are both real files sitting
+// right there in the same file listing selectGGUF already has — isModelGGUF
+// deliberately excludes mmproj from GGUF weight selection (see its own doc
+// comment), and license files were never even file-listing-filtered for at
+// all, they just weren't looked for. Both are optional: most repos have
+// neither, some vision models have an mmproj, most repos have a LICENSE.
+// ---------------------------------------------------------------------------
+
+// mmprojPreference orders which multimodal-projector precision to pick when
+// a repo ships several (BF16/F16/F32 side by side, as unsloth's vision
+// model GGUF repos generally do) — F16 first, matching what every
+// model-publisher JSON config observed in practice consistently points at
+// for the same repos.
+var mmprojPreference = []string{"F16", "BF16", "F32"}
+
+// selectMMProj returns the repo's multimodal projector file, if it has
+// one, for pairing alongside the chosen GGUF weight(s) as an additional
+// weight-typed layer (see dockerTransferHF/pullHF) — a model-spec
+// manifest has no dedicated media type for this (it's a llama.cpp/GGUF-
+// specific concept the spec predates), so it's just another weight layer
+// distinguished by its own org.cncf.model.filepath annotation, the same
+// way every other layer is.
+func selectMMProj(files []hfFile) (hfFile, bool) {
+	var candidates []hfFile
+	for _, f := range files {
+		if f.Type != "file" {
+			continue
+		}
+		lower := strings.ToLower(f.Path)
+		if strings.Contains(lower, "mmproj") && strings.HasSuffix(lower, ".gguf") {
+			candidates = append(candidates, f)
+		}
+	}
+	for _, pref := range mmprojPreference {
+		for _, f := range candidates {
+			// Match pref as a whole "-<pref>." component, not merely a
+			// substring: "-F16." must not match "mmproj-BF16.gguf" just
+			// because "BF16" itself contains the substring "F16".
+			base := strings.ToUpper(filepath.Base(f.Path))
+			if base == pref+".GGUF" || strings.HasSuffix(base, "-"+pref+".GGUF") {
+				return f, true
+			}
+		}
+	}
+	if len(candidates) > 0 {
+		return candidates[0], true
+	}
+	return hfFile{}, false
+}
+
+// licenseFilenames are the conventional base names a HuggingFace repo's
+// plain-text/markdown license file uses, checked in this order.
+var licenseFilenames = []string{"LICENSE", "LICENSE.txt", "LICENSE.md"}
+
+// selectLicenseFile returns the repo's root-level LICENSE file, if it has
+// one, for attaching as an application/vnd.cncf.model.doc.v1.raw layer —
+// spec.md explicitly names LICENSE as a doc-type file example alongside
+// README.md.
+func selectLicenseFile(files []hfFile) (hfFile, bool) {
+	for _, want := range licenseFilenames {
+		for _, f := range files {
+			if f.Type == "file" && strings.EqualFold(f.Path, want) {
+				return f, true
+			}
+		}
+	}
+	return hfFile{}, false
+}
+
+// ---------------------------------------------------------------------------
 // parseHFRef
 // ---------------------------------------------------------------------------
 
@@ -496,7 +645,7 @@ func cachedLayerName(layoutDir, ref string) string {
 		// All blobs present — return a filename from the first layer annotation.
 		if len(manifest.Layers) > 0 {
 			ann := manifest.Layers[0].Annotations
-			for _, key := range []string{"org.cncf.model.filepath", ocispec.AnnotationTitle} {
+			for _, key := range []string{modelspec.AnnotationFilepath, ocispec.AnnotationTitle} {
 				if name := ann[key]; name != "" {
 					return filepath.Base(name)
 				}
@@ -545,9 +694,14 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 	apiClient := hfAPIClient()
 	dlClient := hfDownloadClient()
 
-	commit, err := hfFetchCommit(ctx, apiClient, endpoint, owner, repo, token)
+	info, err := hfFetchModelInfo(ctx, apiClient, endpoint, owner, repo, token)
 	if err != nil {
 		return err
+	}
+	commit := info.commit()
+	meta := modelMeta{}
+	if license, ok := info.license(); ok {
+		meta.Licenses = []string{license}
 	}
 
 	files, err := hfFetchFiles(ctx, apiClient, endpoint, owner, repo, commit, token)
@@ -558,6 +712,11 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 
 	// Try GGUF first; fall back to safetensors if the repo has none.
 	if shards, err := selectGGUF(files, tag); err == nil {
+		meta.Format = "gguf"
+		filepathAnnotation := ""
+		if len(shards) == 1 {
+			filepathAnnotation = filepath.Base(shards[0].Path)
+		}
 		var layers []ocispec.Descriptor
 		for _, f := range shards {
 			downloadURL := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + f.Path
@@ -567,22 +726,46 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 			}
 			layers = append(layers, desc)
 		}
-		return storeGGUFAsOCI(layoutDir, ref, owner+"/"+repo, layers)
+		// mmproj: an optional extra weight layer alongside the chosen
+		// GGUF shard(s) — see selectMMProj's own doc comment for why
+		// this has no dedicated media type of its own.
+		if mmproj, ok := selectMMProj(files); ok {
+			downloadURL := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + mmproj.Path
+			desc, err := downloadHFBlob(ctx, dlClient, downloadURL, token, layoutDir, owner, repo, commit, mmproj)
+			if err != nil {
+				return fmt.Errorf("download %s: %w", mmproj.Path, err)
+			}
+			layers = append(layers, desc)
+			meta.Vision = true
+		}
+		// LICENSE: a doc-type layer per spec.md's own example of what
+		// application/vnd.cncf.model.doc.v1.raw is for.
+		if lic, ok := selectLicenseFile(files); ok {
+			downloadURL := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + lic.Path
+			desc, err := downloadHFBlob(ctx, dlClient, downloadURL, token, layoutDir, owner, repo, commit, lic)
+			if err != nil {
+				return fmt.Errorf("download %s: %w", lic.Path, err)
+			}
+			desc.MediaType = modelspec.MediaTypeModelDocRaw
+			layers = append(layers, desc)
+		}
+		return storeGGUFAsOCI(layoutDir, ref, owner+"/"+repo, meta, filepathAnnotation, layers)
 	}
 
 	// No GGUF found — pull safetensors files as a CNCF model-spec image.
-	return pullHFSafetensors(ctx, dlClient, ref, layoutDir, endpoint, owner, repo, commit, token, files)
+	meta.Format = "safetensors"
+	return pullHFSafetensors(ctx, dlClient, ref, layoutDir, endpoint, owner, repo, commit, token, files, meta)
 }
 
 // safetensorsMediaType maps a file extension to the appropriate CNCF layer media type.
 func safetensorsMediaType(path string) string {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".safetensors", ".bin", ".pt", ".pth":
-		return "application/vnd.cncf.model.weight.v1.raw"
+		return modelspec.MediaTypeModelWeightRaw
 	case ".json", ".model", ".txt", ".tiktoken":
-		return "application/vnd.cncf.model.weight.config.v1.raw"
+		return modelspec.MediaTypeModelWeightConfigRaw
 	default:
-		return "application/vnd.cncf.model.doc.v1.raw"
+		return modelspec.MediaTypeModelDocRaw
 	}
 }
 
@@ -626,6 +809,7 @@ func pullHFSafetensors(
 	client *http.Client,
 	ref, layoutDir, endpoint, owner, repo, commit, token string,
 	files []hfFile,
+	meta modelMeta,
 ) error {
 	toDownload := selectDownloadableHFFiles(files)
 	if len(toDownload) == 0 {
@@ -642,16 +826,16 @@ func pullHFSafetensors(
 		// Override media type and use the full relative path as the filepath annotation.
 		desc.MediaType = safetensorsMediaType(f.Path)
 		desc.Annotations = map[string]string{
-			"org.cncf.model.filepath": f.Path,
+			modelspec.AnnotationFilepath: f.Path,
 		}
 		layers = append(layers, desc)
 	}
 
-	return storeSafetensorsAsOCI(layoutDir, ref, owner+"/"+repo, layers)
+	return storeSafetensorsAsOCI(layoutDir, ref, owner+"/"+repo, meta, layers)
 }
 
-func storeSafetensorsAsOCI(layoutDir, ref, modelRepo string, layers []ocispec.Descriptor) error {
-	manifestDesc, err := buildCNCFManifest(layoutBlobSink(layoutDir), "safetensors", modelRepo, "", layers)
+func storeSafetensorsAsOCI(layoutDir, ref, modelRepo string, meta modelMeta, layers []ocispec.Descriptor) error {
+	manifestDesc, err := buildCNCFManifest(layoutBlobSink(layoutDir), meta, modelRepo, "", layers)
 	if err != nil {
 		return err
 	}
@@ -818,11 +1002,11 @@ func downloadAttempt(ctx context.Context, client *http.Client, url, token, layou
 		// spec-compliant.  llmman's serve layer detection falls back to checking
 		// the org.cncf.model.filepath annotation for ".gguf", so old manifests
 		// (application/vnd.docker.ai.gguf.v3) still work via the other check.
-		MediaType: "application/vnd.cncf.model.weight.v1.raw",
+		MediaType: modelspec.MediaTypeModelWeightRaw,
 		Digest:    dgst,
 		Size:      total,
 		Annotations: map[string]string{
-			"org.cncf.model.filepath": filepath.Base(file.Path),
+			modelspec.AnnotationFilepath: filepath.Base(file.Path),
 		},
 	}, nil
 }
@@ -831,33 +1015,43 @@ func downloadAttempt(ctx context.Context, client *http.Client, url, token, layou
 // storeGGUFAsOCI — wrap the GGUF blob(s) in a CNCF model-spec OCI manifest
 // ---------------------------------------------------------------------------
 
-// cncfModelConfig is the required structure for application/vnd.cncf.model.config.v1+json.
-type cncfModelConfig struct {
-	Descriptor struct{} `json:"descriptor"`
-	Config     struct {
-		Format string `json:"format,omitempty"`
-	} `json:"config"`
-	ModelFS struct {
-		Type    string   `json:"type"`
-		DiffIDs []string `json:"diffIds"`
-	} `json:"modelfs"`
+// modelMeta bundles the optional-but-valuable CNCF model-spec metadata
+// buildCNCFManifest has enough information to populate beyond the bare
+// config.format+modelfs every manifest already needs — see
+// https://github.com/modelpack/model-spec/blob/main/docs/config.md. Both
+// fields are entirely optional per the spec's own schema and are simply
+// omitted when unknown/inapplicable (Model marshals empty sub-fields as
+// omitted JSON via their own `,omitempty` tags).
+type modelMeta struct {
+	// Format is config.format — "gguf" or "safetensors" here.
+	Format string
+
+	// Licenses populates descriptor.licenses as SPDX license
+	// expressions — see hfModelInfo.license(). Nil if the source repo
+	// didn't declare a usable one.
+	Licenses []string
+
+	// Vision marks the model as accepting image input in addition to
+	// text (config.capabilities.inputTypes/outputTypes) — set when a
+	// multimodal projector layer (see selectMMProj) was actually
+	// included among layers. The spec has no separate annotation for
+	// "this manifest has an mmproj layer"; capabilities is model-spec's
+	// own mechanism for signalling multimodal support.
+	Vision bool
 }
 
 // storeGGUFAsOCI wraps one or more GGUF layers — several for a multi-part
-// split (see selectGGUF/ggufShards), just one otherwise — in a CNCF
-// model-spec manifest. filepathAnnotation only gets set at the
-// manifest level for the single-file case: once there's more than one
-// shard there's no single filename left to describe the model as a
-// whole, matching storeSafetensorsAsOCI's own multi-layer convention
-// (each layer's own org.cncf.model.filepath annotation — already set by
+// split (see selectGGUF/ggufShards), just one otherwise, plus an optional
+// mmproj layer (see selectMMProj) — in a CNCF model-spec manifest.
+// filepathAnnotation only gets set at the manifest level for the
+// single-weight-file case: once there's more than one weight layer
+// there's no single filename left to describe the model as a whole,
+// matching storeSafetensorsAsOCI's own multi-layer convention (each
+// layer's own org.cncf.model.filepath annotation — already set by
 // downloadHFBlob — is what actually matters; see streamHFFileToRegistry's
 // comment on the same annotation in transfer_docker.go).
-func storeGGUFAsOCI(layoutDir, ref, modelRepo string, layers []ocispec.Descriptor) error {
-	filepathAnnotation := ""
-	if len(layers) == 1 {
-		filepathAnnotation = layers[0].Annotations["org.cncf.model.filepath"]
-	}
-	manifestDesc, err := buildCNCFManifest(layoutBlobSink(layoutDir), "gguf", modelRepo, filepathAnnotation, layers)
+func storeGGUFAsOCI(layoutDir, ref, modelRepo string, meta modelMeta, filepathAnnotation string, layers []ocispec.Descriptor) error {
+	manifestDesc, err := buildCNCFManifest(layoutBlobSink(layoutDir), meta, modelRepo, filepathAnnotation, layers)
 	if err != nil {
 		return err
 	}
@@ -888,34 +1082,45 @@ func layoutBlobSink(layoutDir string) cncfBlobSink {
 
 // buildCNCFManifest builds a conformant CNCF model-spec config blob and
 // manifest referencing layers, storing each via sink, and returns the
-// manifest's descriptor. filepathAnnotation sets the manifest-level
-// org.cncf.model.filepath annotation for the single-weight-file case (GGUF);
-// pass "" for the multi-layer safetensors case, which only sets
-// ai.model.repo.
-func buildCNCFManifest(sink cncfBlobSink, format, modelRepo, filepathAnnotation string, layers []ocispec.Descriptor) (ocispec.Descriptor, error) {
-	var cfg cncfModelConfig
-	cfg.Config.Format = format
-	cfg.ModelFS.Type = "layers"
-	for _, l := range layers {
-		cfg.ModelFS.DiffIDs = append(cfg.ModelFS.DiffIDs, l.Digest.String())
+// manifest's descriptor. meta carries the optional descriptor.licenses/
+// config.capabilities metadata (see modelMeta's own doc comment).
+// filepathAnnotation sets the manifest-level org.cncf.model.filepath
+// annotation for the single-weight-file case (GGUF); pass "" for the
+// multi-layer safetensors case, which only sets ai.model.repo.
+func buildCNCFManifest(sink cncfBlobSink, meta modelMeta, modelRepo, filepathAnnotation string, layers []ocispec.Descriptor) (ocispec.Descriptor, error) {
+	model := modelspec.Model{
+		ModelFS: modelspec.ModelFS{Type: "layers"},
+		Config:  modelspec.ModelConfig{Format: meta.Format},
 	}
-	cfgData, err := json.Marshal(cfg)
+	if len(meta.Licenses) > 0 {
+		model.Descriptor.Licenses = meta.Licenses
+	}
+	if meta.Vision {
+		model.Config.Capabilities = &modelspec.ModelCapabilities{
+			InputTypes:  []modelspec.Modality{modelspec.TextModality, modelspec.ImageModality},
+			OutputTypes: []modelspec.Modality{modelspec.TextModality},
+		}
+	}
+	for _, l := range layers {
+		model.ModelFS.DiffIDs = append(model.ModelFS.DiffIDs, l.Digest)
+	}
+	cfgData, err := json.Marshal(model)
 	if err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("marshal CNCF model config: %w", err)
 	}
-	configDesc, err := sink("application/vnd.cncf.model.config.v1+json", cfgData)
+	configDesc, err := sink(modelspec.MediaTypeModelConfig, cfgData)
 	if err != nil {
 		return ocispec.Descriptor{}, fmt.Errorf("store CNCF model config: %w", err)
 	}
 
 	annotations := map[string]string{"ai.model.repo": modelRepo}
 	if filepathAnnotation != "" {
-		annotations["org.cncf.model.filepath"] = filepathAnnotation
+		annotations[modelspec.AnnotationFilepath] = filepathAnnotation
 	}
 	manifest := ocispec.Manifest{
 		Versioned:    specs.Versioned{SchemaVersion: 2},
 		MediaType:    ocispec.MediaTypeImageManifest,
-		ArtifactType: "application/vnd.cncf.model.manifest.v1+json",
+		ArtifactType: modelspec.ArtifactTypeModelManifest,
 		Config:       configDesc,
 		Layers:       layers,
 		Annotations:  annotations,

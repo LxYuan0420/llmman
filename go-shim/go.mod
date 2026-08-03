@@ -27,7 +27,11 @@ require (
 	golang.org/x/sync v0.20.0
 )
 
-require golang.org/x/sys v0.43.0
+require (
+	github.com/modelpack/model-spec v0.0.7
+	github.com/sirupsen/logrus v1.9.4
+	golang.org/x/sys v0.43.0
+)
 
 require (
 	cyphar.com/go-pathrs v0.2.4 // indirect
@@ -103,7 +107,6 @@ require (
 	github.com/sigstore/fulcio v1.8.5 // indirect
 	github.com/sigstore/protobuf-specs v0.5.0 // indirect
 	github.com/sigstore/sigstore v1.10.5 // indirect
-	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/smallstep/pkcs7 v0.1.1 // indirect
 	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect

@@ -43,6 +43,7 @@ import (
 	"path/filepath"
 
 	"github.com/containerd/containerd/v2/core/remotes"
+	modelspec "github.com/modelpack/model-spec/specs-go/v1"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/vbauerster/mpb/v8"
@@ -219,9 +220,14 @@ func dockerTransferHF(ctx context.Context, ref, destination string) (changed boo
 	apiClient := hfAPIClient()
 	dlClient := hfDownloadClient()
 
-	commit, err := hfFetchCommit(ctx, apiClient, endpoint, owner, repo, token)
+	info, err := hfFetchModelInfo(ctx, apiClient, endpoint, owner, repo, token)
 	if err != nil {
 		return false, err
+	}
+	commit := info.commit()
+	meta := modelMeta{}
+	if license, ok := info.license(); ok {
+		meta.Licenses = []string{license}
 	}
 	files, err := hfFetchFiles(ctx, apiClient, endpoint, owner, repo, commit, token)
 	if err != nil {
@@ -239,11 +245,12 @@ func dockerTransferHF(ctx context.Context, ref, destination string) (changed boo
 	// split together (see selectGGUF/ggufShards in hf.go) — just one
 	// element for an ordinarily single-file GGUF.
 	if shards, err := selectGGUF(files, tag); err == nil {
+		meta.Format = "gguf"
 		var ggufLayers []ocispec.Descriptor
 		for _, f := range shards {
 			desc, blobChanged, err := streamHFFileToRegistry(
 				ctx, dlClient, pusher, endpoint, owner, repo, commit, token,
-				f, "application/vnd.cncf.model.weight.v1.raw",
+				f, modelspec.MediaTypeModelWeightRaw,
 			)
 			if err != nil {
 				return false, err
@@ -260,7 +267,39 @@ func dockerTransferHF(ctx context.Context, ref, destination string) (changed boo
 		if len(shards) == 1 {
 			filepathAnnotation = filepath.Base(shards[0].Path)
 		}
-		if err := pushCNCFGGUFManifest(ctx, pusher, owner+"/"+repo, filepathAnnotation, ggufLayers, &changed); err != nil {
+		// mmproj: an optional extra weight layer alongside the chosen
+		// GGUF shard(s) — see selectMMProj's own doc comment (hf.go) for
+		// why this has no dedicated media type of its own.
+		if mmproj, ok := selectMMProj(files); ok {
+			desc, blobChanged, err := streamHFFileToRegistry(
+				ctx, dlClient, pusher, endpoint, owner, repo, commit, token,
+				mmproj, modelspec.MediaTypeModelWeightRaw,
+			)
+			if err != nil {
+				return false, err
+			}
+			if blobChanged {
+				changed = true
+			}
+			ggufLayers = append(ggufLayers, desc)
+			meta.Vision = true
+		}
+		// LICENSE: a doc-type layer per spec.md's own example of what
+		// application/vnd.cncf.model.doc.v1.raw is for.
+		if lic, ok := selectLicenseFile(files); ok {
+			desc, blobChanged, err := streamHFFileToRegistry(
+				ctx, dlClient, pusher, endpoint, owner, repo, commit, token,
+				lic, modelspec.MediaTypeModelDocRaw,
+			)
+			if err != nil {
+				return false, err
+			}
+			if blobChanged {
+				changed = true
+			}
+			ggufLayers = append(ggufLayers, desc)
+		}
+		if err := pushCNCFGGUFManifest(ctx, pusher, meta, owner+"/"+repo, filepathAnnotation, ggufLayers, &changed); err != nil {
 			return false, err
 		}
 		if changed {
@@ -269,6 +308,7 @@ func dockerTransferHF(ctx context.Context, ref, destination string) (changed boo
 		return changed, nil
 	}
 
+	meta.Format = "safetensors"
 	toSend := selectDownloadableHFFiles(files)
 	if len(toSend) == 0 {
 		return false, fmt.Errorf("no model files found in repository %s/%s", owner, repo)
@@ -285,10 +325,10 @@ func dockerTransferHF(ctx context.Context, ref, destination string) (changed boo
 		if blobChanged {
 			changed = true
 		}
-		desc.Annotations = map[string]string{"org.cncf.model.filepath": f.Path}
+		desc.Annotations = map[string]string{modelspec.AnnotationFilepath: f.Path}
 		layers = append(layers, desc)
 	}
-	if err := pushCNCFMultiManifest(ctx, pusher, owner+"/"+repo, layers, &changed); err != nil {
+	if err := pushCNCFMultiManifest(ctx, pusher, meta, owner+"/"+repo, layers, &changed); err != nil {
 		return false, err
 	}
 	if changed {
@@ -322,7 +362,7 @@ func streamHFFileToRegistry(
 	// `llmman pull`'s local-layout path. Omitting it here doesn't fail
 	// the transfer itself (the push succeeds either way), but leaves the
 	// pushed image unservable by `llmman run`/`llmman serve` afterwards.
-	annotations := map[string]string{"org.cncf.model.filepath": filepath.Base(file.Path)}
+	annotations := map[string]string{modelspec.AnnotationFilepath: filepath.Base(file.Path)}
 	label := filepath.Base(file.Path)
 
 	dgst, size, digestOK, headErr := hfHeadMetadata(ctx, client, url, token)
@@ -485,14 +525,14 @@ func hfGetBytes(ctx context.Context, client *http.Client, url, token string, bar
 // local-store path. If changed is non-nil, it's set to true whenever the
 // config or manifest blob wasn't already present at the destination —
 // see pusherBlobSink.
-func pushCNCFGGUFManifest(ctx context.Context, pusher remotes.Pusher, modelRepo, filepathAnnotation string, layers []ocispec.Descriptor, changed *bool) error {
-	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher, changed), "gguf", modelRepo, filepathAnnotation, layers)
+func pushCNCFGGUFManifest(ctx context.Context, pusher remotes.Pusher, meta modelMeta, modelRepo, filepathAnnotation string, layers []ocispec.Descriptor, changed *bool) error {
+	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher, changed), meta, modelRepo, filepathAnnotation, layers)
 	return err
 }
 
 // pushCNCFMultiManifest is pushCNCFGGUFManifest's safetensors equivalent.
-func pushCNCFMultiManifest(ctx context.Context, pusher remotes.Pusher, modelRepo string, layers []ocispec.Descriptor, changed *bool) error {
-	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher, changed), "safetensors", modelRepo, "", layers)
+func pushCNCFMultiManifest(ctx context.Context, pusher remotes.Pusher, meta modelMeta, modelRepo string, layers []ocispec.Descriptor, changed *bool) error {
+	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher, changed), meta, modelRepo, "", layers)
 	return err
 }
 
