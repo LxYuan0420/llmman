@@ -235,17 +235,32 @@ func dockerTransferHF(ctx context.Context, ref, destination string) (changed boo
 	}
 
 	// Try GGUF first; fall back to safetensors if the repo has none — same
-	// selection logic pullHF uses.
-	if chosen, err := selectGGUF(files, tag); err == nil {
-		desc, blobChanged, err := streamHFFileToRegistry(
-			ctx, dlClient, pusher, endpoint, owner, repo, commit, token,
-			chosen, "application/vnd.cncf.model.weight.v1.raw",
-		)
-		if err != nil {
-			return false, err
+	// selection logic pullHF uses. shards is every part of a multi-part
+	// split together (see selectGGUF/ggufShards in hf.go) — just one
+	// element for an ordinarily single-file GGUF.
+	if shards, err := selectGGUF(files, tag); err == nil {
+		var ggufLayers []ocispec.Descriptor
+		for _, f := range shards {
+			desc, blobChanged, err := streamHFFileToRegistry(
+				ctx, dlClient, pusher, endpoint, owner, repo, commit, token,
+				f, "application/vnd.cncf.model.weight.v1.raw",
+			)
+			if err != nil {
+				return false, err
+			}
+			if blobChanged {
+				changed = true
+			}
+			ggufLayers = append(ggufLayers, desc)
 		}
-		changed = blobChanged
-		if err := pushCNCFSingleManifest(ctx, pusher, "gguf", owner+"/"+repo, chosen.Path, desc, &changed); err != nil {
+		// filepathAnnotation only makes sense at the manifest level for
+		// the single-file case — see storeGGUFAsOCI's own doc comment on
+		// the same tradeoff for the local-store path.
+		filepathAnnotation := ""
+		if len(shards) == 1 {
+			filepathAnnotation = filepath.Base(shards[0].Path)
+		}
+		if err := pushCNCFGGUFManifest(ctx, pusher, owner+"/"+repo, filepathAnnotation, ggufLayers, &changed); err != nil {
 			return false, err
 		}
 		if changed {
@@ -457,21 +472,25 @@ func hfGetBytes(ctx context.Context, client *http.Client, url, token string, bar
 
 // ---------------------------------------------------------------------------
 // CNCF ModelPack manifest construction — pushed directly, never written
-// to local disk (mirrors storeHFAsOCI/storeSafetensorsAsOCI in hf.go,
+// to local disk (mirrors storeGGUFAsOCI/storeSafetensorsAsOCI in hf.go,
 // which do the local-layout equivalent for `llmman pull`).
 // ---------------------------------------------------------------------------
 
-// pushCNCFSingleManifest builds and pushes the CNCF manifest/config for a
-// single-weight-file (GGUF) model. If changed is non-nil, it's set to true
-// whenever the config or manifest blob wasn't already present at the
-// destination — see pusherBlobSink.
-func pushCNCFSingleManifest(ctx context.Context, pusher remotes.Pusher, format, modelRepo, filename string, weightDesc ocispec.Descriptor, changed *bool) error {
-	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher, changed), format, modelRepo, filepath.Base(filename), []ocispec.Descriptor{weightDesc})
+// pushCNCFGGUFManifest builds and pushes the CNCF manifest/config for a
+// GGUF model — one layer for an ordinary single-file GGUF, or one layer
+// per shard for a multi-part split (see selectGGUF/ggufShards in hf.go).
+// filepathAnnotation sets the manifest-level org.cncf.model.filepath
+// annotation; pass "" once there's more than one layer, matching
+// storeGGUFAsOCI's own convention for the same tradeoff on the
+// local-store path. If changed is non-nil, it's set to true whenever the
+// config or manifest blob wasn't already present at the destination —
+// see pusherBlobSink.
+func pushCNCFGGUFManifest(ctx context.Context, pusher remotes.Pusher, modelRepo, filepathAnnotation string, layers []ocispec.Descriptor, changed *bool) error {
+	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher, changed), "gguf", modelRepo, filepathAnnotation, layers)
 	return err
 }
 
-// pushCNCFMultiManifest is pushCNCFSingleManifest's multi-layer
-// (safetensors) equivalent.
+// pushCNCFMultiManifest is pushCNCFGGUFManifest's safetensors equivalent.
 func pushCNCFMultiManifest(ctx context.Context, pusher remotes.Pusher, modelRepo string, layers []ocispec.Descriptor, changed *bool) error {
 	_, err := buildCNCFManifest(pusherBlobSink(ctx, pusher, changed), "safetensors", modelRepo, "", layers)
 	return err

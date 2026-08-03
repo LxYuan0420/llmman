@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -340,9 +342,64 @@ func isModelGGUF(path string) bool {
 		!strings.Contains(lower, "imatrix")
 }
 
-// selectGGUF picks the best GGUF from the file listing.
+// ggufShardPattern matches llama.cpp's own gguf-split naming convention —
+// "<name>-NNNNN-of-MMMMM.gguf" — used to split a model too large for a
+// single file into several (very common for large MoE models; e.g.
+// unsloth's DeepSeek-V4-Flash-0731-GGUF ships each quant as 5 parts).
+// Capture group 1 is the shared prefix every shard of the same split has
+// in common, group 2 is this shard's 1-based index, group 3 is the total
+// shard count — both fixed-width, but parsed as plain integers rather
+// than matched verbatim so a total of e.g. 5 still matches whether it's
+// spelled "00005" or "5".
+var ggufShardPattern = regexp.MustCompile(`^(.*)-(\d+)-of-(\d+)\.gguf$`)
+
+// parseGGUFShard parses ggufShardPattern out of path's base name. ok is
+// false for a file that isn't part of a multi-part split.
+func parseGGUFShard(path string) (prefix string, index, total int, ok bool) {
+	m := ggufShardPattern.FindStringSubmatch(filepath.Base(path))
+	if m == nil {
+		return "", 0, 0, false
+	}
+	idx, err1 := strconv.Atoi(m[2])
+	tot, err2 := strconv.Atoi(m[3])
+	if err1 != nil || err2 != nil {
+		return "", 0, 0, false
+	}
+	return m[1], idx, tot, true
+}
+
+// ggufShards returns every shard of the same multi-part split as chosen,
+// in shard order — see ggufShardPattern. A manifest built from only the
+// first shard of a split (as an earlier version of selectGGUF did, simply
+// returning the first path matching a quant substring — the *first*
+// shard's filename matches just as well as any other's) silently produces
+// a model no GGUF-reading runtime can actually load, since the remaining
+// shards' tensors are just missing. Returns []hfFile{chosen} unchanged
+// for a file that isn't part of a split.
+func ggufShards(models []hfFile, chosen hfFile) []hfFile {
+	prefix, _, total, ok := parseGGUFShard(chosen.Path)
+	if !ok {
+		return []hfFile{chosen}
+	}
+	var shards []hfFile
+	for _, f := range models {
+		if p, _, t, ok := parseGGUFShard(f.Path); ok && p == prefix && t == total {
+			shards = append(shards, f)
+		}
+	}
+	sort.Slice(shards, func(i, j int) bool {
+		_, ii, _, _ := parseGGUFShard(shards[i].Path)
+		_, jj, _, _ := parseGGUFShard(shards[j].Path)
+		return ii < jj
+	})
+	return shards
+}
+
+// selectGGUF picks the best GGUF quant from the file listing, returning
+// every shard of a multi-part split together (see ggufShards) rather than
+// just whichever shard happened to match first.
 // tag is the user-supplied quantization hint (e.g. "Q4_K_M") or empty for auto.
-func selectGGUF(files []hfFile, tag string) (hfFile, error) {
+func selectGGUF(files []hfFile, tag string) ([]hfFile, error) {
 	var models []hfFile
 	for _, f := range files {
 		if f.Type == "file" && isModelGGUF(f.Path) {
@@ -350,7 +407,7 @@ func selectGGUF(files []hfFile, tag string) (hfFile, error) {
 		}
 	}
 	if len(models) == 0 {
-		return hfFile{}, fmt.Errorf("no GGUF model files found in repository")
+		return nil, fmt.Errorf("no GGUF model files found in repository")
 	}
 
 	// Explicit tag: user asked for a specific quantization.
@@ -358,10 +415,10 @@ func selectGGUF(files []hfFile, tag string) (hfFile, error) {
 		upper := strings.ToUpper(tag)
 		for _, f := range models {
 			if strings.Contains(strings.ToUpper(f.Path), upper) {
-				return f, nil
+				return ggufShards(models, f), nil
 			}
 		}
-		return hfFile{}, fmt.Errorf("no GGUF file matching %q found; available:\n%s",
+		return nil, fmt.Errorf("no GGUF file matching %q found; available:\n%s",
 			tag, ggufList(models))
 	}
 
@@ -369,14 +426,14 @@ func selectGGUF(files []hfFile, tag string) (hfFile, error) {
 	for _, pref := range quantPreference {
 		for _, f := range models {
 			if strings.Contains(strings.ToUpper(f.Path), pref) {
-				return f, nil
+				return ggufShards(models, f), nil
 			}
 		}
 	}
 
 	// Fallback: smallest file (most compressed).
 	sort.Slice(models, func(i, j int) bool { return models[i].Size < models[j].Size })
-	return models[0], nil
+	return ggufShards(models, models[0]), nil
 }
 
 func ggufList(files []hfFile) string {
@@ -500,14 +557,17 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 	progressSetStatus("pulling")
 
 	// Try GGUF first; fall back to safetensors if the repo has none.
-	chosen, err := selectGGUF(files, tag)
-	if err == nil {
-		downloadURL := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + chosen.Path
-		ggufDesc, err := downloadHFBlob(ctx, dlClient, downloadURL, token, layoutDir, owner, repo, commit, chosen)
-		if err != nil {
-			return err
+	if shards, err := selectGGUF(files, tag); err == nil {
+		var layers []ocispec.Descriptor
+		for _, f := range shards {
+			downloadURL := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + f.Path
+			desc, err := downloadHFBlob(ctx, dlClient, downloadURL, token, layoutDir, owner, repo, commit, f)
+			if err != nil {
+				return err
+			}
+			layers = append(layers, desc)
 		}
-		return storeHFAsOCI(layoutDir, ref, owner+"/"+repo, chosen.Path, ggufDesc)
+		return storeGGUFAsOCI(layoutDir, ref, owner+"/"+repo, layers)
 	}
 
 	// No GGUF found — pull safetensors files as a CNCF model-spec image.
@@ -768,7 +828,7 @@ func downloadAttempt(ctx context.Context, client *http.Client, url, token, layou
 }
 
 // ---------------------------------------------------------------------------
-// storeHFAsOCI — wrap the GGUF blob in a CNCF model-spec OCI manifest
+// storeGGUFAsOCI — wrap the GGUF blob(s) in a CNCF model-spec OCI manifest
 // ---------------------------------------------------------------------------
 
 // cncfModelConfig is the required structure for application/vnd.cncf.model.config.v1+json.
@@ -783,8 +843,21 @@ type cncfModelConfig struct {
 	} `json:"modelfs"`
 }
 
-func storeHFAsOCI(layoutDir, ref, modelRepo, filename string, ggufDesc ocispec.Descriptor) error {
-	manifestDesc, err := buildCNCFManifest(layoutBlobSink(layoutDir), "gguf", modelRepo, filepath.Base(filename), []ocispec.Descriptor{ggufDesc})
+// storeGGUFAsOCI wraps one or more GGUF layers — several for a multi-part
+// split (see selectGGUF/ggufShards), just one otherwise — in a CNCF
+// model-spec manifest. filepathAnnotation only gets set at the
+// manifest level for the single-file case: once there's more than one
+// shard there's no single filename left to describe the model as a
+// whole, matching storeSafetensorsAsOCI's own multi-layer convention
+// (each layer's own org.cncf.model.filepath annotation — already set by
+// downloadHFBlob — is what actually matters; see streamHFFileToRegistry's
+// comment on the same annotation in transfer_docker.go).
+func storeGGUFAsOCI(layoutDir, ref, modelRepo string, layers []ocispec.Descriptor) error {
+	filepathAnnotation := ""
+	if len(layers) == 1 {
+		filepathAnnotation = layers[0].Annotations["org.cncf.model.filepath"]
+	}
+	manifestDesc, err := buildCNCFManifest(layoutBlobSink(layoutDir), "gguf", modelRepo, filepathAnnotation, layers)
 	if err != nil {
 		return err
 	}
@@ -793,7 +866,7 @@ func storeHFAsOCI(layoutDir, ref, modelRepo, filename string, ggufDesc ocispec.D
 
 // ---------------------------------------------------------------------------
 // buildCNCFManifest — shared CNCF model-spec manifest+config construction,
-// used by both the local-OCI-layout store path above (storeHFAsOCI,
+// used by both the local-OCI-layout store path above (storeGGUFAsOCI,
 // storeSafetensorsAsOCI) and transfer_docker.go's direct-to-registry push
 // path (pushCNCFSingleManifest, pushCNCFMultiManifest). The two paths differ
 // only in *where* a built blob ends up — a local content-addressed layout
