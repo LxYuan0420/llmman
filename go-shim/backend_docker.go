@@ -251,8 +251,8 @@ func pushBytes(ctx context.Context, pusher remotes.Pusher, desc ocispec.Descript
 // (see hfHeadMetadata) from a source opened lazily by openSource — called,
 // and its resulting reader wrapped in a progress bar via newBar, only if
 // the blob isn't already at the destination (see pushLazy). This is what
-// makes `llmman transfer` behave like `skopeo copy` for large HuggingFace
-// files: bytes flow source → destination without ever landing on disk (or
+// lets `llmman transfer` stream large HuggingFace files straight through:
+// bytes flow source → destination without ever landing on disk (or
 // getting downloaded at all, if the destination turns out to already have
 // them) in between. Pass a nil newBar for no progress reporting.
 func pushStreamLazy(ctx context.Context, pusher remotes.Pusher, desc ocispec.Descriptor, newBar func() *mpb.Bar, openSource func() (io.ReadCloser, error)) (alreadyExists bool, err error) {
@@ -363,8 +363,9 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 	}
 	provider := &ociProvider{dir: layoutDir}
 
-	// "Copying blob/config <digest>" progress bars, matching skopeo's own
-	// copy.Image output exactly (see copy/progress_bars.go upstream).
+	// "Copying blob/config <digest>" progress bars, matching the familiar
+	// registry-copy progress-bar wording (see copy/progress_bars.go
+	// upstream).
 	prog := newProgressPool(40)
 	changed = false
 	pushWithBar := func(desc ocispec.Descriptor, kind string) error {
@@ -399,9 +400,9 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 	}
 	prog.Wait()
 
-	// Push manifest — no progress bar (a few hundred bytes of JSON),
-	// mirroring skopeo's own plain "Writing manifest to image
-	// destination" message instead of a bar for this step.
+	// Push manifest — no progress bar (a few hundred bytes of JSON) —
+	// just a plain "Writing manifest to image destination" message
+	// instead of a bar for this step.
 	manifestAlreadyExists, err := pushBlob(ctx, pusher, provider, manifestDesc, nil)
 	if err != nil {
 		return false, fmt.Errorf("push manifest: %w", err)
@@ -596,11 +597,11 @@ func llmman_inspect(cRef *C.char) *C.char {
 	return okResp(buf.String())
 }
 
-// llmman_transfer copies an image directly from source to destination —
-// llmman's equivalent of `skopeo copy` — without ever writing it to the
-// persistent local store. See transfer.go for the three strategies this
-// picks between (streamed OCI→OCI, streamed HuggingFace→OCI, and a
-// staging-directory fallback for everything else) and why each exists.
+// llmman_transfer transfers an image directly from source to destination,
+// without ever writing it to the persistent local store. See
+// transfer_docker.go for the three strategies this picks between
+// (streamed OCI→OCI, streamed HuggingFace→OCI, and a staging-directory
+// fallback for everything else) and why each exists.
 //
 //export llmman_transfer
 func llmman_transfer(cSource, cDestination *C.char) *C.char {

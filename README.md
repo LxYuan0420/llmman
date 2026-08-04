@@ -13,7 +13,7 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 | `list`    | List locally stored models |
 | `build`   | Package model files into a local OCI image |
 | `push`    | Push a local image to a registry |
-| `transfer` | Copy an image directly from one location to another (e.g. HuggingFace to an OCI registry) |
+| `transfer` | Transfer an image directly from one location to another (e.g. HuggingFace to an OCI registry) |
 | `rm`      | Remove a local image |
 | `tag`     | Create a new local tag pointing to an existing image |
 | `inspect` | Show the manifest of a local or remote image |
@@ -30,9 +30,8 @@ llmman pull unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M
 
 ### Transfer a model between locations
 
-Copy an image directly from a source to a destination without storing it
-locally first — e.g. HuggingFace straight to an OCI registry (this is
-llmman's equivalent of `skopeo copy`):
+Transfer an image directly from a source to a destination without storing
+it locally first — e.g. HuggingFace straight to an OCI registry:
 
 ```
 llmman transfer hf.co/unsloth/Qwen3.5-0.8B-GGUF registry.example.com/owner/model:latest

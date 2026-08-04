@@ -94,12 +94,12 @@ pub fn inspect_remote(reference: &str) -> anyhow::Result<String> {
     consume(unsafe { llmman_inspect(r.as_ptr()) })
 }
 
-/// Copy an image directly from `source` to `destination` — the `skopeo
-/// copy` equivalent — without going through the local store. See
-/// go-shim/transfer_docker.go / transfer_podman.go for how each backend
-/// implements this (streamed blob-for-blob where possible, exactly like
-/// skopeo itself does, falling back to a throwaway local staging
-/// directory only for source kinds that transport has no way to stream).
+/// Transfer an image directly from `source` to `destination` without
+/// going through the local store. See go-shim/transfer_docker.go /
+/// transfer_podman.go for how each backend implements this (streamed
+/// blob-for-blob where possible, falling back to a throwaway local
+/// staging directory only for source kinds that transport has no way to
+/// stream).
 ///
 /// Returns whether anything was actually pushed: every real weight file
 /// (and the manifest built from it) is content-addressed by digest, so

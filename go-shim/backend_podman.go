@@ -309,14 +309,14 @@ func llmman_inspect(cRef *C.char) *C.char {
 	return okResp(buf.String())
 }
 
-// llmman_transfer copies an image directly from source to destination —
-// llmman's equivalent of `skopeo copy` — without ever writing it to the
-// persistent local store. See transfer_podman.go for what this picks
-// between (a direct docker://→docker:// copy.Image, which — like skopeo
-// itself — streams every blob straight through since containers/image
-// already knows each one's digest from the source manifest; or a
-// staging-directory fallback for HuggingFace and other non-OCI sources,
-// which containers/image has no source transport for).
+// llmman_transfer transfers an image directly from source to destination,
+// without ever writing it to the persistent local store. See
+// transfer_podman.go for what this picks between (a direct
+// docker://→docker:// copy.Image, which streams every blob straight
+// through since containers/image already knows each one's digest from
+// the source manifest; or a staging-directory fallback for HuggingFace
+// and other non-OCI sources, which containers/image has no source
+// transport for).
 //
 //export llmman_transfer
 func llmman_transfer(cSource, cDestination *C.char) *C.char {

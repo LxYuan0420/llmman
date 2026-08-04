@@ -1,19 +1,18 @@
 //go:build !podman
 
 // transfer_docker.go — `llmman transfer`'s docker/containerd-backed
-// implementation: llmman's equivalent of `skopeo copy`.
+// implementation.
 //
-// skopeo/containers-image's copy.Image() never fully materializes an image
-// locally before pushing it: it already knows every blob's digest and size
-// up front from the source's own OCI manifest, so it can open a reader on
-// the source blob and a writer on the destination blob at the same time
-// and stream one directly into the other (see the copy package's
-// GetBlob/PutBlob pairing). This file reproduces that property for two
-// cases:
+// A direct transfer never fully materializes an image locally before
+// pushing it: it already knows every blob's digest and size up front from
+// the source's own OCI manifest, so it can open a reader on the source
+// blob and a writer on the destination blob at the same time and stream
+// one directly into the other. This file implements that property for
+// two cases:
 //
 //   - OCI registry → OCI registry (dockerTransferOCI): trivial — the
 //     source manifest already gives every blob's digest/size, so it's a
-//     straight Fetcher → Pusher stream per blob, exactly like skopeo.
+//     straight Fetcher → Pusher stream per blob.
 //
 //   - HuggingFace → OCI registry (dockerTransferHF): harder, because there
 //     is no pre-existing manifest to read a digest from. But a HEAD
@@ -109,19 +108,19 @@ func dockerTransferOCI(ctx context.Context, source, destination string) (changed
 	var manifest ocispec.Manifest
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		// An image index (manifest list): push it as-is. Per-instance
-		// selection (skopeo's --multi-arch) isn't implemented here.
+		// (multi-arch) selection isn't implemented here.
 		alreadyExists, err := pushBytes(ctx, pusher, manifestDesc, manifestData)
 		return !alreadyExists, err
 	}
 
 	// "Transferring blob/config <digest>" progress bars — "Transferring",
-	// not skopeo's own "Copying", because this is genuinely simultaneous:
-	// the fetch from source and the push to destination happen at the
-	// same time, streamed straight through with nothing landing on local
-	// disk in between (see pushStreamLazy). "Copying" is left for
-	// llmman_push's own progress bars (pushToRegistry in this file),
-	// where the source is already sitting on local disk beforehand — an
-	// actual one-directional copy, not a simultaneous transfer.
+	// not "Copying", because this is genuinely simultaneous: the fetch
+	// from source and the push to destination happen at the same time,
+	// streamed straight through with nothing landing on local disk in
+	// between (see pushStreamLazy). "Copying" is left for llmman_push's
+	// own progress bars (pushToRegistry in this file), where the source
+	// is already sitting on local disk beforehand — an actual
+	// one-directional copy, not a simultaneous transfer.
 	//
 	// Each blob gets its own progress pool (rather than one pool shared
 	// across the whole manifest) because retryStream may need to restart
@@ -166,9 +165,9 @@ func dockerTransferOCI(ctx context.Context, source, destination string) (changed
 		return false, err
 	}
 
-	// Manifest push: no progress bar (a few hundred bytes of JSON),
-	// mirroring skopeo's own plain "Writing manifest to image
-	// destination" message instead of a bar for this step.
+	// Manifest push: no progress bar (a few hundred bytes of JSON) — just
+	// a plain "Writing manifest to image destination" message instead of
+	// a bar for this step.
 	manifestAlreadyExists, err := pushBytes(ctx, pusher, manifestDesc, manifestData)
 	if err != nil {
 		return false, err
@@ -337,7 +336,7 @@ func dockerTransferHF(ctx context.Context, ref, destination string) (changed boo
 	return changed, nil
 }
 
-// streamHFFileToRegistry copies one HuggingFace file directly into the
+// streamHFFileToRegistry transfers one HuggingFace file directly into the
 // registry pusher. When the file's real content digest can be learned
 // ahead of time via a HEAD request (true for essentially every real
 // LFS-tracked weight file — see hfHeadMetadata), the GET response body is
@@ -387,13 +386,14 @@ func streamHFFileToRegistry(
 			// comment on this), so each retry gets its own pool/bar
 			// instead of trying to reuse one across attempts.
 			prog := newProgressPool(40)
-			// "Transferring", not "Copying": the GET from HuggingFace and
-			// the push to the destination happen simultaneously here —
-			// streamed straight through with nothing landing on local
-			// disk in between (see pushStreamLazy) — unlike the buffered
+			// "Transferring": the GET from HuggingFace and the push to
+			// the destination happen simultaneously here — streamed
+			// straight through with nothing landing on local disk in
+			// between (see pushStreamLazy) — unlike the buffered
 			// small-file fallback below, which really is
-			// download-then-push and keeps "Copying" for its
-			// (download-phase-only) bar accordingly.
+			// download-then-push, but still reports "Transferring" for
+			// its (download-phase-only) bar to keep `llmman transfer`'s
+			// progress output consistent end to end.
 			newBar := func() *mpb.Bar {
 				return addLayerBar(prog, "Transferring blob "+short, "Transferred  blob "+short, size)
 			}
@@ -425,7 +425,7 @@ func streamHFFileToRegistry(
 	var data []byte
 	err := retryStream(ctx, label, isHTTP4xx, func() error {
 		prog := newProgressPool(40)
-		bar := addLayerBar(prog, "Copying blob "+label, "Copied  blob "+label, size)
+		bar := addLayerBar(prog, "Transferring blob "+label, "Transferred  blob "+label, size)
 		d, err := hfGetBytes(ctx, client, url, token, bar)
 		if err != nil {
 			bar.Abort(false)

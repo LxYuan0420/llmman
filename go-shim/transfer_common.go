@@ -22,7 +22,7 @@ const (
 )
 
 // transferViaStaging implements source→destination transfers that can't be
-// done as a direct registry-to-registry blob copy (e.g. HuggingFace or
+// done as a direct registry-to-registry blob transfer (e.g. HuggingFace or
 // another non-OCI source) by pulling into a temporary local OCI layout and
 // then pushing that layout to the destination registry. Identical for both
 // the docker and podman backends since it only calls the shared

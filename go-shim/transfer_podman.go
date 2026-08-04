@@ -3,14 +3,14 @@
 // transfer_podman.go — `llmman transfer`'s containers/image-backed
 // implementation.
 //
-// For an OCI registry source, this is a one-line reuse of exactly what
-// skopeo itself does: hand `copy.Image` a docker://source and a
-// docker://destination reference directly, with no local OCI layout in
-// between at all. containers/image's copy.Image already streams each blob
-// straight from source to destination (it reads the source manifest first,
-// so every blob's digest/size is known up front, then opens a GetBlob
-// reader and a PutBlob writer for each one — see copy/copy.go upstream);
-// there's nothing llmman needs to add on top for that case.
+// For an OCI registry source, this is a one-line reuse of containers/image's
+// own `copy.Image`: hand it a docker://source and a docker://destination
+// reference directly, with no local OCI layout in between at all.
+// copy.Image already streams each blob straight from source to destination
+// (it reads the source manifest first, so every blob's digest/size is known
+// up front, then opens a GetBlob reader and a PutBlob writer for each one —
+// see copy/copy.go upstream); there's nothing llmman needs to add on top
+// for that case.
 //
 // containers/image has no HuggingFace (or ms:///ngc:///s3:///gs:///local
 // path) source transport, though, so those fall back to staging through a
@@ -48,8 +48,8 @@ func podmanTransfer(ctx context.Context, source, destination string) (changed bo
 // containers/image's copy.Image — no local OCI layout involved. Routed
 // through copyImageWithProgress (backend_podman.go), rather than a bare
 // copy.Image call, purely so its ProgressEventDone/Skipped events can
-// report whether anything was actually copied — see that function's doc
-// comment.
+// report whether anything was actually transferred — see that function's
+// doc comment.
 func podmanTransferOCI(ctx context.Context, source, destination string) (changed bool, err error) {
 	srcStr := "docker://" + source
 	srcRef, err := alltransports.ParseImageName(srcStr)
@@ -71,7 +71,7 @@ func podmanTransferOCI(ctx context.Context, source, destination string) (changed
 	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Transferring", "Transferred", &copy.Options{
 		ReportWriter: os.Stderr,
 	}, &changed); err != nil {
-		return false, fmt.Errorf("copy image: %w", err)
+		return false, fmt.Errorf("transfer image: %w", err)
 	}
 	return changed, nil
 }

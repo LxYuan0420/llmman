@@ -47,7 +47,7 @@ enum Commands {
     Push(cmd::push::PushArgs),
     /// Pull an image from a registry to the local store
     Pull(cmd::pull::PullArgs),
-    /// Copy an image directly from one location to another (e.g. HuggingFace to an OCI registry)
+    /// Transfer an image directly from one location to another (e.g. HuggingFace to an OCI registry)
     Transfer(cmd::transfer::TransferArgs),
     /// List locally stored images
     #[command(alias = "ls")]
