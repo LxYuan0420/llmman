@@ -46,8 +46,14 @@ The server listens on `127.0.0.1:17434` and exposes:
 | API | Endpoints |
 |-----|-----------|
 | Ollama | `/api/generate`, `/api/chat`, `/api/tags`, `/api/show`, `/api/pull`, `/api/ps`, `/api/delete` |
-| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models` |
+| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens` |
 | Anthropic | `/v1/messages` |
+
+`/v1/responses` implements the OpenAI Responses API (the dialect [OpenAI
+Codex](https://github.com/openai/codex) requires), including streaming SSE
+and function-tool-call re-mapping. This is a plain pass-through to
+`llama-server`'s own native `/v1/responses` support, so a recent enough
+`llama-server` build is required for it to work.
 
 Use it as an Ollama-compatible server:
 

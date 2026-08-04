@@ -1,5 +1,6 @@
-//! `llmman serve` – HTTP server exposing Ollama, OpenAI, and Anthropic-compatible
-//! APIs backed by `llama-server` sub-processes from llama.cpp.
+//! `llmman serve` – HTTP server exposing Ollama, OpenAI (including the
+//! Responses API), and Anthropic-compatible APIs backed by `llama-server`
+//! sub-processes from llama.cpp.
 
 use std::collections::HashMap;
 use std::net::TcpListener;
@@ -1647,6 +1648,36 @@ async fn handle_openai_embeddings(
     proxy_openai(&state, &headers, body, "/v1/embeddings").await
 }
 
+// -- OpenAI Responses API (/v1/responses) ------------------------------------
+//
+// llama-server (llama.cpp) has its own native /v1/responses implementation
+// that converts a Responses-API request into a Chat Completions request
+// internally (see server_chat_convert_responses_to_chatcmpl in
+// tools/server/server-chat.cpp) — including the exact SSE event sequence
+// Codex requires (response.created -> response.output_item.added ->
+// response.output_text.delta -> ... -> response.completed, no `[DONE]`),
+// re-mapping of tool_calls into function_call output items, and lenient
+// handling of non-"function" tool entries (Codex's plugin-bundle "namespace"
+// tools are silently skipped rather than rejected). Re-implementing that
+// translation here would just duplicate — and risk drifting out of sync
+// with — llama.cpp's own logic, so this is a plain pass-through exactly like
+// the other /v1/* routes above.
+async fn handle_openai_responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    proxy_openai(&state, &headers, body, "/v1/responses").await
+}
+
+async fn handle_openai_responses_input_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    proxy_openai(&state, &headers, body, "/v1/responses/input_tokens").await
+}
+
 // -- Anthropic /v1/messages --------------------------------------------------
 
 async fn handle_anthropic_messages(
@@ -1807,6 +1838,11 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .route("/v1/chat/completions", post(handle_openai_chat))
         .route("/v1/completions", post(handle_openai_completions))
         .route("/v1/embeddings", post(handle_openai_embeddings))
+        .route("/v1/responses", post(handle_openai_responses))
+        .route(
+            "/v1/responses/input_tokens",
+            post(handle_openai_responses_input_tokens),
+        )
         // Anthropic API
         .route("/v1/messages", post(handle_anthropic_messages))
         .with_state(app_state);
