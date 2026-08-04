@@ -13,6 +13,7 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 | `list`    | List locally stored models |
 | `build`   | Package model files into a local OCI image |
 | `push`    | Push a local image to a registry |
+| `transfer` | Copy an image directly from one location to another (e.g. HuggingFace to an OCI registry) |
 | `rm`      | Remove a local image |
 | `tag`     | Create a new local tag pointing to an existing image |
 | `inspect` | Show the manifest of a local or remote image |
@@ -26,6 +27,20 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 ```
 llmman pull unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M
 ```
+
+### Transfer a model between locations
+
+Copy an image directly from a source to a destination without storing it
+locally first — e.g. HuggingFace straight to an OCI registry (this is
+llmman's equivalent of `skopeo copy`):
+
+```
+llmman transfer hf.co/unsloth/Qwen3.5-0.8B-GGUF registry.example.com/owner/model:latest
+```
+
+Any source `llmman pull` understands (an OCI registry, `hf://`, `ms://`,
+`ngc://`, `s3://`, `gs://`, ...) can be paired with any OCI registry
+destination.
 
 ### Serve
 
@@ -65,7 +80,7 @@ Or with any Ollama, Anthropic or OpenAI-compatible client.
 
 Models are loaded on demand. Each model gets its own `llama-server` subprocess on a random loopback port; subsequent requests reuse the running process.
 
-Short names work with all commands: `pull`, `push`, `rm`, `tag`, `inspect`, and `serve`.
+Short names work with all commands: `pull`, `push`, `transfer`, `rm`, `tag`, `inspect`, and `serve`.
 
 ## Store location
 
