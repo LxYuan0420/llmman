@@ -678,6 +678,50 @@ async fn wait_for_ready(client: &Client, port: u16) -> anyhow::Result<()> {
     }
 }
 
+/// Serializes every call into the Go shim's `llmman_pull`/`llmman_push` (see
+/// `crate::ffi::pull`/`push`) across this whole process.
+///
+/// go-shim/progress_state.go's `progressState` is explicitly documented as
+/// tracking only one transfer at a time — `llmman_pull`/`llmman_push` each
+/// reset it on entry — but nothing on the Rust side ever enforced that.
+/// Three call sites can independently decide "not in store, pull it" for
+/// the same model at once (this fallback in `ensure_model`, `handle_pull`,
+/// and — since `launch` started calling `daemon::ensure_model_pulled`
+/// itself — a concurrent client's own explicit `/api/pull`), and without
+/// this lock, two such calls racing means: two redundant full downloads of
+/// the same multi-GB blob, and a progress bar reading numbers that jump
+/// between whichever transfer happens to be updating the shared state,
+/// occasionally freezing solid (stuck showing an earlier, unrelated
+/// transfer's now-stale total/completed) even while the real download
+/// underneath is still moving.
+///
+/// Held only around the actual FFI call (see `pull_serialized` /
+/// `handle_push`'s task) — never across the cheap "is it already in the
+/// store" check that runs before it — so a second caller that loses the
+/// race simply blocks here until the first finishes, and only then
+/// re-checks the store (see `pull_serialized`) instead of unconditionally
+/// re-downloading everything itself.
+static PULL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Pulls `model` into `layout_dir` if (still, after acquiring `PULL_LOCK`)
+/// missing from the local store — shared by `ensure_model`'s fallback and
+/// `handle_pull` so both funnel through the same single-flight check
+/// instead of each deciding "not present" from a snapshot taken before
+/// waiting on the lock, then redundantly re-pulling once it's their turn.
+///
+/// Must be called from a blocking context (`spawn_blocking`): blocks the
+/// current thread on `PULL_LOCK`, not just this async task.
+fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<()> {
+    let _guard = PULL_LOCK.blocking_lock();
+    if OciStore::open(store_path).and_then(|s| s.find(model)).is_ok() {
+        return Ok(()); // someone else already pulled it while we waited
+    }
+    let layout_dir = store_path
+        .to_str()
+        .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
+    crate::ffi::pull(model, layout_dir)
+}
+
 /// Resolve a user-supplied model ref to the canonical reference stored in the
 /// OCI index (e.g. "hf.co/repo" → "hf.co/repo:latest").  Using the canonical
 /// form as the map key means "hf.co/repo" and "hf.co/repo:latest" both hit
@@ -714,15 +758,10 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         eprintln!("[llmman] {model_ref} not in store — pulling");
         let store_path = state.0.store_path.clone();
         let model_ref_owned = model_ref.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let layout = store_path
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 store path"))?;
-            crate::ffi::pull(&model_ref_owned, layout)
-        })
-        .await
-        .context("pull task panicked")?
-        .context("pull failed")?;
+        tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_ref_owned))
+            .await
+            .context("pull task panicked")?
+            .context("pull failed")?;
     }
 
     // Re-canonicalise after the pull (tag may now be resolvable).
@@ -1346,13 +1385,17 @@ async fn handle_pull(
     // Not in the local store: actually pull it (the previous behavior only
     // ever 404'd here, so no real Ollama client's "pull if missing, then
     // use" flow — e.g. `ollama run <model>` — ever worked against llmman).
+    //
+    // pull_serialized (not a bare crate::ffi::pull call) re-checks presence
+    // after acquiring PULL_LOCK: this request's own `already_present` check
+    // above ran before that wait, so a concurrent pull of the same model
+    // (from another client, or from ensure_model's own fallback below) can
+    // finish while this one was waiting its turn — see PULL_LOCK's doc
+    // comment for why two callers must never invoke the actual FFI pull at
+    // the same time.
     let model_for_task = model.clone();
-    let pull_task = tokio::task::spawn_blocking(move || {
-        let layout_dir = store_path
-            .to_str()
-            .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
-        crate::ffi::pull(&model_for_task, layout_dir)
-    });
+    let pull_task =
+        tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_for_task));
 
     stream_ffi_progress(model, "pull", "pulling manifest", pull_task)
 }
@@ -1386,8 +1429,11 @@ async fn handle_push(
         return (StatusCode::NOT_FOUND, Json(body)).into_response();
     }
 
+    // See PULL_LOCK's doc comment: pushes share the same Go-side
+    // progressState as pulls, so they need the same mutual exclusion.
     let model_for_task = model.clone();
     let push_task = tokio::task::spawn_blocking(move || {
+        let _guard = PULL_LOCK.blocking_lock();
         let layout_dir = store_path
             .to_str()
             .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
