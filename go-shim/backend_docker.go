@@ -184,6 +184,27 @@ func pushLazy(
 	if err != nil {
 		return false, err
 	}
+
+	// containerd's pushWriter (core/remotes/docker/pusher.go) only ever
+	// initializes its underlying pipe inside its own Write method, the
+	// first time that's called with actual data — but content.Copy below
+	// never calls Write at all for a zero-byte blob (its io.ReadAtLeast
+	// loop immediately gets 0, io.EOF, so the "if nr > 0" guard around
+	// the Write call is never entered), leaving that pipe nil. Commit
+	// then unconditionally does pw.pipe.Write(...) to check for a prior
+	// read error, which panics on that nil pipe rather than returning
+	// one — see docker/llmman-publisher's nemotron-3-nano:4b-safetensors
+	// transfer, which crashed exactly this way pushing a real, ordinary
+	// zero-byte file from that HuggingFace repository. A zero-length
+	// write of our own first is a genuine no-op otherwise, and is enough
+	// to make Write actually run once, initializing that pipe before
+	// Commit ever gets to it.
+	if desc.Size == 0 {
+		if _, err := cw.Write(nil); err != nil {
+			return false, describeErr(err)
+		}
+	}
+
 	if copyErr := describeErr(content.Copy(ctx, cw, r, desc.Size, desc.Digest)); copyErr != nil {
 		// A real failure partway through: the bar (if any) was already
 		// incremented some amount short of its total, and never will be
