@@ -89,12 +89,16 @@ const MODEL: &str = "qwen3.5:0.8b";
 /// what's under test here, the launch/env/config plumbing is.
 const PROMPT: &str = "Reply with exactly the single word: pong";
 
-/// How long a single `llmman launch` invocation may run before these
-/// tests give up and fail it as hung, rather than waiting forever. This
-/// has to comfortably cover a cold pull of the ~740MB model plus
-/// llama-server startup plus the integration's own request(s) — all of
-/// which only happen once per fresh daemon, not once per test.
-const TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a single command (an `llmman launch` invocation, or
+/// `warm_model`'s `llmman run`) may run before these tests give up and
+/// fail it as hung, rather than waiting forever. This has to comfortably
+/// cover a cold pull of the ~740MB model plus llama-server startup, which
+/// only happens once per fresh daemon (in `warm_model`, not in every
+/// individual test) — but that one pull is a real download over
+/// whatever network the daemon's machine has, so this is generous rather
+/// than tight: a CI run has already hit the low end of plausible pull
+/// times at 300s.
+const TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Serializes the tests in this file: they'd otherwise run in parallel
 /// threads (the default `cargo test` behavior) and race to spawn

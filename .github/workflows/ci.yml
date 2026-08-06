@@ -208,7 +208,7 @@ jobs:
   e2e:
     name: E2E (launch claude/opencode/codex)
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
