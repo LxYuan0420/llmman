@@ -257,21 +257,65 @@ fn launch_codex(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     )
 }
 
+/// Writes codex's `llmman` profile.
+///
+/// Codex 0.134+ dropped support for `--profile <name>` reading a
+/// `[profiles.<name>]` table out of `config.toml`: it now only overlays a
+/// sibling `~/.codex/<name>.config.toml`, using top-level keys instead of a
+/// `[profiles.<name>]` wrapper (see
+/// <https://developers.openai.com/codex/config-advanced#profiles>). An
+/// older llmman wrote the now-unsupported `[profiles.llmman]` form directly
+/// into `config.toml`, which current codex refuses to start with at all
+/// ("cannot be used while config.toml contains legacy ... table") — so any
+/// leftover copy of that table is stripped from `config.toml` first, then
+/// the real settings are (re)written to the profile overlay file codex
+/// actually reads.
 fn write_codex_config() -> anyhow::Result<()> {
     let home = dirs::home_dir().context("no home directory")?;
     let config_dir = home.join(".codex");
     std::fs::create_dir_all(&config_dir)?;
-    let config_path = config_dir.join("config.toml");
 
-    // Append the llmman profile if not already present.
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
-    if !existing.contains("[profiles.llmman]") {
-        let entry = format!(
-            "\n[profiles.llmman]\nopenai_base_url = \"{SERVER}/v1\"\n"
-        );
-        std::fs::write(&config_path, existing + &entry)?;
+    let config_path = config_dir.join("config.toml");
+    if let Ok(existing) = std::fs::read_to_string(&config_path) {
+        if existing.contains("[profiles.llmman]") {
+            std::fs::write(&config_path, strip_legacy_llmman_profile(&existing))?;
+        }
+    }
+
+    let profile_path = config_dir.join("llmman.config.toml");
+    let contents = format!("openai_base_url = \"{SERVER}/v1\"\n");
+    // Avoid rewriting (and bumping the mtime of) a file that's already
+    // correct.
+    if std::fs::read_to_string(&profile_path).ok().as_deref() != Some(contents.as_str()) {
+        std::fs::write(&profile_path, contents)?;
     }
     Ok(())
+}
+
+/// Removes a `[profiles.llmman]` table (and everything up to the next
+/// top-level `[...]` header or end of file) from `config.toml`'s text —
+/// the shape an older llmman wrote there, now rejected by current codex.
+/// Line-based rather than a real TOML parser: this only ever needs to
+/// undo llmman's own prior output, not handle arbitrary user TOML.
+fn strip_legacy_llmman_profile(existing: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[profiles.llmman]" {
+            skipping = true;
+            continue;
+        }
+        if skipping && trimmed.starts_with('[') {
+            skipping = false;
+        }
+        if skipping {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// aider: set OPENAI_API_KEY and OPENAI_BASE_URL.
@@ -367,4 +411,47 @@ fn exec_with_env(
         .with_context(|| format!("failed to run {}", bin.display()))?;
 
     std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the codex config bug described on
+    /// `write_codex_config`'s own doc comment: an older llmman's
+    /// `[profiles.llmman]` table (a format current codex refuses to load
+    /// at all) must be fully removed, leaving everything else in
+    /// `config.toml` untouched.
+    #[test]
+    fn strip_legacy_llmman_profile_removes_only_that_table() {
+        let existing = "\
+[some_other_setting]
+foo = \"bar\"
+
+[profiles.llmman]
+openai_base_url = \"http://127.0.0.1:17434/v1\"
+
+[profiles.other]
+model = \"gpt-5\"
+";
+        let cleaned = strip_legacy_llmman_profile(existing);
+        assert!(!cleaned.contains("[profiles.llmman]"));
+        assert!(!cleaned.contains("openai_base_url"));
+        assert!(cleaned.contains("[some_other_setting]"));
+        assert!(cleaned.contains("foo = \"bar\""));
+        assert!(cleaned.contains("[profiles.other]"));
+        assert!(cleaned.contains("model = \"gpt-5\""));
+    }
+
+    #[test]
+    fn strip_legacy_llmman_profile_is_a_no_op_without_the_legacy_table() {
+        let existing = "[profiles.other]\nmodel = \"gpt-5\"\n";
+        assert_eq!(strip_legacy_llmman_profile(existing), existing);
+    }
+
+    #[test]
+    fn strip_legacy_llmman_profile_handles_the_table_at_end_of_file() {
+        let existing = "[profiles.llmman]\nopenai_base_url = \"http://127.0.0.1:17434/v1\"\n";
+        assert_eq!(strip_legacy_llmman_profile(existing), "");
+    }
 }

@@ -153,6 +153,146 @@ jobs:
           if-no-files-found: error
 
   # --------------------------------------------------------------------------
+  # Unit tests: every #[cfg(test)] module under src/ (`cargo test --bin`,
+  # since this crate has no lib target — see Cargo.toml). Linux x86_64 only:
+  # these are pure-Rust logic tests with no OS-specific behavior, so one
+  # platform is enough to catch a regression.
+  # --------------------------------------------------------------------------
+  test:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: go-shim/go.sum
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: test-x86_64-unknown-linux-gnu
+
+      - name: Cache Go modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-linux-${{ hashFiles('go-shim/go.sum') }}
+          restore-keys: go-linux-
+
+      - name: Install build dependencies
+        run: sudo apt-get install -y gcc
+
+      - name: cargo test --bin llmman
+        run: cargo test --release --bin llmman
+
+  # --------------------------------------------------------------------------
+  # E2E: `llmman launch <claude|opencode|codex> --model qwen3.5:0.8b`
+  # (tests/launch_e2e.rs) against a real `llmman serve`, a real pulled model,
+  # a real llama-server, and the real third-party CLIs — not mocks. Linux
+  # x86_64 only: installing a matching llama-server release plus every
+  # integration CLI across the full release-build matrix isn't worth the
+  # added CI time/flakiness for what's fundamentally a smoke test of the
+  # launch/env/config plumbing (see tests/launch_e2e.rs's own doc comment for
+  # what each test actually guards against).
+  # --------------------------------------------------------------------------
+  e2e:
+    name: E2E (launch claude/opencode/codex)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: go-shim/go.sum
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: e2e-x86_64-unknown-linux-gnu
+
+      - name: Cache Go modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-linux-${{ hashFiles('go-shim/go.sum') }}
+          restore-keys: go-linux-
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc libgomp1 libcurl4
+
+      # ── Node.js (for the claude/opencode/codex CLIs under test) ────────────
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Install integration CLIs (claude, opencode, codex)
+        run: npm install -g @anthropic-ai/claude-code opencode-ai @openai/codex
+
+      # opencode installs its configured provider's npm package (here
+      # @ai-sdk/openai-compatible — see launch::opencode_config) on demand
+      # into ~/.config/opencode/node_modules the first time a fresh HOME
+      # uses it. Pay that cost here, separately diagnosable, instead of
+      # inside tests/launch_e2e.rs's own per-launch timeout, so a slow
+      # first-time install there can't masquerade as a hung launch.
+      #
+      # The target baseURL is deliberately unreachable (this only needs to
+      # trigger the provider package install, not a real response) — which
+      # means this can *only* ever time out, never exit cleanly: opencode's
+      # ai-sdk runtime retries a failed connection indefinitely rather than
+      # giving up, so there's no successful exit code to wait for once the
+      # (fast) npm install itself is done. `timeout` (not the job's own
+      # timeout-minutes) enforces a much shorter cap so this doesn't waste
+      # CI time being deliberately, permanently unreachable, and `|| true`
+      # tolerates the resulting SIGTERM/failure.
+      - name: Warm up opencode's on-demand provider install
+        run: |
+          export OPENCODE_CONFIG_CONTENT='{"$schema":"https://opencode.ai/config.json","provider":{"ollama":{"npm":"@ai-sdk/openai-compatible","name":"Ollama","options":{"baseURL":"http://127.0.0.1:1/v1"},"models":{"warmup":{"name":"warmup"}}}},"model":"ollama/warmup"}'
+          timeout 45 opencode run "hi" --print-logs --log-level DEBUG || true
+
+      # ── llama-server (the inference backend `llmman serve` shells out to) ──
+      # A prebuilt release straight from upstream llama.cpp, pinned so CI
+      # doesn't silently pick up a build that changes behavior mid-flight;
+      # bump LLAMA_CPP_RELEASE deliberately when a newer one is needed.
+      - name: Install llama-server
+        env:
+          LLAMA_CPP_RELEASE: b10293
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/llama.tar.gz \
+            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE}/llama-${LLAMA_CPP_RELEASE}-bin-ubuntu-x64.tar.gz"
+          mkdir -p "$HOME/llama-cpp"
+          tar -xzf /tmp/llama.tar.gz -C "$HOME/llama-cpp"
+          dir="$HOME/llama-cpp/llama-${LLAMA_CPP_RELEASE}"
+          echo "$dir" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$dir" >> "$GITHUB_ENV"
+
+      - name: Build llmman
+        run: cargo build --release
+
+      - name: cargo test --test launch_e2e
+        run: cargo test --release --test launch_e2e -- --test-threads=1 --nocapture
+
+  # --------------------------------------------------------------------------
   # Release: attach binaries to GitHub Releases on tag push
   # --------------------------------------------------------------------------
   release:

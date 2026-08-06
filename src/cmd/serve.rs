@@ -350,7 +350,7 @@ impl AnthropicContent {
 // OpenAI types (internal proxy use)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 struct OAIMessage {
     role: String,
     content: String,
@@ -1655,18 +1655,18 @@ async fn handle_openai_embeddings(
 // internally (see server_chat_convert_responses_to_chatcmpl in
 // tools/server/server-chat.cpp) — including the exact SSE event sequence
 // Codex requires (response.created -> response.output_item.added ->
-// response.output_text.delta -> ... -> response.completed, no `[DONE]`),
-// re-mapping of tool_calls into function_call output items, and lenient
-// handling of non-"function" tool entries (Codex's plugin-bundle "namespace"
-// tools are silently skipped rather than rejected). Re-implementing that
-// translation here would just duplicate — and risk drifting out of sync
-// with — llama.cpp's own logic, so this is a plain pass-through exactly like
-// the other /v1/* routes above.
+// response.output_text.delta -> ... -> response.completed, no `[DONE]`) and
+// re-mapping of tool_calls into function_call output items. Re-implementing
+// that translation here would just duplicate — and risk drifting out of
+// sync with — llama.cpp's own logic, so this is a plain pass-through
+// exactly like the other /v1/* routes above, apart from
+// filter_non_function_tools (see its own doc comment) below.
 async fn handle_openai_responses(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
+    let body = sanitize_responses_request(body)?;
     proxy_openai(&state, &headers, body, "/v1/responses").await
 }
 
@@ -1675,10 +1675,168 @@ async fn handle_openai_responses_input_tokens(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
+    let body = sanitize_responses_request(body)?;
     proxy_openai(&state, &headers, body, "/v1/responses/input_tokens").await
 }
 
+/// Applies both `/v1/responses` request-shape workarounds below and
+/// re-serializes once, rather than parsing the body twice.
+fn sanitize_responses_request(body: Bytes) -> anyhow::Result<Bytes> {
+    let mut req: serde_json::Value =
+        serde_json::from_slice(&body).context("parse OpenAI request body")?;
+    filter_non_function_tools(&mut req);
+    consolidate_responses_instructions(&mut req);
+    Ok(Bytes::from(
+        serde_json::to_vec(&req).context("re-serialize sanitized request")?,
+    ))
+}
+
+/// Strips any entry from the request's top-level `tools` array whose
+/// `"type"` isn't `"function"` before proxying to llama-server.
+///
+/// Real Codex always includes Responses-API tool types llama-server's own
+/// `/v1/responses` doesn't understand — a `"namespace"`-typed sub-agent
+/// tool bundle, the bare `{"type":"web_search"}` entry, etc. — and, unlike
+/// this module's other passthrough routes, llama-server hard-rejects the
+/// *entire* request the moment even one such entry is present ("'type' of
+/// tool must be 'function'"), rather than skipping just that entry. Since
+/// Codex's own default toolset always includes at least one of these,
+/// every real `codex`/`codex exec` invocation would 400 on its very first
+/// turn without this filter. Nested sub-tools inside a dropped
+/// `"namespace"` entry (e.g. its own agent-management functions) are
+/// dropped along with it rather than hoisted to the top level: the local
+/// model losing access to those secondary tools is harmless, whereas
+/// guessing how to flatten them would risk silently changing their
+/// semantics.
+fn filter_non_function_tools(req: &mut serde_json::Value) {
+    if let Some(tools) = req.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        tools.retain(|t| t.get("type").and_then(|v| v.as_str()) == Some("function"));
+    }
+}
+
+/// Folds every `developer`/`system`-role item out of the request's `input`
+/// array into the top-level `instructions` string, removing them from
+/// `input`, before proxying to llama-server.
+///
+/// llama-server's own `/v1/responses` → chat-completions conversion
+/// (`server_chat_convert_responses_to_chatcmpl` in llama.cpp's
+/// `tools/server/server-chat.cpp`) unconditionally prepends one
+/// `system`-role chat message built from `instructions`, but otherwise
+/// forwards every `input` item's `role` field untouched. A later,
+/// model-agnostic pass in llama.cpp's own chat-template layer
+/// (`workaround::map_developer_role_to_system` in `common/chat.cpp`) then
+/// unconditionally rewrites *every* remaining `role: "developer"` message
+/// to `role: "system"`, wherever it sits in the array, with no
+/// repositioning or merging. Real Codex requests routinely carry a
+/// `developer`-role item further into `input` (permissions/skills
+/// instructions) alongside the top-level `instructions` string, which
+/// after that rewrite leaves two `system`-role messages in the
+/// chat-completions request llama-server builds — the second one not at
+/// index 0, which strict chat templates (Qwen3.5's included) reject
+/// outright with "System message must be at the beginning". This is a
+/// confirmed, currently-unresolved upstream llama.cpp gap (e.g.
+/// ggml-org/llama.cpp#20733, ggml-org/llama.cpp#23423; a fix was proposed
+/// and abandoned in ggml-org/llama.cpp#20079) rather than anything this
+/// module's own /v1/messages-style message-building does, so it can't be
+/// fixed the same way — this route is a pass-through by design (see the
+/// module doc comment above). Folding every developer/system input item
+/// into `instructions` here instead keeps the request in a shape
+/// llama-server can never turn into more than one system message,
+/// regardless of that upstream gap.
+fn consolidate_responses_instructions(req: &mut serde_json::Value) {
+    let mut instructions = req
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if let Some(input) = req.get_mut("input").and_then(|v| v.as_array_mut()) {
+        input.retain(|item| {
+            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            if role != "developer" && role != "system" {
+                return true;
+            }
+            if let Some(text) = responses_input_item_text(item) {
+                if !text.is_empty() {
+                    if !instructions.is_empty() {
+                        instructions.push_str("\n\n");
+                    }
+                    instructions.push_str(&text);
+                }
+            }
+            false
+        });
+    }
+
+    if !instructions.is_empty() {
+        req["instructions"] = serde_json::Value::String(instructions);
+    }
+}
+
+/// Extracts the plain text of a Responses-API `input` message item —
+/// `content` is either a bare string or an array of blocks (each with a
+/// `"text"` field, e.g. `{"type":"input_text","text":"..."}`), the same
+/// two shapes Anthropic's own message content takes (see
+/// `AnthropicContent::as_text` above).
+fn responses_input_item_text(item: &serde_json::Value) -> Option<String> {
+    match item.get("content")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(blocks) => Some(
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+        ),
+        _ => None,
+    }
+}
+
 // -- Anthropic /v1/messages --------------------------------------------------
+
+/// Merges every system-role turn in an Anthropic request into a single
+/// leading system message, then appends every other message in order.
+///
+/// Real Claude Code doesn't confine system content to the top-level
+/// `system` field: it also injects background reminders (available
+/// agents/skills, etc.) as ordinary entries with `"role": "system"`
+/// scattered later in `messages`, which the real Anthropic API accepts in
+/// any position. llama.cpp's chat templates (Qwen's included) are far
+/// stricter and raise "System message must be at the beginning" the
+/// moment a `system` role appears anywhere but index 0 — which every
+/// sufficiently long real Claude Code session eventually triggers.
+/// Concatenating them here keeps every request llama.cpp-template-safe
+/// regardless of where the client put its system-role content.
+fn build_anthropic_messages(req: &AnthropicRequest) -> Vec<OAIMessage> {
+    let mut system_text = String::new();
+    if let Some(sys) = &req.system {
+        system_text.push_str(&sys.as_text());
+    }
+    let mut messages: Vec<OAIMessage> = Vec::new();
+    for m in &req.messages {
+        if m.role == "system" {
+            if !system_text.is_empty() {
+                system_text.push_str("\n\n");
+            }
+            system_text.push_str(&m.content.as_text());
+            continue;
+        }
+        messages.push(OAIMessage {
+            role: m.role.clone(),
+            content: m.content.as_text(),
+        });
+    }
+    if !system_text.is_empty() {
+        messages.insert(
+            0,
+            OAIMessage {
+                role: "system".into(),
+                content: system_text,
+            },
+        );
+    }
+    messages
+}
 
 async fn handle_anthropic_messages(
     State(state): State<AppState>,
@@ -1687,19 +1845,7 @@ async fn handle_anthropic_messages(
     let port = ensure_model(&state, &req.model).await?;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
 
-    let mut messages: Vec<OAIMessage> = Vec::new();
-    if let Some(sys) = &req.system {
-        messages.push(OAIMessage {
-            role: "system".into(),
-            content: sys.as_text(),
-        });
-    }
-    for m in &req.messages {
-        messages.push(OAIMessage {
-            role: m.role.clone(),
-            content: m.content.as_text(),
-        });
-    }
+    let messages = build_anthropic_messages(&req);
 
     let oai = OAIChatRequest {
         model: req.model.clone(),
@@ -1867,4 +2013,139 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the Claude Code bug described on
+    /// `build_anthropic_messages`'s own doc comment: a `system`-role
+    /// message anywhere in `messages` (not just the top-level `system`
+    /// field) must be folded into one message at index 0, never left in
+    /// place, or llama.cpp's chat templates raise "System message must be
+    /// at the beginning" on the second one.
+    #[test]
+    fn build_anthropic_messages_merges_system_role_messages_anywhere_in_the_conversation() {
+        let req: AnthropicRequest = serde_json::from_value(serde_json::json!({
+            "model": "docker.io/ai/qwen3.5:0.8b",
+            "system": [{"type": "text", "text": "leading system prompt"}],
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "system", "content": "a mid-conversation reminder"},
+                {"role": "user", "content": "bye"}
+            ]
+        }))
+        .unwrap();
+
+        let messages = build_anthropic_messages(&req);
+
+        assert_eq!(
+            messages,
+            vec![
+                OAIMessage {
+                    role: "system".into(),
+                    content: "leading system prompt\n\na mid-conversation reminder".into(),
+                },
+                OAIMessage { role: "user".into(), content: "hi".into() },
+                OAIMessage { role: "assistant".into(), content: "hello".into() },
+                OAIMessage { role: "user".into(), content: "bye".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_anthropic_messages_with_no_system_content_has_no_leading_system_message() {
+        let req: AnthropicRequest = serde_json::from_value(serde_json::json!({
+            "model": "docker.io/ai/qwen3.5:0.8b",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+
+        let messages = build_anthropic_messages(&req);
+
+        assert_eq!(
+            messages,
+            vec![OAIMessage { role: "user".into(), content: "hi".into() }]
+        );
+    }
+
+    /// Regression test for the Codex tool-type bug described on
+    /// `filter_non_function_tools`'s own doc comment.
+    #[test]
+    fn filter_non_function_tools_drops_non_function_entries_only() {
+        let mut req = serde_json::json!({
+            "tools": [
+                {"type": "function", "name": "exec_command"},
+                {"type": "namespace", "name": "multi_agent_v1", "tools": [{"type": "function", "name": "close_agent"}]},
+                {"type": "web_search"},
+                {"type": "function", "name": "update_plan"}
+            ]
+        });
+
+        filter_non_function_tools(&mut req);
+
+        assert_eq!(
+            req["tools"],
+            serde_json::json!([
+                {"type": "function", "name": "exec_command"},
+                {"type": "function", "name": "update_plan"}
+            ])
+        );
+    }
+
+    #[test]
+    fn filter_non_function_tools_is_a_no_op_without_a_tools_field() {
+        let mut req = serde_json::json!({"model": "x"});
+        filter_non_function_tools(&mut req);
+        assert_eq!(req, serde_json::json!({"model": "x"}));
+    }
+
+    /// Regression test for the Codex Responses-API bug described on
+    /// `consolidate_responses_instructions`'s own doc comment: a
+    /// `developer`/`system`-role `input` item must be folded into
+    /// `instructions` and removed from `input`, never left in place.
+    #[test]
+    fn consolidate_responses_instructions_folds_developer_and_system_input_items() {
+        let mut req = serde_json::json!({
+            "model": "docker.io/ai/qwen3.5:0.8b",
+            "instructions": "top-level instructions",
+            "input": [
+                {"type": "message", "role": "developer", "content": [
+                    {"type": "input_text", "text": "permissions instructions"}
+                ]},
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hi"}
+                ]},
+                {"type": "message", "role": "system", "content": "a plain-string system item"}
+            ]
+        });
+
+        consolidate_responses_instructions(&mut req);
+
+        assert_eq!(
+            req["instructions"],
+            "top-level instructions\n\npermissions instructions\n\na plain-string system item"
+        );
+        assert_eq!(
+            req["input"],
+            serde_json::json!([
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hi"}
+                ]}
+            ])
+        );
+    }
+
+    #[test]
+    fn consolidate_responses_instructions_is_a_no_op_without_developer_or_system_items() {
+        let mut req = serde_json::json!({
+            "instructions": "top-level instructions",
+            "input": [{"type": "message", "role": "user", "content": "hi"}]
+        });
+        let before = req.clone();
+        consolidate_responses_instructions(&mut req);
+        assert_eq!(req, before);
+    }
 }
