@@ -53,6 +53,17 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     // the requested model so the integration's first request finds it warm.
     crate::daemon::ensure_server(&model)?;
 
+    // serve's preload above is fire-and-forget and only fires on a cold
+    // `serve` start (see run() in cmd/serve.rs) — if the daemon was already
+    // running from a previous invocation, a missing model would otherwise
+    // only surface as an opaque failure once the integration made its first
+    // request. Mirror `llmman run`'s behavior and pull it here instead,
+    // synchronously and with progress, before ever handing off to the
+    // integration.
+    if !model.is_empty() {
+        crate::daemon::ensure_model_pulled(&model)?;
+    }
+
     launch(name, &model, &args.extra_args)
 }
 
