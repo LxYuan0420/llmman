@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/containerd/v2/core/content"
 	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -252,6 +253,41 @@ func (s *stallReadCloser) Close() error {
 	s.stop()
 	return s.body.Close()
 }
+
+// stallWriter is stallReader's write-side mirror: it cancels the context
+// if a Write call goes timeout without returning, rather than if no bytes
+// arrive within timeout. content.Copy's read-then-write loop (see
+// pushLazy in backend_docker.go, the only caller) has no way on its own
+// to notice or escape a destination write that's stopped making progress
+// — observed in practice as a registry PUT that goes quiet mid-upload
+// following a transient error (a 502 from Docker Hub, in the one that
+// prompted this) and then simply never completes or fails on its own.
+// stallReader alone doesn't cover this: it only watches the source (the
+// HuggingFace download) side of that same copy, and a source that's
+// still delivering bytes just fine gives it nothing to notice while the
+// destination write those bytes are headed into sits blocked. Nor does a
+// plain http.Client's own Timeout help — the call actually blocked here
+// (an io.Pipe.Write, feeding the goroutine that owns the real HTTP
+// request) is on our side of an in-process pipe, not a network round
+// trip the http.Client even sees as in progress.
+type stallWriter struct {
+	content.Writer
+	timer *time.Timer
+}
+
+func newStallWriter(w content.Writer, timeout time.Duration, cancel context.CancelFunc) *stallWriter {
+	return &stallWriter{Writer: w, timer: time.AfterFunc(timeout, cancel)}
+}
+
+func (sw *stallWriter) Write(p []byte) (int, error) {
+	n, err := sw.Writer.Write(p)
+	if n > 0 {
+		sw.timer.Reset(dlStallTimeout) // bytes accepted, reset stall clock
+	}
+	return n, err
+}
+
+func (sw *stallWriter) stop() { sw.timer.Stop() }
 
 // isHTTP4xx returns true for permanent HTTP client errors (no point retrying).
 func isHTTP4xx(err error) bool {

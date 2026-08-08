@@ -168,6 +168,17 @@ func pushLazy(
 	desc ocispec.Descriptor,
 	open func() (r io.Reader, bar *mpb.Bar, cleanup func(), err error),
 ) (alreadyExists bool, err error) {
+	// Owns its own cancelable derivative of ctx so a stalled write (see
+	// stallWriter) can abort this attempt without needing every caller
+	// to plumb a cancel func down to here itself — canceling it only
+	// ever affects this one push attempt, and it composes fine with a
+	// caller's own cancelable ctx (e.g. streamHFGet's attemptCtx, for its
+	// read side): cancellation flows one way, parent to child, so either
+	// one firing aborts this attempt, and firing this one can't reach
+	// back up to affect the caller's.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	cw, err := pusher.Push(ctx, desc)
 	if err != nil {
 		if errdefs.IsAlreadyExists(err) {
@@ -185,6 +196,17 @@ func pushLazy(
 		return false, err
 	}
 
+	// See stallWriter's own comment (shared_oci.go) for why this exists:
+	// content.Copy below has no way on its own to notice or escape a
+	// destination write that's stopped making progress — observed in
+	// practice as a registry PUT that goes quiet mid-upload and simply
+	// never completes or fails, hanging the whole transfer (and, per
+	// transfer.yml's job timeout, the whole CI job) for hours rather
+	// than the few seconds it'd otherwise take retryStream to notice and
+	// retry this file from scratch.
+	sw := newStallWriter(cw, dlStallTimeout, cancel)
+	defer sw.stop()
+
 	// containerd's pushWriter (core/remotes/docker/pusher.go) only ever
 	// initializes its underlying pipe inside its own Write method, the
 	// first time that's called with actual data — but content.Copy below
@@ -200,12 +222,12 @@ func pushLazy(
 	// to make Write actually run once, initializing that pipe before
 	// Commit ever gets to it.
 	if desc.Size == 0 {
-		if _, err := cw.Write(nil); err != nil {
+		if _, err := sw.Write(nil); err != nil {
 			return false, describeErr(err)
 		}
 	}
 
-	if copyErr := describeErr(content.Copy(ctx, cw, r, desc.Size, desc.Digest)); copyErr != nil {
+	if copyErr := describeErr(content.Copy(ctx, sw, r, desc.Size, desc.Digest)); copyErr != nil {
 		// A real failure partway through: the bar (if any) was already
 		// incremented some amount short of its total, and never will be
 		// any further — abort it explicitly so it doesn't likewise leave
