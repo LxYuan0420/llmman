@@ -198,17 +198,47 @@ jobs:
   # --------------------------------------------------------------------------
   # E2E: `llmman launch <claude|opencode|codex> --model qwen3.5:0.8b`
   # (tests/launch_e2e.rs) against a real `llmman serve`, a real pulled model,
-  # a real llama-server, and the real third-party CLIs — not mocks. Linux
-  # x86_64 only: installing a matching llama-server release plus every
-  # integration CLI across the full release-build matrix isn't worth the
-  # added CI time/flakiness for what's fundamentally a smoke test of the
-  # launch/env/config plumbing (see tests/launch_e2e.rs's own doc comment for
-  # what each test actually guards against).
+  # a real llama-server, and the real third-party CLIs — not mocks. One
+  # runner per OS family, not the full release-build matrix's every
+  # architecture (e.g. no aarch64-linux or Windows arm64 entry here):
+  # installing a matching llama-server release plus every integration CLI
+  # across every architecture too isn't worth the added CI time/flakiness
+  # for what's fundamentally a smoke test of the launch/env/config plumbing
+  # (see tests/launch_e2e.rs's own doc comment for what each test actually
+  # guards against) — one representative runner per OS is enough to catch
+  # an OS-specific regression (path/shell/PATHEXT handling, line endings,
+  # ...) without tripling the download/install cost for every architecture
+  # variant of it too.
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/opencode/codex)
-    runs-on: ubuntu-24.04
+    name: E2E (launch claude/opencode/codex) — ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            go-os: linux
+            llama-asset: llama-b10293-bin-ubuntu-x64.tar.gz
+
+          - os: macos
+            runner: macos-15
+            target: aarch64-apple-darwin
+            go-os: darwin
+            llama-asset: llama-b10293-bin-macos-arm64.tar.gz
+
+          # lld-link, not MSVC link.exe — see the `build` job's own comment
+          # on why (same CGO-produced-object-format issue, native build or
+          # not).
+          - os: windows
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            go-os: windows
+            llama-asset: llama-b10293-bin-win-cpu-x64.zip
+            rustflags: "-C linker=lld-link"
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -225,7 +255,7 @@ jobs:
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          key: e2e-x86_64-unknown-linux-gnu
+          key: e2e-${{ matrix.target }}
 
       - name: Cache Go modules
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -233,10 +263,24 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-linux-${{ hashFiles('go-shim/go.sum') }}
-          restore-keys: go-linux-
+          key: go-${{ matrix.go-os }}-${{ hashFiles('go-shim/go.sum') }}
+          restore-keys: go-${{ matrix.go-os }}-
 
-      - name: Install build dependencies
+      # ── Windows: set up MSVC (needed for CGO, same as the `build` job) ────
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: amd64
+
+      # ── Linux: C compiler (always needed for CGO) + llama-server's own
+      # runtime shared-library deps. macOS/Windows need neither: Xcode's
+      # command-line tools already provide a C compiler on the macOS
+      # runner image, and both platforms' llama-server release archives
+      # are fully self-contained (verified via `strings`/load-command
+      # inspection — no external libomp/libcurl reference either way).
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y gcc libgomp1 libcurl4
 
       # ── Node.js (for the claude/opencode/codex CLIs under test) ────────────
@@ -245,8 +289,21 @@ jobs:
         with:
           node-version: "22"
 
+      # Each install is tolerated independently (`|| ...`, not `&&`-chained)
+      # rather than failing the whole step — and so the whole job — the
+      # moment one of these three isn't installable on a given OS: a
+      # missing CLI just makes tests/launch_e2e.rs's own on_path check skip
+      # that one integration's test instead, exactly as it already does
+      # for a developer machine that simply doesn't have e.g. `codex`
+      # installed. `shell: bash` (not the Windows default of `pwsh`) is
+      # needed on every OS-agnostic step from here on for consistent `||`/
+      # multi-line syntax; ubuntu/macOS already default to bash.
       - name: Install integration CLIs (claude, opencode, codex)
-        run: npm install -g @anthropic-ai/claude-code opencode-ai @openai/codex
+        shell: bash
+        run: |
+          npm install -g @anthropic-ai/claude-code || echo "::warning::claude-code install failed on ${{ runner.os }}"
+          npm install -g opencode-ai || echo "::warning::opencode-ai install failed on ${{ runner.os }}"
+          npm install -g @openai/codex || echo "::warning::codex install failed on ${{ runner.os }}"
 
       # opencode installs its configured provider's npm package (here
       # @ai-sdk/openai-compatible — see launch::opencode_config) on demand
@@ -263,31 +320,60 @@ jobs:
       # (fast) npm install itself is done. `timeout` (not the job's own
       # timeout-minutes) enforces a much shorter cap so this doesn't waste
       # CI time being deliberately, permanently unreachable, and `|| true`
-      # tolerates the resulting SIGTERM/failure.
+      # tolerates the resulting SIGTERM/failure. Also tolerates opencode
+      # itself not being installed (see the step above) — `command -v`
+      # guards against that rather than failing here instead.
       - name: Warm up opencode's on-demand provider install
+        shell: bash
         run: |
           export OPENCODE_CONFIG_CONTENT='{"$schema":"https://opencode.ai/config.json","provider":{"ollama":{"npm":"@ai-sdk/openai-compatible","name":"Ollama","options":{"baseURL":"http://127.0.0.1:1/v1"},"models":{"warmup":{"name":"warmup"}}}},"model":"ollama/warmup"}'
-          timeout 45 opencode run "hi" --print-logs --log-level DEBUG || true
+          command -v opencode >/dev/null && timeout 45 opencode run "hi" --print-logs --log-level DEBUG || true
 
       # ── llama-server (the inference backend `llmman serve` shells out to) ──
       # A prebuilt release straight from upstream llama.cpp, pinned so CI
       # doesn't silently pick up a build that changes behavior mid-flight;
       # bump LLAMA_CPP_RELEASE deliberately when a newer one is needed.
+      # `matrix.llama-asset` is this OS/arch's release asset (the Windows
+      # one's a .zip, the other two .tar.gz — `tar -xf` auto-detects either
+      # on every OS this runs on: GNU tar (Linux) only ever sees its own
+      # .tar.gz here, and both macOS's and Windows' own bundled `tar` are
+      # libarchive-based `bsdtar`, which reads both formats). The
+      # ubuntu/macOS archives unpack into one llama-<tag> subdirectory; the
+      # Windows one doesn't — found dynamically below rather than hardcoding
+      # either layout.
       - name: Install llama-server
+        shell: bash
         env:
           LLAMA_CPP_RELEASE: b10293
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/llama.tar.gz \
-            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE}/llama-${LLAMA_CPP_RELEASE}-bin-ubuntu-x64.tar.gz"
-          mkdir -p "$HOME/llama-cpp"
-          tar -xzf /tmp/llama.tar.gz -C "$HOME/llama-cpp"
-          dir="$HOME/llama-cpp/llama-${LLAMA_CPP_RELEASE}"
-          echo "$dir" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=$dir" >> "$GITHUB_ENV"
+          archive="$RUNNER_TEMP/llama-cpp-archive"
+          curl -fsSL -o "$archive" \
+            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE}/${{ matrix.llama-asset }}"
+          dir="$RUNNER_TEMP/llama-cpp"
+          mkdir -p "$dir"
+          tar -xf "$archive" -C "$dir"
+          # Exact names only (not a `llama-server*` glob): the Windows
+          # archive also ships a sibling llama-server-impl.dll, which
+          # a wildcard would just as happily match first.
+          bin=$(find "$dir" -type f \( -iname 'llama-server' -o -iname 'llama-server.exe' \) | head -n1)
+          bindir=$(dirname "$bin")
+          echo "$bindir" >> "$GITHUB_PATH"
+          # Only Linux needs this: llama-server's shared libraries sit
+          # right next to it either way, but macOS's build resolves those
+          # via @rpath/@loader_path and Windows' via the same-directory DLL
+          # search every EXE already gets for free — neither needs (nor,
+          # for DYLD_LIBRARY_PATH under macOS's hardened runtime, reliably
+          # even honors) an extra library-search env var the way Linux's
+          # dynamic linker does.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            echo "LD_LIBRARY_PATH=$bindir" >> "$GITHUB_ENV"
+          fi
 
       - name: Build llmman
         run: cargo build --release
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
       - name: cargo test --test launch_e2e
         run: cargo test --release --test launch_e2e -- --test-threads=1 --nocapture

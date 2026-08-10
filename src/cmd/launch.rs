@@ -141,16 +141,35 @@ fn print_integrations() {
     println!("\nUsage: llmman launch <integration> [--model <model>]");
 }
 
+/// Extensions to try, in order, when resolving a bare command name on
+/// Windows — where, unlike everywhere else, a name on `PATH` almost never
+/// exists as a bare file: it's always some extension's worth of shim/
+/// executable, and which one varies by how it got installed. `.exe` is a
+/// real native binary; `.cmd`/`.bat` is what `npm install -g` always
+/// generates for a JS-based CLI's bin entry (every integration this
+/// module launches — claude, opencode, codex — is installed exactly that
+/// way), alongside a `.ps1` this intentionally skips: unlike `.exe`/
+/// `.cmd`/`.bat`, Windows' `CreateProcess` (and so `std::process::Command`
+/// under it) can't launch a `.ps1` directly at all without an explicit
+/// `powershell -File` wrapper, and every npm install already writes a
+/// `.cmd` alongside it, so there's no case where only the `.ps1` exists.
+const WINDOWS_PATH_EXTS: &[&str] = &["exe", "cmd", "bat"];
+
 fn find_on_path(binary: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
-        let candidate = if cfg!(windows) {
-            dir.join(format!("{binary}.exe"))
+        if cfg!(windows) {
+            for ext in WINDOWS_PATH_EXTS {
+                let candidate = dir.join(format!("{binary}.{ext}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
         } else {
-            dir.join(binary)
-        };
-        if candidate.is_file() {
-            return Some(candidate);
+            let candidate = dir.join(binary);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None

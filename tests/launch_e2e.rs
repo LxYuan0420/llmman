@@ -117,11 +117,26 @@ fn llmman_bin() -> PathBuf {
 
 /// True if `bin` resolves on `PATH` — enough for test-skip purposes
 /// without depending on llmman's own (private) `launch::find_on_path`.
+/// Mirrors that function's own Windows handling (see its doc comment):
+/// a bare name on Windows is checked against `.exe`/`.cmd`/`.bat`, not
+/// just the bare file itself, since every integration under test here is
+/// installed via `npm install -g` — which on Windows never produces a
+/// bare, extension-less file — and this needs to agree with what
+/// `find_on_path` can actually locate. A test skipping here despite the
+/// CLI being on `PATH` (or, worse, not skipping and then hitting
+/// `find_on_path`'s own "not installed" error inside `llmman launch`)
+/// would both be this check silently drifting from that one.
 fn on_path(bin: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&path).any(|dir| dir.join(bin).is_file())
+    if cfg!(windows) {
+        const EXTS: &[&str] = &["exe", "cmd", "bat"];
+        std::env::split_paths(&path)
+            .any(|dir| EXTS.iter().any(|ext| dir.join(format!("{bin}.{ext}")).is_file()))
+    } else {
+        std::env::split_paths(&path).any(|dir| dir.join(bin).is_file())
+    }
 }
 
 /// A fresh, unique temp `HOME` for one test's child process — isolates
