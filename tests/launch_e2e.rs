@@ -226,10 +226,24 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
 /// code this suite controls, removes the window entirely: by the time any
 /// test execs a real integration, `MODEL` has already answered a real
 /// prompt successfully at least once.
+///
+/// `--think false`: qwen3.5's thinking mode has been observed (directly,
+/// against a real windows-2025/macos-15 run — see this repo's own git
+/// history) to occasionally degenerate into repeating the same handful of
+/// reasoning sentences (or even just one repeated token) indefinitely
+/// instead of ever reaching an answer, hanging this warm-up for the
+/// full `TIMEOUT` and poisoning `WARM` for every other test in the same
+/// run. That failure mode lives entirely inside the "Thinking:" block
+/// this flag skips outright — disabling it here removes the surface area
+/// for it, in the one call this suite fully controls the shape of. The
+/// three real per-integration launches below don't get this same
+/// treatment: they exercise real third-party clients exactly as a real
+/// user would run them, unable to pass a flag those clients don't
+/// themselves expose.
 fn warm_model() {
     WARM.call_once(|| {
         let mut cmd = Command::new(llmman_bin());
-        cmd.arg("run").arg(MODEL).arg(PROMPT);
+        cmd.arg("run").arg(MODEL).arg("--think").arg("false").arg(PROMPT);
         let output = spawn_with_timeout(cmd, TIMEOUT, "llmman run (model warm-up)");
         assert!(
             output.status.success(),

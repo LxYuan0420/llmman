@@ -191,6 +191,11 @@ struct OllamaChatRequest {
     #[serde(default = "bool_true")]
     stream: bool,
     options: Option<serde_json::Value>,
+    /// Ollama's own top-level `think` field ("for thinking models, should
+    /// the model think before responding? Can be a boolean or a thinking
+    /// level"). See `think_to_chat_template_kwargs`.
+    #[serde(default)]
+    think: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +209,30 @@ struct OllamaGenerateRequest {
     /// keep_alive: 0 with an empty prompt is the Ollama unload signal
     #[serde(default)]
     keep_alive: Option<serde_json::Value>,
+    /// See `OllamaChatRequest::think`.
+    #[serde(default)]
+    think: Option<serde_json::Value>,
+}
+
+/// Translates Ollama's own `think` request field into the
+/// `chat_template_kwargs` llama-server's `/v1/chat/completions` expects to
+/// actually toggle a Qwen3-style template's thinking block (verified
+/// directly against a running llama-server: a request-level
+/// `"reasoning_budget"` field, despite mirroring the CLI flag of the same
+/// name, is *not* respected — only `chat_template_kwargs.enable_thinking`
+/// is).
+///
+/// Only handles the plain-boolean case of `think` (`true`/`false`) —
+/// Ollama's documented string thinking levels (`"low"`/`"medium"`/
+/// `"high"`/`"max"`) have no equivalent in `enable_thinking`'s plain
+/// on/off, so those (along with `think` being absent entirely) are left
+/// as a no-op: the template's own default applies, exactly as if this
+/// field didn't exist.
+fn think_to_chat_template_kwargs(think: &Option<serde_json::Value>) -> Option<serde_json::Value> {
+    match think {
+        Some(serde_json::Value::Bool(b)) => Some(serde_json::json!({ "enable_thinking": b })),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -375,6 +404,12 @@ struct OAIChatRequest {
     // falling back to llama-server's much more repetition-prone one.
     #[serde(skip_serializing_if = "Option::is_none")]
     repeat_penalty: Option<f32>,
+    // See think_to_chat_template_kwargs. Omitted entirely (rather than
+    // sent as `null`) when the caller didn't ask to override thinking, so
+    // the template's own default applies exactly as if this field never
+    // existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<serde_json::Value>,
 }
 
 /// Ollama's documented default for `repeat_penalty` (see
@@ -1632,6 +1667,7 @@ async fn handle_ollama_chat(
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
         repeat_penalty: opt_f64(&req.options, "repeat_penalty").or(Some(DEFAULT_REPEAT_PENALTY)),
+        chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
     };
     let model = req.model;
     stream_ollama(state.0.client.clone(), url, oai, move |content, thinking, done| {
@@ -1698,6 +1734,7 @@ async fn handle_ollama_generate(
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
         repeat_penalty: opt_f64(&req.options, "repeat_penalty").or(Some(DEFAULT_REPEAT_PENALTY)),
+        chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
     };
     let model = req.model;
     stream_ollama(state.0.client.clone(), url, oai, move |response, thinking, done| {
@@ -1992,6 +2029,8 @@ async fn handle_anthropic_messages(
         // The Anthropic Messages API has no repeat_penalty concept of its
         // own to read an override from — see DEFAULT_REPEAT_PENALTY.
         repeat_penalty: Some(DEFAULT_REPEAT_PENALTY),
+        // Nor a `think` override — see think_to_chat_template_kwargs.
+        chat_template_kwargs: None,
     };
 
     if req.stream {

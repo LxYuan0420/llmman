@@ -334,13 +334,11 @@ jobs:
       # doesn't silently pick up a build that changes behavior mid-flight;
       # bump LLAMA_CPP_RELEASE deliberately when a newer one is needed.
       # `matrix.llama-asset` is this OS/arch's release asset (the Windows
-      # one's a .zip, the other two .tar.gz — `tar -xf` auto-detects either
-      # on every OS this runs on: GNU tar (Linux) only ever sees its own
-      # .tar.gz here, and both macOS's and Windows' own bundled `tar` are
-      # libarchive-based `bsdtar`, which reads both formats). The
-      # ubuntu/macOS archives unpack into one llama-<tag> subdirectory; the
-      # Windows one doesn't — found dynamically below rather than hardcoding
-      # either layout.
+      # one's a .zip, the other two .tar.gz — extracted differently per
+      # OS below, see that step's own comment on why). The ubuntu/macOS
+      # archives unpack into one llama-<tag> subdirectory; the Windows one
+      # doesn't — found dynamically below rather than hardcoding either
+      # layout.
       - name: Install llama-server
         shell: bash
         env:
@@ -355,22 +353,25 @@ jobs:
           # already the plain POSIX-style path (`/c/Users/...`) Git Bash
           # itself uses throughout, on every OS this runs on.
           archive="$HOME/llama-cpp-archive"
-          # --retry: a plain -fsSL here failed once on a windows-2025 run
-          # with tar then rejecting the result ("This does not look like a
-          # tar archive") — i.e. curl exited 0 having written *something*,
-          # just not the actual asset; a transient CDN/proxy hiccup this
-          # can't distinguish from a permanent bad-URL failure ahead of
-          # time, so retry a few times before giving up either way. The
-          # explicit size/type print after is for if it fails again anyway
-          # — `tar`'s own error alone doesn't say whether curl came back
-          # empty, truncated, or with an HTML error page instead.
           curl -fsSL --retry 5 --retry-all-errors -o "$archive" \
             "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE}/${{ matrix.llama-asset }}"
-          ls -l "$archive"
-          file "$archive" || true
           dir="$HOME/llama-cpp"
           mkdir -p "$dir"
-          tar -xf "$archive" -C "$dir"
+          # Windows needs Expand-Archive, not tar -xf: confirmed against a
+          # real windows-2025 run that the .zip downloads correctly (right
+          # size, and `file` agrees it's a genuine zip) but Git for
+          # Windows' bundled tar.exe (bsdtar) still rejects it outright
+          # ("This does not look like a tar archive") — that build simply
+          # doesn't support the zip format tar/find/cargo's own automatic
+          # POSIX<->Windows path translation would otherwise make this a
+          # non-issue for. macOS's and Linux's own tar (bsdtar and GNU tar,
+          # respectively) both handle their own .tar.gz asset here fine.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            powershell -NoProfile -Command \
+              "Expand-Archive -LiteralPath '$(cygpath -w "$archive")' -DestinationPath '$(cygpath -w "$dir")' -Force"
+          else
+            tar -xf "$archive" -C "$dir"
+          fi
           # Exact names only (not a `llama-server*` glob): the Windows
           # archive also ships a sibling llama-server-impl.dll, which
           # a wildcard would just as happily match first.
