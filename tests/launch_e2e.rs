@@ -186,7 +186,22 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
         if start.elapsed() > timeout {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("{description} did not finish within {timeout:?} — likely a hang");
+            // Join the reader threads (rather than just discarding them)
+            // before panicking: killing the child closes its end of both
+            // pipes, so read_to_end on each should return promptly — and
+            // whatever the process printed before it got stuck is exactly
+            // what's needed to tell "genuinely still downloading/loading
+            // a large model" apart from "stuck in a real hang" from the
+            // outside, instead of a bare timeout message that can't
+            // distinguish either.
+            let stdout = stdout_thread.join().map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_else(|_| "<stdout reader thread panicked>".into());
+            let stderr = stderr_thread.join().map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_else(|_| "<stderr reader thread panicked>".into());
+            panic!(
+                "{description} did not finish within {timeout:?} — likely a hang\n\
+                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
         }
         std::thread::sleep(Duration::from_millis(200));
     };

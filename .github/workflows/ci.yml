@@ -355,8 +355,19 @@ jobs:
           # already the plain POSIX-style path (`/c/Users/...`) Git Bash
           # itself uses throughout, on every OS this runs on.
           archive="$HOME/llama-cpp-archive"
-          curl -fsSL -o "$archive" \
+          # --retry: a plain -fsSL here failed once on a windows-2025 run
+          # with tar then rejecting the result ("This does not look like a
+          # tar archive") — i.e. curl exited 0 having written *something*,
+          # just not the actual asset; a transient CDN/proxy hiccup this
+          # can't distinguish from a permanent bad-URL failure ahead of
+          # time, so retry a few times before giving up either way. The
+          # explicit size/type print after is for if it fails again anyway
+          # — `tar`'s own error alone doesn't say whether curl came back
+          # empty, truncated, or with an HTML error page instead.
+          curl -fsSL --retry 5 --retry-all-errors -o "$archive" \
             "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE}/${{ matrix.llama-asset }}"
+          ls -l "$archive"
+          file "$archive" || true
           dir="$HOME/llama-cpp"
           mkdir -p "$dir"
           tar -xf "$archive" -C "$dir"
