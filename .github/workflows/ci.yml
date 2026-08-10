@@ -352,7 +352,15 @@ jobs:
           # failed") — confirmed against a real windows-2025 run. $HOME is
           # already the plain POSIX-style path (`/c/Users/...`) Git Bash
           # itself uses throughout, on every OS this runs on.
-          archive="$HOME/llama-cpp-archive"
+          #
+          # The local filename keeps matrix.llama-asset's own extension
+          # (not a fixed generic name) — confirmed directly against a real
+          # windows-2025 run that Expand-Archive (see below) determines
+          # archive format purely from the filename extension, unlike
+          # tar/file, which sniff actual file content: an extension-less
+          # name downloaded and byte-for-byte verified as a real zip still
+          # got "is not a supported archive file format" from it.
+          archive="$HOME/$(basename "${{ matrix.llama-asset }}")"
           curl -fsSL --retry 5 --retry-all-errors -o "$archive" \
             "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE}/${{ matrix.llama-asset }}"
           dir="$HOME/llama-cpp"
