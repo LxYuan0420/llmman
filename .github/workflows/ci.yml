@@ -409,13 +409,25 @@ jobs:
             echo "LD_LIBRARY_PATH=$bindir" >> "$GITHUB_ENV"
           fi
 
+      # --target (even though every one of these is a *native* build, never
+      # a cross one): a windows-2025 run confirmed omitting it silently
+      # drops the RUSTFLAGS lld-link override below — the env var reaches
+      # the process (verified in that run's own step-env dump) but the
+      # final link still invoked MSVC's link.exe anyway, hitting the exact
+      # LNK1223 the `build` job's own comment documents lld-link as
+      # required to avoid. That job always passes --target explicitly;
+      # matching it here (rather than relying on implicit host-target
+      # resolution) is what actually makes RUSTFLAGS take effect.
       - name: Build llmman
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
+      # --target here too: has to match the Build llmman step above, or
+      # this would compile (and run) an entirely separate, independently-
+      # built copy under target/release/ instead of reusing it.
       - name: cargo test --test launch_e2e
-        run: cargo test --release --test launch_e2e -- --test-threads=1 --nocapture
+        run: cargo test --release --target ${{ matrix.target }} --test launch_e2e -- --test-threads=1 --nocapture
 
   # --------------------------------------------------------------------------
   # Release: attach binaries to GitHub Releases on tag push
