@@ -367,7 +367,25 @@ struct OAIChatRequest {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    // llama-server's own default (1.0) disables repetition penalty
+    // entirely — unlike Ollama, whose default is 1.1 (see
+    // DEFAULT_REPEAT_PENALTY's doc comment). Every caller below sends
+    // this explicitly rather than omitting it, so llmman's actual runtime
+    // behavior matches Ollama's documented default instead of silently
+    // falling back to llama-server's much more repetition-prone one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f32>,
 }
+
+/// Ollama's documented default for `repeat_penalty` (see
+/// docs/modelfile.mdx's PARAMETER table: "Default: 1.1"). llama-server's
+/// own built-in default is 1.0 — repetition penalty fully disabled —
+/// which measurably risks small/quantized models (observed firsthand with
+/// qwen3.5:0.8b's "thinking" mode) looping on the same handful of
+/// reasoning sentences indefinitely, since nothing then discourages the
+/// sampler from repeating exact prior tokens. Used as the fallback
+/// whenever a caller doesn't supply its own `options.repeat_penalty`.
+const DEFAULT_REPEAT_PENALTY: f32 = 1.1;
 
 #[derive(Debug, Deserialize)]
 struct OAIChunk {
@@ -1613,6 +1631,7 @@ async fn handle_ollama_chat(
         temperature: opt_f64(&req.options, "temperature"),
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
+        repeat_penalty: opt_f64(&req.options, "repeat_penalty").or(Some(DEFAULT_REPEAT_PENALTY)),
     };
     let model = req.model;
     stream_ollama(state.0.client.clone(), url, oai, move |content, thinking, done| {
@@ -1678,6 +1697,7 @@ async fn handle_ollama_generate(
         temperature: opt_f64(&req.options, "temperature"),
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
+        repeat_penalty: opt_f64(&req.options, "repeat_penalty").or(Some(DEFAULT_REPEAT_PENALTY)),
     };
     let model = req.model;
     stream_ollama(state.0.client.clone(), url, oai, move |response, thinking, done| {
@@ -1969,6 +1989,9 @@ async fn handle_anthropic_messages(
         temperature: req.temperature,
         top_p: req.top_p,
         max_tokens: req.max_tokens,
+        // The Anthropic Messages API has no repeat_penalty concept of its
+        // own to read an override from — see DEFAULT_REPEAT_PENALTY.
+        repeat_penalty: Some(DEFAULT_REPEAT_PENALTY),
     };
 
     if req.stream {
