@@ -230,20 +230,29 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
 /// `--think false`: qwen3.5's thinking mode has been observed (directly,
 /// against a real windows-2025/macos-15 run — see this repo's own git
 /// history) to occasionally degenerate into repeating the same handful of
-/// reasoning sentences (or even just one repeated token) indefinitely
-/// instead of ever reaching an answer, hanging this warm-up for the
-/// full `TIMEOUT` and poisoning `WARM` for every other test in the same
-/// run. That failure mode lives entirely inside the "Thinking:" block
-/// this flag skips outright — disabling it here removes the surface area
-/// for it, in the one call this suite fully controls the shape of. The
-/// three real per-integration launches below don't get this same
-/// treatment: they exercise real third-party clients exactly as a real
-/// user would run them, unable to pass a flag those clients don't
+/// reasoning sentences indefinitely instead of ever reaching an answer,
+/// hanging this warm-up for the full `TIMEOUT` and poisoning `WARM` for
+/// every other test in the same run. That failure mode lives entirely
+/// inside the "Thinking:" block this flag skips outright.
+///
+/// `--num-predict 64`: disabling thinking alone turned out not to be
+/// enough — a *second*, real windows-2025 run (this one with `--think
+/// false` already in effect) still hung the full `TIMEOUT`, this time
+/// repeating a single token in the actual answer instead of inside a
+/// thinking block. Nothing about *why* a small quantized model's sampling
+/// might degenerate is reliably preventable from here; a hard ceiling on
+/// how many tokens it's even allowed to generate is. 64 is generous for
+/// this file's own PROMPT (a literal one-word answer) while still capping
+/// a worst-case degenerate run at a few seconds, not `TIMEOUT`'s full 600.
+///
+/// Neither flag is used for the three real per-integration launches
+/// below: they exercise real third-party clients exactly as a real user
+/// would run them, unable to pass either flag those clients don't
 /// themselves expose.
 fn warm_model() {
     WARM.call_once(|| {
         let mut cmd = Command::new(llmman_bin());
-        cmd.arg("run").arg(MODEL).arg("--think").arg("false").arg(PROMPT);
+        cmd.arg("run").arg(MODEL).arg("--think").arg("false").arg("--num-predict").arg("64").arg(PROMPT);
         let output = spawn_with_timeout(cmd, TIMEOUT, "llmman run (model warm-up)");
         assert!(
             output.status.success(),

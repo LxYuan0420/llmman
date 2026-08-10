@@ -40,8 +40,28 @@ pub struct RunArgs {
     /// model's own template default in effect) if not passed at all.
     #[arg(long)]
     pub think: Option<bool>,
+    /// Forwarded as `options.num_predict` (Ollama's own name for
+    /// llama-server's `max_tokens` — see opt_u32 in cmd::serve) on every
+    /// request this sends: a hard ceiling on how many tokens a single
+    /// reply may generate, regardless of *why* it might otherwise run
+    /// away (a real, no-stopping-condition-hit degenerate loop, observed
+    /// directly with qwen3.5:0.8b even with `--think false` and a
+    /// repeat_penalty already in effect — see this repo's own git history
+    /// — is not reliably preventable any other way). Omitted (no ceiling
+    /// at all, matching Ollama's own num_predict default of -1) if not
+    /// passed.
+    #[arg(long)]
+    pub num_predict: Option<u32>,
     #[arg(value_name = "PROMPT", trailing_var_arg = true, allow_hyphen_values = true)]
     pub prompt: Vec<String>,
+}
+
+/// Per-request knobs `chat_submit`'s every caller in this file threads
+/// through unchanged from `RunArgs` — see `RunArgs::think`/`num_predict`.
+#[derive(Debug, Clone, Copy, Default)]
+struct ChatOptions {
+    think: Option<bool>,
+    num_predict: Option<u32>,
 }
 
 pub fn run(args: &RunArgs) -> anyhow::Result<()> {
@@ -80,7 +100,7 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     let interactive = prompt.is_empty() && io::stdin().is_terminal();
 
     if interactive {
-        run_interactive_tty(&model, args.think)
+        run_interactive_tty(&model, ChatOptions { think: args.think, num_predict: args.num_predict })
     } else {
         let p = if prompt.is_empty() {
             let mut s = String::new();
@@ -99,7 +119,7 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
             // works identically against llmman or a real Ollama install
             // either way (both expose /api/chat).
             let client = chat_client()?;
-            chat_submit(&client, &model, &mut Vec::new(), p, args.think)?;
+            chat_submit(&client, &model, &mut Vec::new(), p, ChatOptions { think: args.think, num_predict: args.num_predict })?;
         }
         Ok(())
     }
@@ -138,6 +158,14 @@ struct ChatReq<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     think: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<ChatReqOptions>,
+}
+
+#[derive(Serialize)]
+struct ChatReqOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_predict: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -152,15 +180,15 @@ struct ChatChunk {
 // Interactive — TTY path
 // ---------------------------------------------------------------------------
 
-fn run_interactive_tty(model: &str, think: Option<bool>) -> anyhow::Result<()> {
+fn run_interactive_tty(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        run_interactive_unix(model, think)
+        run_interactive_unix(model, opts)
     }
     #[cfg(not(unix))]
     {
         // Windows fallback: basic cooked-mode loop
-        run_interactive_cooked(model, think)
+        run_interactive_cooked(model, opts)
     }
 }
 
@@ -169,7 +197,7 @@ fn run_interactive_tty(model: &str, think: Option<bool>) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-fn run_interactive_unix(model: &str, think: Option<bool>) -> anyhow::Result<()> {
+fn run_interactive_unix(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
     use unix_readline::Readline;
 
     let client = chat_client()?;
@@ -228,7 +256,7 @@ fn run_interactive_unix(model: &str, think: Option<bool>) -> anyhow::Result<()> 
                 let full = std::mem::take(buf).trim_end_matches('\n').to_string();
                 multiline = None;
                 if !full.trim().is_empty() {
-                    chat_submit(&client, model, &mut messages, full, think)?;
+                    chat_submit(&client, model, &mut messages, full, opts)?;
                 }
             } else {
                 buf.push_str(&line);
@@ -259,7 +287,7 @@ fn run_interactive_unix(model: &str, think: Option<bool>) -> anyhow::Result<()> 
             if let Some(closed) = inner.strip_suffix("\"\"\"") {
                 let content = closed.to_string();
                 if !content.trim().is_empty() {
-                    chat_submit(&client, model, &mut messages, content, think)?;
+                    chat_submit(&client, model, &mut messages, content, opts)?;
                 }
             } else {
                 multiline = Some(inner.to_string() + "\n");
@@ -268,7 +296,7 @@ fn run_interactive_unix(model: &str, think: Option<bool>) -> anyhow::Result<()> 
         }
 
         if !line.trim().is_empty() {
-            chat_submit(&client, model, &mut messages, line, think)?;
+            chat_submit(&client, model, &mut messages, line, opts)?;
         }
     }
 
@@ -283,13 +311,19 @@ fn chat_submit(
     model: &str,
     messages: &mut Vec<Msg>,
     content: String,
-    think: Option<bool>,
+    opts: ChatOptions,
 ) -> anyhow::Result<()> {
     messages.push(Msg { role: "user".into(), content, thinking: None });
 
     let resp = client
         .post(&format!("{SERVER}/api/chat"))
-        .json(&ChatReq { model, messages, stream: true, think })
+        .json(&ChatReq {
+            model,
+            messages,
+            stream: true,
+            think: opts.think,
+            options: opts.num_predict.map(|n| ChatReqOptions { num_predict: Some(n) }),
+        })
         .send()
         .context("connect to llmman serve")?;
 
@@ -577,7 +611,7 @@ mod unix_readline {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-fn run_interactive_cooked(model: &str, think: Option<bool>) -> anyhow::Result<()> {
+fn run_interactive_cooked(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
     let client = chat_client()?;
     let mut messages: Vec<Msg> = Vec::new();
     use std::io::BufRead;
@@ -597,7 +631,7 @@ fn run_interactive_cooked(model: &str, think: Option<bool>) -> anyhow::Result<()
             _ => {}
         }
         if !line.trim().is_empty() {
-            chat_submit(&client, model, &mut messages, line, think)?;
+            chat_submit(&client, model, &mut messages, line, opts)?;
         }
     }
     Ok(())
