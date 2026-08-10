@@ -29,6 +29,18 @@ tokio      = { version = "1", features = ["full"] }
 reqwest    = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls", "http2", "charset"] }
 futures    = "0.3"
 indicatif  = "0.18"
+# `llmman sign` — cosign-compatible Sigstore signing (keyless via Fulcio +
+# Rekor, or key-based). `sigstore` pulls in its own copy of reqwest
+# (0.13, vs. the 0.12 above) since the two aren't semver-compatible yet;
+# that's an accepted, harmless duplication rather than vendoring Sigstore's
+# client/crypto code ourselves.
+sigstore              = { version = "0.14", default-features = false, features = ["sign", "sigstore-trust-root", "rustls-tls"] }
+sigstore_protobuf_specs = "0.5"
+p256       = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+ecdsa      = "0.16"
+pkcs8      = { version = "0.10", features = ["pem"] }
+signature  = "3.0"
+webbrowser = "1.0"
 
 [features]
 default = ["docker"]

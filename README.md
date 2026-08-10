@@ -17,6 +17,7 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 | `rm`      | Remove a local image |
 | `tag`     | Create a new local tag pointing to an existing image |
 | `inspect` | Show the manifest of a local or remote image |
+| `sign`    | Sign an image with a cosign-compatible Sigstore signature |
 | `login`   | Log in to a container registry |
 | `logout`  | Log out from a container registry |
 
@@ -40,6 +41,29 @@ llmman transfer hf.co/unsloth/Qwen3.5-0.8B-GGUF registry.example.com/owner/model
 Any source `llmman pull` understands (an OCI registry, `hf://`, `ms://`,
 `ngc://`, `s3://`, `gs://`, ...) can be paired with any OCI registry
 destination.
+
+### Sign a model
+
+Attach a [cosign](https://github.com/sigstore/cosign)-compatible
+[Sigstore](https://www.sigstore.dev/) signature to a model, as an OCI 1.1
+*referrer* of its manifest — keyless by default (Fulcio certificate + public
+Rekor transparency log):
+
+```
+llmman sign registry.example.com/owner/model:latest --remote
+```
+
+or with a private key, fully offline:
+
+```
+llmman sign registry.example.com/owner/model:latest --remote --key cosign.key
+```
+
+Without `--remote`, `llmman sign` signs an image already in the local store
+instead of a registry (`llmman inspect` still works locally the same way).
+Keyless signing resolves an OIDC identity token from `--identity-token`,
+`--identity-token-file`, an ambient CI provider (currently GitHub Actions), or
+an interactive browser login, in that order.
 
 ### Serve
 
@@ -79,7 +103,7 @@ Or with any Ollama, Anthropic or OpenAI-compatible client.
 
 Models are loaded on demand. Each model gets its own `llama-server` subprocess on a random loopback port; subsequent requests reuse the running process.
 
-Short names work with all commands: `pull`, `push`, `transfer`, `rm`, `tag`, `inspect`, and `serve`.
+Short names work with all commands: `pull`, `push`, `transfer`, `rm`, `tag`, `inspect`, `sign`, and `serve`.
 
 ## Store location
 
