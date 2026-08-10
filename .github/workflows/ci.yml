@@ -198,48 +198,59 @@ jobs:
   # --------------------------------------------------------------------------
   # E2E: `llmman launch <claude|opencode|codex> --model qwen3.5:0.8b`
   # (tests/launch_e2e.rs) against a real `llmman serve`, a real pulled model,
-  # a real llama-server, and the real third-party CLIs — not mocks. One
-  # runner per OS family, not the full release-build matrix's every
-  # architecture (e.g. no aarch64-linux or Windows arm64 entry here):
-  # installing a matching llama-server release plus every integration CLI
-  # across every architecture too isn't worth the added CI time/flakiness
-  # for what's fundamentally a smoke test of the launch/env/config plumbing
-  # (see tests/launch_e2e.rs's own doc comment for what each test actually
-  # guards against) — one representative runner per OS is enough to catch
-  # an OS-specific regression (path/shell/PATHEXT handling, line endings,
-  # ...) without tripling the download/install cost for every architecture
-  # variant of it too.
+  # a real llama-server, and the real third-party CLIs — not mocks. Mirrors
+  # the `build` job's own 5-target matrix exactly (same runners, same
+  # msvc-arch/rustflags choices), so the launch/env/config plumbing this
+  # actually exercises gets checked on every platform/architecture llmman
+  # ships a binary for, not just a subset of them.
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/opencode/codex) — ${{ matrix.os }}
+    name: E2E (launch claude/opencode/codex) — ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: linux
+          # ── Linux x86_64 ──────────────────────────────────────────────────
+          - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
             go-os: linux
             llama-asset: llama-b10293-bin-ubuntu-x64.tar.gz
 
-          - os: macos
+          # ── Linux aarch64 ─────────────────────────────────────────────────
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            go-os: linux
+            llama-asset: llama-b10293-bin-ubuntu-arm64.tar.gz
+
+          # ── macOS aarch64 (Apple Silicon) ─────────────────────────────────
+          - target: aarch64-apple-darwin
             runner: macos-15
-            target: aarch64-apple-darwin
             go-os: darwin
             llama-asset: llama-b10293-bin-macos-arm64.tar.gz
 
+          # ── Windows x86_64 ────────────────────────────────────────────────
           # lld-link, not MSVC link.exe — see the `build` job's own comment
           # on why (same CGO-produced-object-format issue, native build or
-          # not). Set as CARGO_TARGET_..._LINKER (not just RUSTFLAGS) — see
-          # the Build llmman step's own comment on why both are set.
-          - os: windows
+          # not).
+          - target: x86_64-pc-windows-msvc
             runner: windows-2025
-            target: x86_64-pc-windows-msvc
             go-os: windows
             llama-asset: llama-b10293-bin-win-cpu-x64.zip
+            msvc-arch: amd64
             rustflags: "-C linker=lld-link"
+
+          # ── Windows aarch64 ───────────────────────────────────────────────
+          # rustflags empty (MSVC-native link.exe, not lld-link) — see the
+          # `build` job's own comment on why this one architecture is the
+          # opposite of the x86_64 Windows entry just above.
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            go-os: windows
+            llama-asset: llama-b10293-bin-win-cpu-arm64.zip
+            msvc-arch: arm64
+            rustflags: ""
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -252,28 +263,16 @@ jobs:
 
       # targets: matches the build job's own Set up Rust step — needed
       # there for genuinely cross-compiled targets, harmless here where
-      # every target is actually native, kept only so this job has no
-      # unexplained difference left from that one to chase down if
-      # something like the lld-link issue below ever resurfaces.
+      # every target is actually native.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
 
-      # A fresh key suffix (v2): the very first windows-2025 run to reach
-      # this point hit the lld-link issue below, and every retry since —
-      # across several unrelated fixes, meanwhile — kept hitting the exact
-      # same failure despite explicitly matching the build job's own
-      # (already-working) RUSTFLAGS/target/PATH setup byte-for-byte. Never
-      # conclusively root-caused; ruling out a stale cached build (from
-      # that very first failing attempt) persisting across retries under
-      # the same key was the last plausible remaining explanation once
-      # every other difference between this job and the build job's own
-      # working one had been eliminated.
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          key: e2e-v2-${{ matrix.target }}
+          key: e2e-${{ matrix.target }}
 
       - name: Cache Go modules
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -285,11 +284,15 @@ jobs:
           restore-keys: go-${{ matrix.go-os }}-
 
       # ── Windows: set up MSVC (needed for CGO, same as the `build` job) ────
+      # arch: matrix-driven (not a hardcoded amd64) — the ARM64 runner
+      # needs the ARM64 toolchain, or CGO compiling Go's ARM64 runtime
+      # stubs would use the wrong assembler (see the `build` job's own
+      # comment on its identical msvc-arch matrix field).
       - name: Set up MSVC (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
-          arch: amd64
+          arch: ${{ matrix.msvc-arch }}
 
       # ── Linux: C compiler (always needed for CGO) + llama-server's own
       # runtime shared-library deps. macOS/Windows need neither: Xcode's
@@ -427,37 +430,28 @@ jobs:
             echo "LD_LIBRARY_PATH=$bindir" >> "$GITHUB_ENV"
           fi
 
-      # --target (even though every one of these is a *native* build, never
-      # a cross one): matches the build job's own (already-working)
-      # invocation exactly, on general principle — though on its own, on a
-      # real windows-2025 run, it did *not* turn out to be what made
-      # RUSTFLAGS's lld-link override actually take effect (see below).
-      #
-      # CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER, not just RUSTFLAGS:
-      # multiple real windows-2025 runs kept invoking MSVC's link.exe and
-      # hitting the exact LNK1223 lld-link is required to avoid, *despite*
-      # RUSTFLAGS=-C linker=lld-link reaching the process correctly
-      # (verified directly in each run's own step-env dump) and every
-      # other input (PATH, --target, toolchain setup) matching the build
-      # job's own working invocation byte-for-byte. Never conclusively
-      # root-caused (a stale cache under this job's own key, from the
-      # first attempt that predates any of this, was the last plausible
-      # explanation — see the cache step's own comment). This more
-      # specific, higher-precedence env var is set alongside RUSTFLAGS as
-      # a second, independent way of asking for the same linker, in case
-      # whatever RUSTFLAGS was silently losing to doesn't affect this one
-      # the same way.
+      # --target: matches the build job's own invocation (every one of
+      # these is a native build, but explicit --target keeps the output
+      # path/build-plan identical to that job's, rather than relying on
+      # implicit host-target resolution).
       - name: Build llmman
         run: cargo build --release --target ${{ matrix.target }}
         env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: ${{ runner.os == 'Windows' && 'lld-link' || '' }}
           RUSTFLAGS: ${{ matrix.rustflags }}
 
-      # --target here too: has to match the Build llmman step above, or
-      # this would compile (and run) an entirely separate, independently-
-      # built copy under target/release/ instead of reusing it.
+      # --target here too, for the same reason as the Build llmman step —
+      # and RUSTFLAGS needs repeating here too, not just there: this step
+      # compiles its own separate test binary (tests/launch_e2e.rs), which
+      # links against the exact same Go-shim-produced llmman_shim.lib the
+      # main binary does, and hit that same LNK1223 lld-link exists to
+      # avoid (see the `build` job's own comment) the first several times
+      # this job's Windows entry ran — root-caused to exactly this: the
+      # env was present on the Build llmman step above, but this step
+      # never inherits another step's `env:` block, and never had its own.
       - name: cargo test --test launch_e2e
         run: cargo test --release --target ${{ matrix.target }} --test launch_e2e -- --test-threads=1 --nocapture
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
   # --------------------------------------------------------------------------
   # Release: attach binaries to GitHub Releases on tag push
