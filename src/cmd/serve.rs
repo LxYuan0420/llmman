@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context};
 use axum::body::{Body, Bytes};
@@ -678,48 +678,87 @@ async fn wait_for_ready(client: &Client, port: u16) -> anyhow::Result<()> {
     }
 }
 
-/// Serializes every call into the Go shim's `llmman_pull`/`llmman_push` (see
-/// `crate::ffi::pull`/`push`) across this whole process.
+/// Per-model registry of locks serializing every call into the Go shim's
+/// `llmman_pull`/`llmman_push` (see `crate::ffi::pull`/`push`) for a given
+/// model reference — replacing what used to be one `PULL_LOCK` mutex
+/// shared by every model in the process.
 ///
-/// go-shim/progress_state.go's `progressState` is explicitly documented as
-/// tracking only one transfer at a time — `llmman_pull`/`llmman_push` each
-/// reset it on entry — but nothing on the Rust side ever enforced that.
-/// Three call sites can independently decide "not in store, pull it" for
-/// the same model at once (this fallback in `ensure_model`, `handle_pull`,
-/// and — since `launch` started calling `daemon::ensure_model_pulled`
-/// itself — a concurrent client's own explicit `/api/pull`), and without
-/// this lock, two such calls racing means: two redundant full downloads of
-/// the same multi-GB blob, and a progress bar reading numbers that jump
-/// between whichever transfer happens to be updating the shared state,
-/// occasionally freezing solid (stuck showing an earlier, unrelated
-/// transfer's now-stale total/completed) even while the real download
-/// underneath is still moving.
-///
-/// Held only around the actual FFI call (see `pull_serialized` /
-/// `handle_push`'s task) — never across the cheap "is it already in the
-/// store" check that runs before it — so a second caller that loses the
-/// race simply blocks here until the first finishes, and only then
-/// re-checks the store (see `pull_serialized`) instead of unconditionally
-/// re-downloading everything itself.
-static PULL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// go-shim/progress_state.go's `progressState` used to track only one
+/// transfer at a time process-wide; it's now keyed per model reference
+/// (see that file's own doc comment), so two *different* models pulling
+/// or pushing at once no longer interleave or corrupt each other's
+/// progress numbers the way they would have under the old global lock —
+/// only concurrent operations on the *same* model reference still need to
+/// be serialized. Three call sites can independently decide "not in
+/// store, pull it" for the same model at once (this fallback in
+/// `ensure_model`, `handle_pull`, and — since `launch` started calling
+/// `daemon::ensure_model_pulled` itself — a concurrent client's own
+/// explicit `/api/pull`), and without a per-model lock, two such calls
+/// racing for the *same* model still means a redundant full download of
+/// the same multi-GB blob. See also go-shim's `blobFetchGroup`
+/// (shared_oci.go), which separately deduplicates two *different* models'
+/// concurrent pulls that happen to share an underlying blob — a case this
+/// per-model registry can't catch on its own since it only locks by
+/// reference, not by content digest.
+static MODEL_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-/// Pulls `model` into `layout_dir` if (still, after acquiring `PULL_LOCK`)
-/// missing from the local store — shared by `ensure_model`'s fallback and
-/// `handle_pull` so both funnel through the same single-flight check
-/// instead of each deciding "not present" from a snapshot taken before
-/// waiting on the lock, then redundantly re-pulling once it's their turn.
+/// Returns (creating if absent) the lock serializing pull/push calls for
+/// `model`. Cheap and non-blocking: it only ever holds `MODEL_LOCKS`'s own
+/// short-lived std mutex to look up or insert the entry, never the
+/// per-model tokio mutex itself.
+fn model_lock(model: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = MODEL_LOCKS.lock().unwrap();
+    locks
+        .entry(model.to_owned())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Drops model's entry from `MODEL_LOCKS` once nobody else appears to be
+/// waiting on it, so a long-running daemon doesn't accumulate one entry
+/// per distinct model it has ever pulled/pushed. Called after releasing
+/// our own clone of the lock: at that point a strong count of 1 means
+/// only `MODEL_LOCKS` itself still references it (safe to remove), while
+/// a higher count means another caller is already holding or waiting on
+/// this same Arc and should keep using it — removing the map entry in
+/// that case wouldn't break anything (that caller's clone stays valid
+/// independent of the map), it would just mean the *next* new caller for
+/// this model gets handed a fresh, unrelated lock instead of piggybacking
+/// on the map's copy of this one, so it's simplest to just leave it.
+fn release_model_lock(model: &str) {
+    let mut locks = MODEL_LOCKS.lock().unwrap();
+    if let Some(arc) = locks.get(model) {
+        if Arc::strong_count(arc) <= 1 {
+            locks.remove(model);
+        }
+    }
+}
+
+/// Pulls `model` into `layout_dir` if (still, after acquiring model's own
+/// lock) missing from the local store — shared by `ensure_model`'s
+/// fallback and `handle_pull` so both funnel through the same
+/// single-flight check instead of each deciding "not present" from a
+/// snapshot taken before waiting on the lock, then redundantly re-pulling
+/// once it's their turn.
 ///
 /// Must be called from a blocking context (`spawn_blocking`): blocks the
-/// current thread on `PULL_LOCK`, not just this async task.
+/// current thread on model's lock, not just this async task.
 fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<()> {
-    let _guard = PULL_LOCK.blocking_lock();
-    if OciStore::open(store_path).and_then(|s| s.find(model)).is_ok() {
-        return Ok(()); // someone else already pulled it while we waited
-    }
-    let layout_dir = store_path
-        .to_str()
-        .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
-    crate::ffi::pull(model, layout_dir)
+    let lock = model_lock(model);
+    let result = (|| {
+        let _guard = lock.blocking_lock();
+        if OciStore::open(store_path).and_then(|s| s.find(model)).is_ok() {
+            return Ok(()); // someone else already pulled it while we waited
+        }
+        let layout_dir = store_path
+            .to_str()
+            .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
+        crate::ffi::pull(model, layout_dir)
+    })();
+    drop(lock);
+    release_model_lock(model);
+    result
 }
 
 /// Resolve a user-supplied model ref to the canonical reference stored in the
@@ -1429,15 +1468,23 @@ async fn handle_push(
         return (StatusCode::NOT_FOUND, Json(body)).into_response();
     }
 
-    // See PULL_LOCK's doc comment: pushes share the same Go-side
-    // progressState as pulls, so they need the same mutual exclusion.
+    // See MODEL_LOCKS' doc comment: a push shares the same Go-side
+    // progressState entry (keyed by this model reference) as a pull of
+    // the same model, so they need the same per-model mutual exclusion —
+    // but a push of one model no longer blocks a pull/push of another.
     let model_for_task = model.clone();
     let push_task = tokio::task::spawn_blocking(move || {
-        let _guard = PULL_LOCK.blocking_lock();
-        let layout_dir = store_path
-            .to_str()
-            .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
-        crate::ffi::push(layout_dir, &model_for_task)
+        let lock = model_lock(&model_for_task);
+        let result = (|| {
+            let _guard = lock.blocking_lock();
+            let layout_dir = store_path
+                .to_str()
+                .ok_or_else(|| anyhow!("store path is not valid UTF-8"))?;
+            crate::ffi::push(layout_dir, &model_for_task)
+        })();
+        drop(lock);
+        release_model_lock(&model_for_task);
+        result
     });
 
     stream_ffi_progress(model, "push", "retrieving manifest", push_task).into_response()
@@ -1445,8 +1492,8 @@ async fn handle_push(
 
 /// Runs `task` (a blocking FFI call already dispatched via spawn_blocking)
 /// to completion, streaming an immediate `first_status` line, then polling
-/// `ffi::progress()` every 200ms (matching the Go shim's own mpb refresh
-/// rate) until the task finishes, then a final `{"status": "success"}` or
+/// `ffi::progress(&model)` every 200ms (matching the Go shim's own mpb
+/// refresh rate) until the task finishes, then a final `{"status": "success"}` or
 /// `{"error": ...}` line. Shared by handle_pull and handle_push.
 ///
 /// Each polled line includes real `total`/`completed` byte counts (mirroring
@@ -1485,7 +1532,7 @@ fn stream_ffi_progress(
                         Some((Bytes::from(line + "\n"), None))
                     }
                     _ = sleep(Duration::from_millis(200)) => {
-                        let line = match crate::ffi::progress() {
+                        let line = match crate::ffi::progress(&model) {
                             Ok(p) if p.total > 0 => serde_json::json!({
                                 "status": if p.status.is_empty() { format!("{verb}ing {model}") } else { p.status },
                                 "total": p.total.max(0),

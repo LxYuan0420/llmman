@@ -1,6 +1,6 @@
-// progress_state.go – a process-wide byte-level progress snapshot for
-// whichever pull/push is currently in flight, polled by the Rust daemon
-// (cmd::serve) via llmman_progress.
+// progress_state.go – a byte-level progress snapshot for each pull/push
+// currently in flight, polled by the Rust daemon (cmd::serve) via
+// llmman_progress.
 //
 // `llmman transfer`'s mpb bars (shared_oci.go's newProgressPool/addLayerBar)
 // already show up on an interactive terminal for free, because their FFI
@@ -16,12 +16,14 @@
 // already being drawn (uselessly) into the daemon's log, just delivered a
 // second way.
 //
-// Only one pull/push is tracked at a time: llmman_pull/llmman_push each
-// reset this on entry (see their own doc comments), so two requests
-// in flight at once would interleave their numbers. That matches every
-// other piece of shared daemon state (e.g. the OCI store's own advisory
-// locks) — llmman's daemon is designed around one interactive client at a
-// time, not concurrent multi-tenant transfers.
+// One entry per model reference: the daemon serializes concurrent
+// pulls/pushes of the *same* model reference (see Rust's per-model lock
+// registry in serve.rs), but two different models now pull/push fully in
+// parallel, so a single global snapshot (as this used to be) would let
+// their numbers interleave and corrupt each other exactly the way a
+// single global lock was once needed to prevent. Keying by reference
+// instead means each pull/push's own NDJSON stream only ever sees its own
+// numbers, however many others are running alongside it.
 package main
 
 /*
@@ -34,56 +36,101 @@ import (
 	"sync"
 )
 
-var progressState struct {
-	mu        sync.Mutex
+type progressEntry struct {
 	status    string
 	total     int64
 	completed int64
 }
 
+var progressState struct {
+	mu      sync.Mutex
+	entries map[string]*progressEntry
+}
+
+// entryLocked returns key's entry, creating it if absent. Callers must
+// hold progressState.mu. An empty key means "don't track" (used by
+// llmman_transfer's call paths, which share the same helpers as
+// pull/push — see addLayerBar/proxyOrNop — but are polled a different
+// way, per this file's own doc comment): every function below is a no-op
+// for key == "" rather than accumulating entries nobody will ever poll
+// or clean up.
+func entryLocked(key string) *progressEntry {
+	if progressState.entries == nil {
+		progressState.entries = make(map[string]*progressEntry)
+	}
+	e, ok := progressState.entries[key]
+	if !ok {
+		e = &progressEntry{}
+		progressState.entries[key] = e
+	}
+	return e
+}
+
 // progressReset clears any leftover total/completed from a previous
-// pull/push and sets the initial status text — called once, right at the
-// top of llmman_pull/llmman_push, before any bar/download work begins.
-func progressReset(status string) {
+// pull/push of the same key and sets the initial status text — called
+// once, right at the top of llmman_pull/llmman_push, before any bar/
+// download work begins.
+func progressReset(key, status string) {
+	if key == "" {
+		return
+	}
 	progressState.mu.Lock()
 	defer progressState.mu.Unlock()
-	progressState.status = status
-	progressState.total = 0
-	progressState.completed = 0
+	if progressState.entries == nil {
+		progressState.entries = make(map[string]*progressEntry)
+	}
+	progressState.entries[key] = &progressEntry{status: status}
 }
 
 // progressSetStatus updates only the status text (e.g. "pulling manifest"
 // -> "pulling"), leaving the running totals untouched.
-func progressSetStatus(status string) {
+func progressSetStatus(key, status string) {
+	if key == "" {
+		return
+	}
 	progressState.mu.Lock()
 	defer progressState.mu.Unlock()
-	progressState.status = status
+	entryLocked(key).status = status
 }
 
-// progressAddTotal adjusts the running total by delta bytes — positive
+// progressAddTotal adjusts key's running total by delta bytes — positive
 // when a new layer/blob's size becomes known and it's about to be
 // downloaded/uploaded, negative to undo that once a blob turns out to
 // already exist at the destination and no bytes will actually move for it
 // (see backend_podman.go's ProgressEventSkipped handling).
-func progressAddTotal(delta int64) {
-	if delta == 0 {
+func progressAddTotal(key string, delta int64) {
+	if key == "" || delta == 0 {
 		return
 	}
 	progressState.mu.Lock()
 	defer progressState.mu.Unlock()
-	progressState.total += delta
+	entryLocked(key).total += delta
 }
 
-// progressAddCompleted adds delta bytes to the running completed count.
+// progressAddCompleted adds delta bytes to key's running completed count.
 // Called from the same places that already increment an mpb bar (see
 // proxyOrNop in shared_oci.go), so the two stay in lockstep.
-func progressAddCompleted(delta int64) {
-	if delta <= 0 {
+func progressAddCompleted(key string, delta int64) {
+	if key == "" || delta <= 0 {
 		return
 	}
 	progressState.mu.Lock()
 	defer progressState.mu.Unlock()
-	progressState.completed += delta
+	entryLocked(key).completed += delta
+}
+
+// progressDone removes key's entry once its pull/push has finished
+// (successfully or not) — called via defer from llmman_pull/llmman_push,
+// so a long-running daemon doesn't accumulate one stale entry per
+// distinct model ref it has ever pulled/pushed. Safe to call for a key
+// that was never tracked (empty key, or a poll raced past completion).
+func progressDone(key string) {
+	if key == "" {
+		return
+	}
+	progressState.mu.Lock()
+	defer progressState.mu.Unlock()
+	delete(progressState.entries, key)
 }
 
 // progressSnapshot is the JSON shape returned (as the `data` field of the
@@ -94,18 +141,22 @@ type progressSnapshot struct {
 	Completed int64  `json:"completed"`
 }
 
-// llmman_progress returns the current pull/push's byte-level progress
+// llmman_progress returns key's current pull/push byte-level progress
 // snapshot — polled by cmd::serve roughly every 200ms while a pull/push
-// task is in flight. See progressState's own doc comment for why this
-// exists.
+// task for that same key is in flight. See progressState's own doc
+// comment for why this exists. A key with no tracked entry (not yet
+// started, or already finished and cleaned up via progressDone) returns a
+// zero-value snapshot rather than an error — cmd::serve's poll loop
+// treats that as "nothing to report yet" and falls back to plain status
+// text.
 //
 //export llmman_progress
-func llmman_progress() *C.char {
+func llmman_progress(cKey *C.char) *C.char {
+	key := C.GoString(cKey)
 	progressState.mu.Lock()
-	snap := progressSnapshot{
-		Status:    progressState.status,
-		Total:     progressState.total,
-		Completed: progressState.completed,
+	var snap progressSnapshot
+	if e, ok := progressState.entries[key]; ok {
+		snap = progressSnapshot{Status: e.status, Total: e.total, Completed: e.completed}
 	}
 	progressState.mu.Unlock()
 	data, _ := json.Marshal(snap)

@@ -246,7 +246,7 @@ func pushLazy(
 // pushLazy can abort it on a copy failure) plus a cleanup func that closes
 // both the proxy reader and r itself (if r is an io.Closer) — for use as
 // pushLazy's open callback.
-func withBar(r io.Reader, newBar func() *mpb.Bar) (io.Reader, *mpb.Bar, func()) {
+func withBar(r io.Reader, newBar func() *mpb.Bar, progressKey string) (io.Reader, *mpb.Bar, func()) {
 	var bar *mpb.Bar
 	closers := []io.Closer{}
 	if rc, ok := r.(io.Closer); ok {
@@ -254,7 +254,7 @@ func withBar(r io.Reader, newBar func() *mpb.Bar) (io.Reader, *mpb.Bar, func()) 
 	}
 	if newBar != nil {
 		bar = newBar()
-		proxyRC := proxyOrNop(bar, r)
+		proxyRC := proxyOrNop(bar, r, progressKey)
 		r = proxyRC
 		closers = append(closers, proxyRC)
 	}
@@ -269,13 +269,13 @@ func withBar(r io.Reader, newBar func() *mpb.Bar) (io.Reader, *mpb.Bar, func()) 
 // pusher, reporting progress via newBar — called, and its resulting bar
 // wrapped around the read, only if the blob isn't already at the
 // destination (see pushLazy). Pass nil for no progress reporting.
-func pushBlob(ctx context.Context, pusher remotes.Pusher, provider *ociProvider, desc ocispec.Descriptor, newBar func() *mpb.Bar) (alreadyExists bool, err error) {
+func pushBlob(ctx context.Context, pusher remotes.Pusher, provider *ociProvider, desc ocispec.Descriptor, newBar func() *mpb.Bar, progressKey string) (alreadyExists bool, err error) {
 	return pushLazy(ctx, pusher, desc, func() (io.Reader, *mpb.Bar, func(), error) {
 		ra, err := provider.ReaderAt(ctx, desc)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		r, bar, cleanup := withBar(io.NewSectionReader(ra, 0, ra.Size()), newBar)
+		r, bar, cleanup := withBar(io.NewSectionReader(ra, 0, ra.Size()), newBar, progressKey)
 		return r, bar, func() { cleanup(); ra.Close() }, nil
 	})
 }
@@ -304,7 +304,11 @@ func pushStreamLazy(ctx context.Context, pusher remotes.Pusher, desc ocispec.Des
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		r, bar, cleanup := withBar(rc, newBar)
+		// pushStreamLazy is only used by llmman transfer (streamed
+		// HuggingFace/OCI to a registry, never through the daemon's
+		// per-model-keyed progress poll — see progress_state.go), so
+		// there's no meaningful key to credit these bytes to.
+		r, bar, cleanup := withBar(rc, newBar, "")
 		return r, bar, cleanup, nil
 	})
 }
@@ -359,8 +363,10 @@ func llmman_logout(cServer *C.char) *C.char {
 //
 //export llmman_push
 func llmman_push(cLayoutDir, cRef *C.char) *C.char {
-	progressReset("retrieving manifest")
-	if _, err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), C.GoString(cRef)); err != nil {
+	ref := C.GoString(cRef)
+	progressReset(ref, "retrieving manifest")
+	defer progressDone(ref)
+	if _, err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), ref); err != nil {
 		return errResp(err)
 	}
 	return okResp("")
@@ -414,9 +420,9 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 	pushWithBar := func(desc ocispec.Descriptor, kind string) error {
 		short := shortDigest(desc.Digest)
 		newBar := func() *mpb.Bar {
-			return addLayerBar(prog, "Copying "+kind+" "+short, "Copied  "+kind+" "+short, desc.Size)
+			return addLayerBar(prog, "Copying "+kind+" "+short, "Copied  "+kind+" "+short, desc.Size, ref)
 		}
-		alreadyExists, err := pushBlob(ctx, pusher, provider, desc, newBar)
+		alreadyExists, err := pushBlob(ctx, pusher, provider, desc, newBar, ref)
 		if err != nil {
 			return err
 		}
@@ -429,7 +435,7 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 	}
 
 	// Push layers
-	progressSetStatus("pushing")
+	progressSetStatus(ref, "pushing")
 	for _, layer := range manifest.Layers {
 		if err := pushWithBar(layer, "blob"); err != nil {
 			prog.Wait()
@@ -446,7 +452,7 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 	// Push manifest — no progress bar (a few hundred bytes of JSON) —
 	// just a plain "Writing manifest to image destination" message
 	// instead of a bar for this step.
-	manifestAlreadyExists, err := pushBlob(ctx, pusher, provider, manifestDesc, nil)
+	manifestAlreadyExists, err := pushBlob(ctx, pusher, provider, manifestDesc, nil, "")
 	if err != nil {
 		return false, fmt.Errorf("push manifest: %w", err)
 	}
@@ -463,8 +469,10 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 //
 //export llmman_pull
 func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
-	progressReset("pulling manifest")
-	if err := pullToLayout(context.Background(), C.GoString(cRef), C.GoString(cLayoutDir)); err != nil {
+	ref := C.GoString(cRef)
+	progressReset(ref, "pulling manifest")
+	defer progressDone(ref)
+	if err := pullToLayout(context.Background(), ref, C.GoString(cLayoutDir)); err != nil {
 		return errResp(err)
 	}
 	return okResp("")
@@ -473,12 +481,19 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 // pullToLayout is llmman_pull's implementation, factored out so
 // llmman_transfer's staging-directory fallback can reuse it.
 func pullToLayout(ctx context.Context, ref, layoutDir string) error {
+	// progressKey is the exact ref llmman_pull was originally called with
+	// (and the exact string the Rust daemon polls llmman_progress with —
+	// see progress_state.go) — captured before classifyPullRef below
+	// potentially normalizes ref itself (e.g. defaulting in ":latest"),
+	// so progress tracking always uses the same key regardless of that
+	// normalization.
+	progressKey := ref
 	ref, isOCI, handled, err := classifyPullRef(ctx, ref, layoutDir)
 	if handled {
 		return err
 	}
 	if !isOCI {
-		return pullHF(ctx, ref, layoutDir)
+		return pullHF(ctx, ref, layoutDir, progressKey)
 	}
 
 	if err := ensureLayout(layoutDir); err != nil {
@@ -540,7 +555,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	// decorators flip each bar to "Pulled   <digest>" when done so the final static
 	// line is always correct regardless of render-tick timing.
 	const maxParallel = 6
-	progressSetStatus("pulling")
+	progressSetStatus(progressKey, "pulling")
 	prog := mpb.New(
 		mpb.WithWidth(80),
 		mpb.WithOutput(os.Stderr),
@@ -562,38 +577,54 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 		// Create the bar before launching the goroutine so bars appear in
 		// manifest order even when downloads finish out of order.
 		barMu.Lock()
-		bar := addLayerBar(prog, "Pulling  "+shortDigest, "Pulled   "+shortDigest, layer.Size)
+		bar := addLayerBar(prog, "Pulling  "+shortDigest, "Pulled   "+shortDigest, layer.Size, progressKey)
 		barMu.Unlock()
 		sem <- struct{}{}
 		g.Go(func() error {
 			defer func() { <-sem }()
-			layerRC, err := fetcher.Fetch(gctx, layer)
-			if err != nil {
-				bar.Abort(false)
-				return fmt.Errorf("fetch layer %s: %w", layer.Digest, err)
-			}
-			// Resume from an existing partial download: seek the HTTP reader to
-			// the already-downloaded offset (containerd's httpReadSeeker issues a
-			// Range: bytes=N- request, or discards N bytes if the server doesn't
-			// support range requests) and pre-fill the progress bar.
-			partOffset := int64(0)
-			partPath := blobPath(layoutDir, layer.Digest) + ".part"
-			if fi, statErr := os.Stat(partPath); statErr == nil && fi.Size() > 0 {
-				if seeker, ok := layerRC.(io.ReadSeeker); ok {
-					if _, seekErr := seeker.Seek(fi.Size(), io.SeekStart); seekErr == nil {
-						partOffset = fi.Size()
-						bar.IncrInt64(partOffset)
-						progressAddCompleted(partOffset)
+			// Deduplicate against any other pull in this process (a
+			// different model, running concurrently — see
+			// blobFetchGroup's own doc comment) that's fetching this
+			// exact same blob digest right now, rather than racing it
+			// to append to the same deterministic .part file.
+			_, err := dedupBlobFetch(layer.Digest.String(), progressKey, layer.Size, func() (ocispec.Descriptor, error) {
+				layerRC, err := fetcher.Fetch(gctx, layer)
+				if err != nil {
+					return ocispec.Descriptor{}, fmt.Errorf("fetch layer %s: %w", layer.Digest, err)
+				}
+				// Resume from an existing partial download: seek the HTTP reader to
+				// the already-downloaded offset (containerd's httpReadSeeker issues a
+				// Range: bytes=N- request, or discards N bytes if the server doesn't
+				// support range requests) and pre-fill the progress bar.
+				partOffset := int64(0)
+				partPath := blobPath(layoutDir, layer.Digest) + ".part"
+				if fi, statErr := os.Stat(partPath); statErr == nil && fi.Size() > 0 {
+					if seeker, ok := layerRC.(io.ReadSeeker); ok {
+						if _, seekErr := seeker.Seek(fi.Size(), io.SeekStart); seekErr == nil {
+							partOffset = fi.Size()
+							bar.IncrInt64(partOffset)
+							progressAddCompleted(progressKey, partOffset)
+						}
 					}
 				}
-			}
-			proxyRC := proxyOrNop(bar, layerRC)
-			_, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size, layer.Digest, partOffset)
-			proxyRC.Close()
-			if writeErr != nil {
+				proxyRC := proxyOrNop(bar, layerRC, progressKey)
+				desc, writeErr := writeBlobStream(layoutDir, layer.MediaType, proxyRC, layer.Size, layer.Digest, partOffset)
+				proxyRC.Close()
+				if writeErr != nil {
+					return ocispec.Descriptor{}, fmt.Errorf("write layer %s: %w", layer.Digest, writeErr)
+				}
+				return desc, nil
+			})
+			if err != nil {
 				bar.Abort(false)
-				return fmt.Errorf("write layer %s: %w", layer.Digest, writeErr)
+				return err
 			}
+			// Whether this goroutine did the actual fetch or a concurrent
+			// pull of a different model got there first (see
+			// dedupBlobFetch), the blob is now on disk — force this bar
+			// to 100% so mpb's pool.Wait() below doesn't hang waiting on
+			// a bar this goroutine never itself incremented.
+			bar.SetTotal(layer.Size, true)
 			return nil
 		})
 	}

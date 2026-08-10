@@ -41,29 +41,34 @@ import (
 
 // dispatchPull routes a URI-scheme reference to the appropriate source handler.
 // Returns (handled bool, error). When handled=false the caller falls through to
-// the existing OCI / HuggingFace routing.
+// the existing OCI / HuggingFace routing. progressKey is always the exact,
+// original ref the daemon's /api/pull handler was given — not any
+// source-specific canonicalized form the handler below might separately
+// compute (e.g. pullModelScope's own storeRef) — since that's the exact
+// string the Rust side polls llmman_progress with (see progress_state.go).
 func dispatchPull(ctx context.Context, ref, layoutDir string) (bool, error) {
 	if err := ensureLayout(layoutDir); err != nil {
 		return true, fmt.Errorf("init layout: %w", err)
 	}
+	progressKey := ref
 
 	switch {
 	case strings.HasPrefix(ref, "hf://") || strings.HasPrefix(ref, "huggingface://"):
 		hfRef := strings.TrimPrefix(strings.TrimPrefix(ref, "hf://"), "huggingface://")
-		return true, pullHF(ctx, hfRef, layoutDir)
+		return true, pullHF(ctx, hfRef, layoutDir, progressKey)
 
 	case strings.HasPrefix(ref, "ms://") || strings.HasPrefix(ref, "modelscope://"):
 		msRef := strings.TrimPrefix(strings.TrimPrefix(ref, "ms://"), "modelscope://")
-		return true, pullModelScope(ctx, msRef, layoutDir)
+		return true, pullModelScope(ctx, msRef, layoutDir, progressKey)
 
 	case strings.HasPrefix(ref, "ngc://"):
-		return true, pullNGC(ctx, ref, layoutDir)
+		return true, pullNGC(ctx, ref, layoutDir, progressKey)
 
 	case strings.HasPrefix(ref, "s3://"):
-		return true, pullS3(ctx, ref, layoutDir)
+		return true, pullS3(ctx, ref, layoutDir, progressKey)
 
 	case strings.HasPrefix(ref, "gs://"):
-		return true, pullGCS(ctx, ref, layoutDir)
+		return true, pullGCS(ctx, ref, layoutDir, progressKey)
 
 	case strings.HasPrefix(ref, "/"):
 		return true, pullLocal(ref, layoutDir)
@@ -130,9 +135,9 @@ type modelPackFile struct {
 // "ms", "ngc") to avoid collisions, and kind labels error messages (e.g.
 // "ModelScope", "NGC"). Callers remain responsible for calling prog.Wait()
 // once, after the whole download loop finishes (successfully or not).
-func downloadToPackFile(prog *mpb.Progress, layoutDir, tmpPrefix, kind, relPath string, size int64, open func() (io.ReadCloser, error)) (modelPackFile, error) {
+func downloadToPackFile(prog *mpb.Progress, layoutDir, tmpPrefix, kind, relPath string, size int64, open func() (io.ReadCloser, error), progressKey string) (modelPackFile, error) {
 	tmpPath := filepath.Join(layoutDir, "blobs", tmpPrefix+"-"+strings.ReplaceAll(relPath, "/", "_")+".part")
-	bar := addLayerBar(prog, "Pulling  "+filepath.Base(relPath), "Pulled   "+filepath.Base(relPath), size)
+	bar := addLayerBar(prog, "Pulling  "+filepath.Base(relPath), "Pulled   "+filepath.Base(relPath), size, progressKey)
 
 	body, err := open()
 	if err != nil {
@@ -146,7 +151,7 @@ func downloadToPackFile(prog *mpb.Progress, layoutDir, tmpPrefix, kind, relPath 
 		bar.Abort(false)
 		return modelPackFile{}, err
 	}
-	proxy := proxyOrNop(bar, body)
+	proxy := proxyOrNop(bar, body, progressKey)
 	_, copyErr := io.Copy(fh, proxy)
 	proxy.Close()
 	fh.Close()
@@ -183,12 +188,12 @@ type downloadItem struct {
 // staging file names between sources (e.g. "ms", "ngc"); kind labels error
 // messages (e.g. "ModelScope", "NGC"); noFilesErr is returned verbatim if no
 // items were downloaded (each source phrases this error slightly differently).
-func downloadItemsAsModelPack(layoutDir, tmpPrefix, kind string, items []downloadItem, storeRef, modelRepo string, noFilesErr error) error {
+func downloadItemsAsModelPack(layoutDir, tmpPrefix, kind string, items []downloadItem, storeRef, modelRepo string, noFilesErr error, progressKey string) error {
 	prog := newProgressPool(80)
 	var packFiles []modelPackFile
 
 	for _, it := range items {
-		pf, err := downloadToPackFile(prog, layoutDir, tmpPrefix, kind, it.relPath, it.size, it.open)
+		pf, err := downloadToPackFile(prog, layoutDir, tmpPrefix, kind, it.relPath, it.size, it.open, progressKey)
 		if err != nil {
 			prog.Wait()
 			return err
@@ -260,7 +265,7 @@ type msFile struct {
 	Type string `json:"Type"` // "file" or "tree"
 }
 
-func pullModelScope(ctx context.Context, msRef, layoutDir string) error {
+func pullModelScope(ctx context.Context, msRef, layoutDir, progressKey string) error {
 	// Parse owner/repo[:revision]
 	owner, repo, revision := "", "", "master"
 	parts := strings.SplitN(msRef, "/", 2)
@@ -345,7 +350,7 @@ func pullModelScope(ctx context.Context, msRef, layoutDir string) error {
 	}
 
 	return downloadItemsAsModelPack(layoutDir, "ms", "ModelScope", items, storeRef, owner+"/"+repo,
-		fmt.Errorf("no model files found in ModelScope repo %s/%s", owner, repo))
+		fmt.Errorf("no model files found in ModelScope repo %s/%s", owner, repo), progressKey)
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +358,7 @@ func pullModelScope(ctx context.Context, msRef, layoutDir string) error {
 // ---------------------------------------------------------------------------
 
 // NGC ref format: ngc://org/team/model:version  or  ngc://org/model:version
-func pullNGC(ctx context.Context, ngcRef, layoutDir string) error {
+func pullNGC(ctx context.Context, ngcRef, layoutDir, progressKey string) error {
 	// Strip scheme
 	path := strings.TrimPrefix(ngcRef, "ngc://")
 	apiKey := os.Getenv("NGC_API_KEY")
@@ -445,14 +450,14 @@ func pullNGC(ctx context.Context, ngcRef, layoutDir string) error {
 	}
 
 	return downloadItemsAsModelPack(layoutDir, "ngc", "NGC", items, storeRef, modelPath,
-		fmt.Errorf("no model files found in NGC model %s", modelPath))
+		fmt.Errorf("no model files found in NGC model %s", modelPath), progressKey)
 }
 
 // ---------------------------------------------------------------------------
 // AWS S3  (s3://)
 // ---------------------------------------------------------------------------
 
-func pullS3(ctx context.Context, s3Ref, layoutDir string) error {
+func pullS3(ctx context.Context, s3Ref, layoutDir, progressKey string) error {
 	// s3://bucket/prefix/to/model
 	withoutScheme := strings.TrimPrefix(s3Ref, "s3://")
 	slashIdx := strings.Index(withoutScheme, "/")
@@ -539,7 +544,7 @@ func pullS3(ctx context.Context, s3Ref, layoutDir string) error {
 	}
 
 	return downloadItemsAsModelPack(layoutDir, "s3", "S3", items, storeRef, withoutScheme,
-		fmt.Errorf("no model files found at s3://%s/%s", bucket, prefix))
+		fmt.Errorf("no model files found at s3://%s/%s", bucket, prefix), progressKey)
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +554,7 @@ func pullS3(ctx context.Context, s3Ref, layoutDir string) error {
 // pullGCS downloads a model from a GCS bucket using plain HTTP.
 // Authentication: GOOGLE_APPLICATION_CREDENTIALS (service account JSON)
 // or Application Default Credentials (ADC) via GOOGLE_ACCESS_TOKEN.
-func pullGCS(ctx context.Context, gsRef, layoutDir string) error {
+func pullGCS(ctx context.Context, gsRef, layoutDir, progressKey string) error {
 	withoutScheme := strings.TrimPrefix(gsRef, "gs://")
 	slashIdx := strings.Index(withoutScheme, "/")
 	if slashIdx < 0 {
@@ -643,7 +648,7 @@ func pullGCS(ctx context.Context, gsRef, layoutDir string) error {
 	}
 
 	return downloadItemsAsModelPack(layoutDir, "gs", "GCS", items, storeRef, withoutScheme,
-		fmt.Errorf("no model files found at gs://%s/%s", bucket, prefix))
+		fmt.Errorf("no model files found at gs://%s/%s", bucket, prefix), progressKey)
 }
 
 // gcsAccessToken returns a GCS Bearer token from the environment.

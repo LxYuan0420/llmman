@@ -21,7 +21,7 @@ extern "C" {
     fn llmman_pull(reference: *const c_char, layout_dir: *const c_char) -> *mut c_char;
     fn llmman_inspect(reference: *const c_char) -> *mut c_char;
     fn llmman_transfer(source: *const c_char, destination: *const c_char) -> *mut c_char;
-    fn llmman_progress() -> *mut c_char;
+    fn llmman_progress(key: *const c_char) -> *mut c_char;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,10 +113,12 @@ pub fn transfer(source: &str, destination: &str) -> anyhow::Result<bool> {
     Ok(data == "changed")
 }
 
-/// A byte-level snapshot of whichever pull/push is currently running
-/// inside this process, as tracked by the Go shim's `progressState` (see
-/// go-shim/progress_state.go). `total`/`completed` are 0 until the shim
-/// learns a blob's size and starts transferring it.
+/// A byte-level snapshot of one particular pull/push (identified by
+/// `key`, the exact model reference it was started with), as tracked by
+/// the Go shim's `progressState` (see go-shim/progress_state.go).
+/// `total`/`completed` are 0 until the shim learns a blob's size and
+/// starts transferring it, or if `key` has no tracked entry (not started
+/// yet, or already finished and cleaned up).
 #[derive(Deserialize)]
 pub struct ProgressSnapshot {
     pub status: String,
@@ -124,13 +126,19 @@ pub struct ProgressSnapshot {
     pub completed: i64,
 }
 
-/// Polls the Go shim's process-wide pull/push progress snapshot. Called
-/// by `cmd::serve` every ~200ms while a `/api/pull` or `/api/push` task is
-/// in flight, to relay real byte counts over its NDJSON stream instead of
-/// just a coarse "pulling <model>" heartbeat — see llmman_progress's own
-/// doc comment for why the daemon can't just let the shim's own mpb bars
-/// (go-shim/shared_oci.go) reach an interactive terminal directly.
-pub fn progress() -> anyhow::Result<ProgressSnapshot> {
-    let data = consume(unsafe { llmman_progress() })?;
+/// Polls the Go shim's pull/push progress snapshot for `key` (the same
+/// model reference passed to `pull`/`push` above). Called by `cmd::serve`
+/// every ~200ms while a `/api/pull` or `/api/push` task for that same key
+/// is in flight, to relay real byte counts over its NDJSON stream instead
+/// of just a coarse "pulling <model>" heartbeat — see llmman_progress's
+/// own doc comment for why the daemon can't just let the shim's own mpb
+/// bars (go-shim/shared_oci.go) reach an interactive terminal directly.
+/// Keying by reference (rather than one process-wide snapshot, as this
+/// used to be) is what lets two different models' pulls/pushes run
+/// concurrently in the same daemon without their progress numbers
+/// interleaving — see serve.rs's per-model lock registry.
+pub fn progress(key: &str) -> anyhow::Result<ProgressSnapshot> {
+    let k = cstr(key)?;
+    let data = consume(unsafe { llmman_progress(k.as_ptr()) })?;
     serde_json::from_str(&data).context("failed to decode progress snapshot")
 }

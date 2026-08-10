@@ -720,7 +720,13 @@ func reportCached(layoutDir, ref, label string) bool {
 	return true
 }
 
-func pullHF(ctx context.Context, ref, layoutDir string) error {
+// progressKey is the exact, original ref the daemon's /api/pull handler
+// was given — normally identical to ref, except when called from
+// dispatchPull's "hf://"/"huggingface://" scheme handling, where ref has
+// already had that scheme prefix stripped (for use as the storage/index
+// key) but the Rust side is still polling llmman_progress with the
+// original, prefixed string (see progress_state.go).
+func pullHF(ctx context.Context, ref, layoutDir, progressKey string) error {
 	host, owner, repo, tag, err := parseHFRef(ref)
 	if err != nil {
 		return err
@@ -755,7 +761,7 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 	if err != nil {
 		return err
 	}
-	progressSetStatus("pulling")
+	progressSetStatus(progressKey, "pulling")
 
 	// Try GGUF first; fall back to safetensors if the repo has none.
 	if shards, err := selectGGUF(files, tag); err == nil {
@@ -767,7 +773,7 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 		var layers []ocispec.Descriptor
 		for _, f := range shards {
 			downloadURL := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + f.Path
-			desc, err := downloadHFBlob(ctx, dlClient, downloadURL, token, layoutDir, owner, repo, commit, f)
+			desc, err := downloadHFBlob(ctx, dlClient, downloadURL, token, layoutDir, owner, repo, commit, f, progressKey)
 			if err != nil {
 				return err
 			}
@@ -778,7 +784,7 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 		// this has no dedicated media type of its own.
 		if mmproj, ok := selectMMProj(files); ok {
 			downloadURL := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + mmproj.Path
-			desc, err := downloadHFBlob(ctx, dlClient, downloadURL, token, layoutDir, owner, repo, commit, mmproj)
+			desc, err := downloadHFBlob(ctx, dlClient, downloadURL, token, layoutDir, owner, repo, commit, mmproj, progressKey)
 			if err != nil {
 				return fmt.Errorf("download %s: %w", mmproj.Path, err)
 			}
@@ -789,7 +795,7 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 		// application/vnd.cncf.model.doc.v1.raw is for.
 		if lic, ok := selectLicenseFile(files); ok {
 			downloadURL := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + lic.Path
-			desc, err := downloadHFBlob(ctx, dlClient, downloadURL, token, layoutDir, owner, repo, commit, lic)
+			desc, err := downloadHFBlob(ctx, dlClient, downloadURL, token, layoutDir, owner, repo, commit, lic, progressKey)
 			if err != nil {
 				return fmt.Errorf("download %s: %w", lic.Path, err)
 			}
@@ -801,7 +807,7 @@ func pullHF(ctx context.Context, ref, layoutDir string) error {
 
 	// No GGUF found — pull safetensors files as a CNCF model-spec image.
 	meta.Format = "safetensors"
-	return pullHFSafetensors(ctx, dlClient, ref, layoutDir, endpoint, owner, repo, commit, token, files, meta)
+	return pullHFSafetensors(ctx, dlClient, ref, layoutDir, endpoint, owner, repo, commit, token, files, meta, progressKey)
 }
 
 // safetensorsMediaType maps a file extension to the appropriate CNCF layer media type.
@@ -857,6 +863,7 @@ func pullHFSafetensors(
 	ref, layoutDir, endpoint, owner, repo, commit, token string,
 	files []hfFile,
 	meta modelMeta,
+	progressKey string,
 ) error {
 	toDownload := selectDownloadableHFFiles(files)
 	if len(toDownload) == 0 {
@@ -866,7 +873,7 @@ func pullHFSafetensors(
 	var layers []ocispec.Descriptor
 	for _, f := range toDownload {
 		url := endpoint + owner + "/" + repo + "/resolve/" + commit + "/" + f.Path
-		desc, err := downloadHFBlob(ctx, client, url, token, layoutDir, owner, repo, commit, f)
+		desc, err := downloadHFBlob(ctx, client, url, token, layoutDir, owner, repo, commit, f, progressKey)
 		if err != nil {
 			return fmt.Errorf("download %s: %w", f.Path, err)
 		}
@@ -903,7 +910,7 @@ func storeSafetensorsAsOCI(layoutDir, ref, modelRepo string, meta modelMeta, lay
 // backoff/stall/permanent-vs-transient logic).
 // ---------------------------------------------------------------------------
 
-func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layoutDir, owner, repo, commit string, file hfFile) (ocispec.Descriptor, error) {
+func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layoutDir, owner, repo, commit string, file hfFile, progressKey string) (ocispec.Descriptor, error) {
 	if err := os.MkdirAll(filepath.Join(layoutDir, "blobs"), 0o755); err != nil {
 		return ocispec.Descriptor{}, err
 	}
@@ -912,10 +919,24 @@ func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layout
 	tmpKey := sanitize.Replace(owner + "_" + repo + "_" + commit[:12] + "_" + filepath.Base(file.Path))
 	tmpPath := filepath.Join(layoutDir, "blobs", "hf-"+tmpKey+".part")
 
+	// Deduplicate against any other pull in this process (a different
+	// model, running concurrently now that pulls of distinct models are
+	// no longer serialized against each other — see blobFetchGroup's own
+	// doc comment) that's downloading this exact same source file right
+	// now, rather than racing it to write the same deterministic tmpPath.
+	return dedupBlobFetch(tmpKey, progressKey, file.Size, func() (ocispec.Descriptor, error) {
+		return downloadHFBlobAttempts(ctx, client, url, token, layoutDir, tmpPath, file, progressKey)
+	})
+}
+
+// downloadHFBlobAttempts is downloadHFBlob's actual retry loop, run at
+// most once per tmpKey across every concurrent caller — see
+// dedupBlobFetch.
+func downloadHFBlobAttempts(ctx context.Context, client *http.Client, url, token, layoutDir, tmpPath string, file hfFile, progressKey string) (ocispec.Descriptor, error) {
 	label := "Pulling  " + filepath.Base(file.Path)
 	doneLbl := "Pulled   " + filepath.Base(file.Path)
 	prog := newProgressPool(80)
-	bar := addLayerBar(prog, label, doneLbl, file.Size)
+	bar := addLayerBar(prog, label, doneLbl, file.Size, progressKey)
 
 	var lastErr error
 	// creditedResume tracks how much of the .part file's already-downloaded
@@ -932,7 +953,7 @@ func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layout
 	var creditedResume int64
 	for attempt := 0; attempt < dlMaxAttempts; attempt++ {
 		if attempt > 0 {
-			delay := dlRetryBase * time.Duration(1<<uint(attempt-1)) // 2s, 4s
+			delay := retryDelay(attempt)
 			fmt.Fprintf(os.Stderr, "\n[llmman] retrying %s (attempt %d/%d, wait %v)\n",
 				filepath.Base(file.Path), attempt+1, dlMaxAttempts, delay)
 			select {
@@ -951,11 +972,11 @@ func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layout
 		}
 		bar.SetCurrent(startOffset)
 		if startOffset > creditedResume {
-			progressAddCompleted(startOffset - creditedResume)
+			progressAddCompleted(progressKey, startOffset-creditedResume)
 			creditedResume = startOffset
 		}
 
-		desc, err := downloadAttempt(ctx, client, url, token, layoutDir, tmpPath, startOffset, file, bar)
+		desc, err := downloadAttempt(ctx, client, url, token, layoutDir, tmpPath, startOffset, file, bar, progressKey)
 		if err == nil {
 			prog.Wait()
 			return desc, nil
@@ -978,7 +999,7 @@ func downloadHFBlob(ctx context.Context, client *http.Client, url, token, layout
 }
 
 // downloadAttempt performs one download attempt with stall detection.
-func downloadAttempt(ctx context.Context, client *http.Client, url, token, layoutDir, tmpPath string, startOffset int64, file hfFile, bar *mpb.Bar) (ocispec.Descriptor, error) {
+func downloadAttempt(ctx context.Context, client *http.Client, url, token, layoutDir, tmpPath string, startOffset int64, file hfFile, bar *mpb.Bar, progressKey string) (ocispec.Descriptor, error) {
 	// Per-attempt context with stall cancellation.
 	attemptCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1014,11 +1035,13 @@ func downloadAttempt(ctx context.Context, client *http.Client, url, token, layou
 		return ocispec.Descriptor{}, err
 	}
 
-	// Wrap with stall detector: cancel attemptCtx if no bytes for 60s.
+	// Wrap with stall/slow-speed detector: cancel attemptCtx if no bytes
+	// for 60s, or if the sustained rate drops far below this process's
+	// recent median transfer speed (see stallReader.checkSpeed).
 	sr := newStallReader(resp.Body, dlStallTimeout, cancel)
 	defer sr.stop()
 
-	proxyRC := proxyOrNop(bar, sr)
+	proxyRC := proxyOrNop(bar, sr, progressKey)
 	written, copyErr := io.Copy(io.MultiWriter(f, digester.Hash()), proxyRC)
 	proxyRC.Close()
 	f.Close()
@@ -1027,6 +1050,10 @@ func downloadAttempt(ctx context.Context, client *http.Client, url, token, layou
 		// Partial file kept for resume on next attempt — do NOT remove it here.
 		return ocispec.Descriptor{}, fmt.Errorf("write %s: %w", file.Path, copyErr)
 	}
+	// Feed this attempt's throughput into the process-wide speed tracker
+	// so future transfers can detect running anomalously slowly by
+	// comparison — see globalSpeedTracker.
+	globalSpeedTracker.record(sr.finalSpeed())
 	total := startOffset + written
 	dgst := digester.Digest()
 

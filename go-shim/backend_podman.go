@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/vbauerster/mpb/v8"
@@ -79,8 +80,10 @@ func llmman_logout(cServer *C.char) *C.char {
 //
 //export llmman_push
 func llmman_push(cLayoutDir, cRef *C.char) *C.char {
-	progressReset("retrieving manifest")
-	if _, err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), C.GoString(cRef)); err != nil {
+	ref := C.GoString(cRef)
+	progressReset(ref, "retrieving manifest")
+	defer progressDone(ref)
+	if _, err := pushToRegistry(context.Background(), C.GoString(cLayoutDir), ref); err != nil {
 		return errResp(err)
 	}
 	return okResp("")
@@ -117,8 +120,8 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 	}
 	defer pctx.Destroy()
 
-	progressSetStatus("pushing")
-	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pushing", "Pushed", &copy.Options{}, &changed); err != nil {
+	progressSetStatus(ref, "pushing")
+	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pushing", "Pushed", &copy.Options{}, &changed, ref); err != nil {
 		return false, fmt.Errorf("copy image: %w", err)
 	}
 	return changed, nil
@@ -128,8 +131,10 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 //
 //export llmman_pull
 func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
-	progressReset("pulling manifest")
-	if err := pullToLayout(context.Background(), C.GoString(cRef), C.GoString(cLayoutDir)); err != nil {
+	ref := C.GoString(cRef)
+	progressReset(ref, "pulling manifest")
+	defer progressDone(ref)
+	if err := pullToLayout(context.Background(), ref, C.GoString(cLayoutDir)); err != nil {
 		return errResp(err)
 	}
 	return okResp("")
@@ -138,6 +143,10 @@ func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 // pullToLayout is llmman_pull's implementation, factored out so
 // llmman_transfer's staging-directory fallback can reuse it.
 func pullToLayout(ctx context.Context, ref, layoutDir string) error {
+	// progressKey is the exact ref llmman_pull was originally called with
+	// (see backend_docker.go's pullToLayout for why this must be
+	// captured before classifyPullRef potentially normalizes ref itself).
+	progressKey := ref
 	ref, isOCI, handled, err := classifyPullRef(ctx, ref, layoutDir)
 	if handled {
 		return err
@@ -149,7 +158,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 		if err := ensureLayout(layoutDir); err != nil {
 			return fmt.Errorf("init OCI layout: %w", err)
 		}
-		return pullHF(ctx, ref, layoutDir)
+		return pullHF(ctx, ref, layoutDir, progressKey)
 	}
 
 	tag := tagFromRef(ref)
@@ -179,23 +188,45 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	}
 	defer pctx.Destroy()
 
-	progressSetStatus("pulling")
+	progressSetStatus(progressKey, "pulling")
 	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Pulling", "Pulled", &copy.Options{
 		MaxParallelDownloads: 6,
-	}, nil); err != nil {
+	}, nil, progressKey); err != nil {
 		return fmt.Errorf("copy image: %w", err)
 	}
 	return nil
 }
 
+// copyImageMu serializes the actual copy.Image call across every
+// concurrent pull/push in this process (podman build only).
+//
+// Unlike the docker/containerd backend (backend_docker.go), which fetches
+// and writes each blob itself and can therefore deduplicate concurrent
+// fetches of the very same digest via blobFetchGroup (see its own doc
+// comment), copy.Image is a single opaque call into containers/image:
+// there's no hook to intercept its internal per-blob writes into the OCI
+// layout's blobs/ directory. Now that pulls/pushes of *different* models
+// run concurrently (see the Rust daemon's per-model lock registry), two
+// such calls could race to write the exact same shared blob at once with
+// no way for this package to arbitrate between them. Rather than risk
+// that corruption, the podman build keeps this one step — actual data
+// transfer — fully serialized, while still letting everything else about
+// two concurrent pulls (manifest resolution, HTTP auth, local store
+// checks) proceed in parallel. This is more conservative than strictly
+// necessary (it also serializes two pulls that share no blobs at all),
+// but correctness first: see the docker backend for the finer-grained
+// alternative used where it's actually achievable.
+var copyImageMu sync.Mutex
+
 // copyImageWithProgress runs copy.Image with an mpb bar per artifact (for
 // direct/foreground FFI callers, e.g. `llmman transfer`'s podman backend —
 // though transfer_podman.go's own copy.Image calls don't currently go
-// through this, only pull/push do) and folds the same byte counts into the
-// shared progressState snapshot (see progress_state.go) that lets
-// cmd::serve poll them out of the daemon process — two consumers of the
-// same underlying containers/image progress channel. present/pastTense
-// label each artifact's bar (e.g. "Pulling"/"Pulled", "Pushing"/"Pushed").
+// through this, only pull/push do) and folds the same byte counts into
+// progressKey's entry in the shared progressState snapshot (see
+// progress_state.go) that lets cmd::serve poll them out of the daemon
+// process — two consumers of the same underlying containers/image
+// progress channel. present/pastTense label each artifact's bar (e.g.
+// "Pulling"/"Pulled", "Pushing"/"Pushed").
 //
 // If changed is non-nil, it's set to true whenever at least one artifact
 // actually completes a copy (types.ProgressEventDone) rather than turning
@@ -203,7 +234,10 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 // which never leads to a Done for that same artifact) — letting a caller
 // like pushToRegistry/podmanTransferOCI tell whether anything was really
 // pushed, e.g. to report "already up to date" for a no-op re-transfer.
-func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool) error {
+func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool, progressKey string) error {
+	copyImageMu.Lock()
+	defer copyImageMu.Unlock()
+
 	prog := mpb.New(mpb.WithOutput(os.Stderr))
 	ch := make(chan types.ProgressProperties)
 	bars := make(map[string]*mpb.Bar)
@@ -218,7 +252,7 @@ func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, d
 				if total < 0 {
 					total = 0
 				}
-				progressAddTotal(total)
+				progressAddTotal(progressKey, total)
 				short := p.Artifact.Digest.Hex()
 				if len(short) > 12 {
 					short = short[:12]
@@ -239,7 +273,7 @@ func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, d
 				}
 				bars[key] = bar
 			case types.ProgressEventRead:
-				progressAddCompleted(int64(p.OffsetUpdate))
+				progressAddCompleted(progressKey, int64(p.OffsetUpdate))
 				if bar, ok := bars[key]; ok {
 					bar.IncrInt64(int64(p.OffsetUpdate))
 				}
@@ -258,7 +292,7 @@ func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, d
 				// destination — no bytes will ever flow for it via
 				// ProgressEventRead, so undo the provisional total
 				// ProgressEventNewArtifact already added above.
-				progressAddTotal(-p.Artifact.Size)
+				progressAddTotal(progressKey, -p.Artifact.Size)
 				if bar, ok := bars[key]; ok {
 					bar.Abort(true)
 					delete(bars, key)

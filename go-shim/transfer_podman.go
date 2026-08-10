@@ -68,9 +68,12 @@ func podmanTransferOCI(ctx context.Context, source, destination string) (changed
 	}
 	defer pctx.Destroy()
 
+	// "" — llmman transfer doesn't go through the daemon's per-model
+	// progress poll (see progress_state.go), so there's no key to credit
+	// these bytes to.
 	if err := copyImageWithProgress(ctx, pctx, dstRef, srcRef, "Transferring", "Transferred", &copy.Options{
 		ReportWriter: os.Stderr,
-	}, &changed); err != nil {
+	}, &changed, ""); err != nil {
 		return false, fmt.Errorf("transfer image: %w", err)
 	}
 	return changed, nil

@@ -135,7 +135,7 @@ func dockerTransferOCI(ctx context.Context, source, destination string) (changed
 		err := retryStream(ctx, kind+" "+short, isHTTP4xx, func() error {
 			prog := newProgressPool(40)
 			newBar := func() *mpb.Bar {
-				return addLayerBar(prog, "Transferring "+kind+" "+short, "Transferred  "+kind+" "+short, desc.Size)
+				return addLayerBar(prog, "Transferring "+kind+" "+short, "Transferred  "+kind+" "+short, desc.Size, "")
 			}
 			exists, err := streamBlobFromFetcher(ctx, fetcher, pusher, desc, newBar)
 			prog.Wait()
@@ -395,7 +395,7 @@ func streamHFFileToRegistry(
 			// its (download-phase-only) bar to keep `llmman transfer`'s
 			// progress output consistent end to end.
 			newBar := func() *mpb.Bar {
-				return addLayerBar(prog, "Transferring blob "+short, "Transferred  blob "+short, size)
+				return addLayerBar(prog, "Transferring blob "+short, "Transferred  blob "+short, size, "")
 			}
 			exists, err := streamHFGet(ctx, client, url, token, pusher, desc, newBar)
 			prog.Wait()
@@ -425,7 +425,7 @@ func streamHFFileToRegistry(
 	var data []byte
 	err := retryStream(ctx, label, isHTTP4xx, func() error {
 		prog := newProgressPool(40)
-		bar := addLayerBar(prog, "Transferring blob "+label, "Transferred  blob "+label, size)
+		bar := addLayerBar(prog, "Transferring blob "+label, "Transferred  blob "+label, size, "")
 		d, err := hfGetBytes(ctx, client, url, token, bar)
 		if err != nil {
 			bar.Abort(false)
@@ -505,7 +505,7 @@ func hfGetBytes(ctx context.Context, client *http.Client, url, token string, bar
 	}
 	sr := newStallReadCloser(resp.Body, dlStallTimeout, cancel)
 	defer sr.Close()
-	r := proxyOrNop(bar, sr)
+	r := proxyOrNop(bar, sr, "")
 	defer r.Close()
 	return io.ReadAll(r)
 }
