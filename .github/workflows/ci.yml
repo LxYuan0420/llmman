@@ -347,10 +347,17 @@ jobs:
           LLAMA_CPP_RELEASE: b10293
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/llama-cpp-archive"
+          # $HOME, not $RUNNER_TEMP: on Windows the latter is a native
+          # `D:\a\_temp`-style path, and Git Bash's tar.exe (bsdtar) reads
+          # the drive letter's colon as its own old rmt "host:path" remote-
+          # archive syntax instead ("tar: Cannot connect to D: resolve
+          # failed") — confirmed against a real windows-2025 run. $HOME is
+          # already the plain POSIX-style path (`/c/Users/...`) Git Bash
+          # itself uses throughout, on every OS this runs on.
+          archive="$HOME/llama-cpp-archive"
           curl -fsSL -o "$archive" \
             "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE}/${{ matrix.llama-asset }}"
-          dir="$RUNNER_TEMP/llama-cpp"
+          dir="$HOME/llama-cpp"
           mkdir -p "$dir"
           tar -xf "$archive" -C "$dir"
           # Exact names only (not a `llama-server*` glob): the Windows
@@ -358,7 +365,19 @@ jobs:
           # a wildcard would just as happily match first.
           bin=$(find "$dir" -type f \( -iname 'llama-server' -o -iname 'llama-server.exe' \) | head -n1)
           bindir=$(dirname "$bin")
-          echo "$bindir" >> "$GITHUB_PATH"
+          # $GITHUB_PATH crosses out of this bash step into whatever shell
+          # later steps use (pwsh by default on Windows) — which, unlike
+          # tar/find/cargo right above, doesn't go through Git Bash's own
+          # automatic POSIX<->Windows path translation. A bare Git-Bash
+          # path (`/c/Users/...`) written here would be silently useless
+          # PATH-wise to that pwsh-run cargo/cargo-test's own child-process
+          # spawn, so it's converted to the native `C:\Users\...` form
+          # cygpath (bundled with Git for Windows) exists specifically for.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cygpath -w "$bindir" >> "$GITHUB_PATH"
+          else
+            echo "$bindir" >> "$GITHUB_PATH"
+          fi
           # Only Linux needs this: llama-server's shared libraries sit
           # right next to it either way, but macOS's build resolves those
           # via @rpath/@loader_path and Windows' via the same-directory DLL
