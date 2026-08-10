@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -212,24 +213,43 @@ func hfTokenPath() string {
 // of the content) — callers should fall back to a normal buffered
 // download for those; they're tiny (config/tokenizer files), so buffering
 // them in memory costs nothing.
-func hfHeadMetadata(ctx context.Context, client *http.Client, url, token string) (dgst digest.Digest, size int64, ok bool, err error) {
-	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
-	if err != nil {
-		return "", 0, false, err
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	req.Header.Set("Accept-Encoding", "identity") // force the real, uncompressed size
+// hfHeadMetadataMaxHops bounds how many redirects hfHeadMetadata will
+// follow on its own looking for X-Linked-Etag/X-Linked-Size, in case of
+// a redirect loop or some other pathological chain — real chains are one
+// or two hops (see hfHeadMetadata's own comment), so this is generous
+// headroom, not a limit ever expected to actually bind.
+const hfHeadMetadataMaxHops = 5
 
-	// Do NOT follow the redirect: huggingface.co sets X-Linked-Etag/
-	// X-Linked-Size on its own redirecting response (pointing at the real
-	// content's sha256/size before it hands off to a CDN); the CDN's own
-	// response has neither header and sets an unrelated ETag of its own
-	// (its storage object's identifier, not a content hash we can trust)
-	// — using that instead silently produces a wrong digest that a
-	// registry push then rejects as DIGEST_INVALID after fully uploading
-	// the (correct) bytes under the (wrong) declared name.
+func hfHeadMetadata(ctx context.Context, client *http.Client, target, token string) (dgst digest.Digest, size int64, ok bool, err error) {
+	// Do NOT let http.Client itself follow redirects: huggingface.co sets
+	// X-Linked-Etag/X-Linked-Size on its own redirecting response
+	// (pointing at the real content's sha256/size before it hands off to
+	// a CDN); the CDN's own response has neither header and sets an
+	// unrelated ETag of its own (its storage object's identifier, not a
+	// content hash we can trust) — using that instead silently produces
+	// a wrong digest that a registry push then rejects as DIGEST_INVALID
+	// after fully uploading the (correct) bytes under the (wrong)
+	// declared name. So this follows redirects itself, one hop at a
+	// time, stopping the moment a response actually carries those
+	// headers rather than assuming that's always the very first hop.
+	//
+	// It isn't always: a *renamed* repository (an owner or repo name
+	// changed after the URL being resolved here was written down, e.g.
+	// models/ornith/35b-safetensors's deepreinforce-ai/Ornith-1.0-35B,
+	// now ornith-ai/Ornith-1.0-35B) redirects huggingface.co → itself
+	// first, to the new owner/repo, carrying neither header, before ever
+	// reaching the resolve endpoint's actual CDN-bound redirect that
+	// does. Stopping at that first hop unconditionally (an earlier
+	// version of this code did) finds neither header on it and
+	// concludes — wrongly — that this file has no usable digest at all,
+	// which sends a real, multi-gigabyte weight file down
+	// streamHFFileToRegistry's small-non-LFS-file fallback instead:
+	// buffered entirely in memory rather than streamed, which is exactly
+	// how docker/llmman-publisher's ornith:35b-safetensors transfer was
+	// running a GitHub-hosted runner out of memory (each of that
+	// repository's 16 safetensors shards is itself several gigabytes on
+	// its own) rather than actually failing on anything about the
+	// transfer itself.
 	noRedirect := &http.Client{
 		Transport: client.Transport,
 		Timeout:   client.Timeout,
@@ -237,43 +257,70 @@ func hfHeadMetadata(ctx context.Context, client *http.Client, url, token string)
 			return http.ErrUseLastResponse
 		},
 	}
-	resp, err := noRedirect.Do(req)
-	if err != nil {
-		return "", 0, false, fmt.Errorf("HEAD %s: %w", url, err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 200 && (resp.StatusCode < 300 || resp.StatusCode >= 400) {
-		return "", 0, false, fmt.Errorf("HEAD %s: HTTP %d", url, resp.StatusCode)
-	}
 
-	// Read size first and independently of digest validity below: callers
-	// that fall back to buffering (small, non-LFS files) still want an
-	// accurate progress-bar size even though the digest can't be trusted
-	// yet — see transfer_docker.go's streamHFFileToRegistry.
-	sizeStr := resp.Header.Get("X-Linked-Size")
-	if sizeStr == "" && resp.StatusCode == 200 {
-		// Only trust a plain Content-Length when there was no redirect —
-		// a redirect response's Content-Length describes its own (tiny)
-		// body, not the file being redirected to.
-		sizeStr = resp.Header.Get("Content-Length")
-	}
-	if sizeStr != "" {
-		if n, convErr := parseInt64(sizeStr); convErr == nil {
-			size = n
+	for hop := 0; hop < hfHeadMetadataMaxHops; hop++ {
+		req, err := http.NewRequestWithContext(ctx, "HEAD", target, nil)
+		if err != nil {
+			return "", 0, false, err
 		}
-	}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		req.Header.Set("Accept-Encoding", "identity") // force the real, uncompressed size
 
-	etag := resp.Header.Get("X-Linked-Etag")
-	if etag == "" {
-		etag = resp.Header.Get("ETag")
-	}
-	etag = strings.TrimPrefix(etag, "W/")
-	etag = strings.Trim(etag, `"`)
-	if len(etag) != 64 {
-		return "", size, false, nil // not a sha256 — not LFS, caller should buffer instead
-	}
+		resp, err := noRedirect.Do(req)
+		if err != nil {
+			return "", 0, false, fmt.Errorf("HEAD %s: %w", target, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 && (resp.StatusCode < 300 || resp.StatusCode >= 400) {
+			return "", 0, false, fmt.Errorf("HEAD %s: HTTP %d", target, resp.StatusCode)
+		}
 
-	return digest.NewDigestFromEncoded(digest.SHA256, strings.ToLower(etag)), size, true, nil
+		xLinkedEtag := resp.Header.Get("X-Linked-Etag")
+		xLinkedSize := resp.Header.Get("X-Linked-Size")
+		isRedirect := resp.StatusCode >= 300 && resp.StatusCode < 400
+		if isRedirect && xLinkedEtag == "" && xLinkedSize == "" {
+			loc := resp.Header.Get("Location")
+			next, parseErr := neturl.Parse(loc)
+			if loc == "" || parseErr != nil {
+				break // no usable Location to follow — give up, same as before
+			}
+			target = req.URL.ResolveReference(next).String()
+			continue
+		}
+
+		// Read size first and independently of digest validity below:
+		// callers that fall back to buffering (small, non-LFS files)
+		// still want an accurate progress-bar size even though the
+		// digest can't be trusted yet — see transfer_docker.go's
+		// streamHFFileToRegistry.
+		sizeStr := xLinkedSize
+		if sizeStr == "" && resp.StatusCode == 200 {
+			// Only trust a plain Content-Length when there was no
+			// redirect — a redirect response's Content-Length describes
+			// its own (tiny) body, not the file being redirected to.
+			sizeStr = resp.Header.Get("Content-Length")
+		}
+		if sizeStr != "" {
+			if n, convErr := parseInt64(sizeStr); convErr == nil {
+				size = n
+			}
+		}
+
+		etag := xLinkedEtag
+		if etag == "" {
+			etag = resp.Header.Get("ETag")
+		}
+		etag = strings.TrimPrefix(etag, "W/")
+		etag = strings.Trim(etag, `"`)
+		if len(etag) != 64 {
+			return "", size, false, nil // not a sha256 — not LFS, caller should buffer instead
+		}
+
+		return digest.NewDigestFromEncoded(digest.SHA256, strings.ToLower(etag)), size, true, nil
+	}
+	return "", 0, false, nil
 }
 
 func parseInt64(s string) (int64, error) {
