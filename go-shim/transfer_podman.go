@@ -1,9 +1,9 @@
 //go:build podman
 
-// transfer_podman.go — `llmman transfer`'s containers/image-backed
+// transfer_podman.go — `llmman transfer`'s go.podman.io/image-backed
 // implementation.
 //
-// For an OCI registry source, this is a one-line reuse of containers/image's
+// For an OCI registry source, this is a one-line reuse of go.podman.io/image's
 // own `copy.Image`: hand it a docker://source and a docker://destination
 // reference directly, with no local OCI layout in between at all.
 // copy.Image already streams each blob straight from source to destination
@@ -12,7 +12,7 @@
 // see copy/copy.go upstream); there's nothing llmman needs to add on top
 // for that case.
 //
-// containers/image has no HuggingFace (or ms:///ngc:///s3:///gs:///local
+// go.podman.io/image has no HuggingFace (or ms:///ngc:///s3:///gs:///local
 // path) source transport, though, so those fall back to staging through a
 // throwaway local OCI layout — pull, then push from it, mirroring what
 // `llmman transfer` did before streaming support existed, and what
@@ -45,7 +45,7 @@ func podmanTransfer(ctx context.Context, source, destination string) (changed bo
 }
 
 // podmanTransferOCI streams directly between two registries via
-// containers/image's copy.Image — no local OCI layout involved. Routed
+// go.podman.io/image's copy.Image — no local OCI layout involved. Routed
 // through copyImageWithProgress (backend_podman.go), rather than a bare
 // copy.Image call, purely so its ProgressEventDone/Skipped events can
 // report whether anything was actually transferred — see that function's

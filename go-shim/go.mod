@@ -19,7 +19,10 @@ require (
 	// Progress bars
 	github.com/vbauerster/mpb/v8 v8.12.0
 
-	// Podman backend — containers/image transport (same library podman uses)
+	// Podman backend — go.podman.io/image transport (same library podman
+	// uses; formerly containers/image, now developed as the image/ module
+	// in the podman-container-tools/container-libs monorepo, which
+	// go.podman.io/* vanity-imports to)
 	go.podman.io/common v0.67.2-0.20260430110239-06cbc5da36f1
 	go.podman.io/image/v5 v5.39.3-0.20260430110239-06cbc5da36f1
 

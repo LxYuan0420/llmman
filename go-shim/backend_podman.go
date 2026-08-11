@@ -43,7 +43,7 @@ func insecurePolicy() (*signature.PolicyContext, error) {
 // Exported CGO functions
 // ---------------------------------------------------------------------------
 
-// llmman_login stores credentials for a registry using the containers/common auth library.
+// llmman_login stores credentials for a registry using the go.podman.io/common auth library.
 //
 //export llmman_login
 func llmman_login(cServer, cUsername, cPassword *C.char) *C.char {
@@ -102,7 +102,7 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 		return false, fmt.Errorf("parse src ref %q: %w", srcStr, err)
 	}
 
-	// Destination: Docker registry. containers/image's docker transport
+	// Destination: Docker registry. go.podman.io/image's docker transport
 	// already defaults a tagless ref to :latest internally, but
 	// normalizing here too keeps this consistent with the docker/
 	// containerd backend (whose resolver has no such default — see
@@ -152,7 +152,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 		return err
 	}
 	// HuggingFace and similar hosts cannot be pulled via the OCI registry
-	// protocol (their paths contain uppercase letters which containers/image
+	// protocol (their paths contain uppercase letters which go.podman.io/image
 	// rejects).  Delegate to the shared HF pull path instead.
 	if !isOCI {
 		if err := ensureLayout(layoutDir); err != nil {
@@ -203,7 +203,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 // Unlike the docker/containerd backend (backend_docker.go), which fetches
 // and writes each blob itself and can therefore deduplicate concurrent
 // fetches of the very same digest via blobFetchGroup (see its own doc
-// comment), copy.Image is a single opaque call into containers/image:
+// comment), copy.Image is a single opaque call into go.podman.io/image:
 // there's no hook to intercept its internal per-blob writes into the OCI
 // layout's blobs/ directory. Now that pulls/pushes of *different* models
 // run concurrently (see the Rust daemon's per-model lock registry), two
@@ -224,7 +224,7 @@ var copyImageMu sync.Mutex
 // through this, only pull/push do) and folds the same byte counts into
 // progressKey's entry in the shared progressState snapshot (see
 // progress_state.go) that lets cmd::serve poll them out of the daemon
-// process — two consumers of the same underlying containers/image
+// process — two consumers of the same underlying go.podman.io/image
 // progress channel. present/pastTense label each artifact's bar (e.g.
 // "Pulling"/"Pulled", "Pushing"/"Pushed").
 //
@@ -347,9 +347,9 @@ func llmman_inspect(cRef *C.char) *C.char {
 // without ever writing it to the persistent local store. See
 // transfer_podman.go for what this picks between (a direct
 // docker://→docker:// copy.Image, which streams every blob straight
-// through since containers/image already knows each one's digest from
+// through since go.podman.io/image already knows each one's digest from
 // the source manifest; or a staging-directory fallback for HuggingFace
-// and other non-OCI sources, which containers/image has no source
+// and other non-OCI sources, which go.podman.io/image has no source
 // transport for).
 //
 //export llmman_transfer
