@@ -218,15 +218,48 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 // alternative used where it's actually achievable.
 var copyImageMu sync.Mutex
 
-// copyImageWithProgress runs copy.Image with an mpb bar per artifact (for
-// direct/foreground FFI callers, e.g. `llmman transfer`'s podman backend —
-// though transfer_podman.go's own copy.Image calls don't currently go
-// through this, only pull/push do) and folds the same byte counts into
-// progressKey's entry in the shared progressState snapshot (see
-// progress_state.go) that lets cmd::serve poll them out of the daemon
-// process — two consumers of the same underlying go.podman.io/image
-// progress channel. present/pastTense label each artifact's bar (e.g.
-// "Pulling"/"Pulled", "Pushing"/"Pushed").
+// copyImageWithProgress runs copyImageAttempt with retry and stall
+// detection, via the same retryStream helper (shared_oci.go) that already
+// backs hf.go's downloads and transfer_docker.go's streaming pushes — for
+// the one path that had none of it: a real registry pull that simply
+// stalled mid-blob-download (zero bytes, indefinitely, no error) is
+// exactly what a plain context.Context with no deadline of its own can't
+// recover from, and it's what first surfaced this gap — the new
+// podman-backend e2e CI coverage's very first run hit a genuine 600s
+// test-harness timeout here with zero visible progress. isHTTP4xx stops
+// retrying immediately on a permanent error (bad ref, auth failure, ...)
+// rather than wasting up to dlMaxAttempts backoff cycles on one.
+//
+// A retry after a stall (or any other transient error) simply calls
+// copy.Image again from scratch: neither of its two destinations (a local
+// OCI layout directory for pulls, a registry for pushes) loses
+// already-completed blobs between attempts, so a retry only re-fetches
+// whatever didn't finish the first time — the same "retry, don't resume"
+// trade-off shared_oci.go's own doc comment already accepts for
+// transfer_docker.go's non-resumable registry-push path, for the same
+// underlying reason: copy.Image (like that path) has no protocol-level
+// way to resume a partial blob.
+func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool, progressKey string) error {
+	// Held for the whole retry sequence, not just one attempt — see this
+	// mutex's own doc comment on why the actual data transfer is kept
+	// fully serialized across every concurrent pull/push in this process.
+	copyImageMu.Lock()
+	defer copyImageMu.Unlock()
+
+	return retryStream(ctx, progressKey, isHTTP4xx, func() error {
+		return copyImageAttempt(ctx, pctx, dst, src, present, pastTense, opts, changed, progressKey)
+	})
+}
+
+// copyImageAttempt runs a single copy.Image call with an mpb bar per
+// artifact (for direct/foreground FFI callers, e.g. `llmman transfer`'s
+// podman backend — though transfer_podman.go's own copy.Image calls
+// don't currently go through this, only pull/push do) and folds the
+// same byte counts into progressKey's entry in the shared progressState
+// snapshot (see progress_state.go) that lets cmd::serve poll them out of
+// the daemon process — two consumers of the same underlying
+// go.podman.io/image progress channel. present/pastTense label each
+// artifact's bar (e.g. "Pulling"/"Pulled", "Pushing"/"Pushed").
 //
 // If changed is non-nil, it's set to true whenever at least one artifact
 // actually completes a copy (types.ProgressEventDone) rather than turning
@@ -234,17 +267,38 @@ var copyImageMu sync.Mutex
 // which never leads to a Done for that same artifact) — letting a caller
 // like pushToRegistry/podmanTransferOCI tell whether anything was really
 // pushed, e.g. to report "already up to date" for a no-op re-transfer.
-func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool, progressKey string) error {
-	copyImageMu.Lock()
-	defer copyImageMu.Unlock()
+//
+// Stall detection: copy.Image is a single opaque call into
+// go.podman.io/image with no per-blob hooks of its own — unlike hf.go's
+// downloadHFBlob (which wraps its own http.Response.Body in a
+// stallReader), the only signal available here is copy.Image's own
+// Progress channel, so a ProgressEventRead/NewArtifact/Done/Skipped
+// callback IS this backend's only "still alive" signal. The watchdog
+// goroutine below cancels a context derived from ctx (independent of
+// whatever cancellation the caller's own ctx already provides) if
+// dlStallTimeout passes with no such callback at all — which, since it
+// covers the time before the first callback too, also catches a stall
+// during manifest/credential resolution, not just mid-blob-download.
+func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool, progressKey string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	prog := mpb.New(mpb.WithOutput(os.Stderr))
 	ch := make(chan types.ProgressProperties)
 	bars := make(map[string]*mpb.Bar)
 	progDone := make(chan struct{})
+
+	var mu sync.Mutex
+	lastEvent := time.Now()
+	stalled := false
+
 	go func() {
 		defer close(progDone)
 		for p := range ch {
+			mu.Lock()
+			lastEvent = time.Now()
+			mu.Unlock()
+
 			key := p.Artifact.Digest.String()
 			switch p.Event {
 			case types.ProgressEventNewArtifact:
@@ -302,13 +356,44 @@ func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, d
 		}
 	}()
 
+	watchdogDone := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				timedOut := time.Since(lastEvent) > dlStallTimeout
+				if timedOut {
+					stalled = true
+				}
+				mu.Unlock()
+				if timedOut {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
 	opts.Progress = ch
 	opts.ProgressInterval = 200 * time.Millisecond
 
 	_, err := copy.Image(ctx, pctx, dst, src, opts)
 	close(ch)
 	<-progDone
+	<-watchdogDone
 	prog.Wait()
+	mu.Lock()
+	wasStalled := stalled
+	mu.Unlock()
+	if err != nil && wasStalled {
+		return fmt.Errorf("stalled: no progress for over %v: %w", dlStallTimeout, err)
+	}
 	return err
 }
 
