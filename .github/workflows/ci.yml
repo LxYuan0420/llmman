@@ -277,7 +277,7 @@ jobs:
   # ships a binary for, not just a subset of them.
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/opencode/codex) — ${{ matrix.target }}
+    name: E2E (launch claude/opencode/codex) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
     # 25 was set back when this only ever ran on ubuntu-24.04 (a typical
     # run there takes 5-7 minutes total). Confirmed against real
@@ -294,36 +294,68 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Linux x86_64 ──────────────────────────────────────────────────
+          # ── Linux x86_64 (docker backend) ────────────────────────────────
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             go-os: linux
             llama-asset: llama-b10293-bin-ubuntu-x64.tar.gz
+            backend: docker
+            feature-flags: ""
 
-          # ── Linux aarch64 ─────────────────────────────────────────────────
+          # ── Linux aarch64 (docker backend) ───────────────────────────────
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             go-os: linux
             llama-asset: llama-b10293-bin-ubuntu-arm64.tar.gz
+            backend: docker
+            feature-flags: ""
 
-          # ── macOS aarch64 (Apple Silicon) ─────────────────────────────────
+          # ── Linux x86_64 (podman backend) ────────────────────────────────
+          # Same runner/llama-asset as the docker entry above, just linked
+          # against go-shim/backend_podman.go (go.podman.io/image) instead
+          # of go-shim/backend_docker.go — this is the only place that
+          # backend's actual pull/push code path gets exercised end-to-end
+          # against a real registry; the `test` job's own unit tests never
+          # touch the ffi::* boundary that differs between backends, and
+          # the `build` job only compiles this backend, it doesn't run it.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            go-os: linux
+            llama-asset: llama-b10293-bin-ubuntu-x64.tar.gz
+            backend: podman
+            feature-flags: "--no-default-features --features podman"
+
+          # ── Linux aarch64 (podman backend) ───────────────────────────────
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            go-os: linux
+            llama-asset: llama-b10293-bin-ubuntu-arm64.tar.gz
+            backend: podman
+            feature-flags: "--no-default-features --features podman"
+
+          # ── macOS aarch64 (Apple Silicon, docker backend) ────────────────
           - target: aarch64-apple-darwin
             runner: macos-15
             go-os: darwin
             llama-asset: llama-b10293-bin-macos-arm64.tar.gz
+            backend: docker
+            feature-flags: ""
 
-          # ── Windows x86_64 ────────────────────────────────────────────────
+          # ── Windows x86_64 (docker backend) ──────────────────────────────
           # lld-link, not MSVC link.exe — see the `build` job's own comment
           # on why (same CGO-produced-object-format issue, native build or
-          # not).
+          # not). No podman entry: containers/image has no Windows support
+          # (see the `build` job's own comment on its identical exclusion).
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             go-os: windows
             llama-asset: llama-b10293-bin-win-cpu-x64.zip
             msvc-arch: amd64
             rustflags: "-C linker=lld-link"
+            backend: docker
+            feature-flags: ""
 
-          # ── Windows aarch64 ───────────────────────────────────────────────
+          # ── Windows aarch64 (docker backend) ─────────────────────────────
           # rustflags empty (MSVC-native link.exe, not lld-link) — see the
           # `build` job's own comment on why this one architecture is the
           # opposite of the x86_64 Windows entry just above.
@@ -333,6 +365,8 @@ jobs:
             llama-asset: llama-b10293-bin-win-cpu-arm64.zip
             msvc-arch: arm64
             rustflags: ""
+            backend: docker
+            feature-flags: ""
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -354,7 +388,12 @@ jobs:
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          key: e2e-${{ matrix.target }}
+          # backend, not just target: the docker/podman entries sharing a
+          # target build with different --features, and Cargo's target dir
+          # doesn't itself key build artefacts by feature set — an
+          # unqualified key here would have them fight over (and keep
+          # invalidating) the same cache entry.
+          key: e2e-${{ matrix.target }}-${{ matrix.backend }}
 
       - name: Cache Go modules
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -515,9 +554,15 @@ jobs:
       # --target: matches the build job's own invocation (every one of
       # these is a native build, but explicit --target keeps the output
       # path/build-plan identical to that job's, rather than relying on
-      # implicit host-target resolution).
+      # implicit host-target resolution). matrix.feature-flags is empty
+      # for the docker entries (its default) and
+      # "--no-default-features --features podman" for the two podman ones
+      # — mirrors the `build` job's own separate "Build (podman backend)"
+      # step, just reused here as a matrix dimension instead of a second
+      # step, since this job needs the resulting binary under test either
+      # way, not just a successful compile.
       - name: Build llmman
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.feature-flags }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
@@ -570,8 +615,12 @@ jobs:
       # this job's Windows entry ran — root-caused to exactly this: the
       # env was present on the Build llmman step above, but this step
       # never inherits another step's `env:` block, and never had its own.
+      # matrix.feature-flags: same reasoning as the Build llmman step —
+      # this test binary must link against the same backend the one built
+      # above did, or the two podman entries would silently test a docker-
+      # backed binary instead.
       - name: cargo test --test launch_e2e
-        run: cargo test --release --target ${{ matrix.target }} --test launch_e2e -- --test-threads=1 --nocapture
+        run: cargo test --release --target ${{ matrix.target }} ${{ matrix.feature-flags }} --test launch_e2e -- --test-threads=1 --nocapture
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
