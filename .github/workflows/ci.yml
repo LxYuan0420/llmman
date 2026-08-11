@@ -716,12 +716,11 @@ jobs:
           for dir in */; do
             target="${dir%/}"          # e.g. llmman-docker-x86_64-unknown-linux-gnu
             triple="${target#llmman-docker-}"
-            src="$dir/llmman"
-            [ -f "$dir/llmman.exe" ] && src="$dir/llmman.exe"
-            ext="${src##*.}"
-            [ "$ext" = "llmman" ] && ext=""  # no extension
-            [ "$ext" != "" ] && ext=".$ext"
-            cp "$src" "llmman-${triple}${ext}"
+            if [ -f "${dir}llmman.exe" ]; then
+              cp "${dir}llmman.exe" "llmman-${triple}.exe"
+            else
+              cp "${dir}llmman" "llmman-${triple}"
+            fi
           done
 
       - name: Determine release tag
