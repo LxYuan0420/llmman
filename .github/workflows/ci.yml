@@ -449,15 +449,6 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
-      # --target here too, for the same reason as the Build llmman step —
-      # and RUSTFLAGS needs repeating here too, not just there: this step
-      # compiles its own separate test binary (tests/launch_e2e.rs), which
-      # links against the exact same Go-shim-produced llmman_shim.lib the
-      # main binary does, and hit that same LNK1223 lld-link exists to
-      # avoid (see the `build` job's own comment) the first several times
-      # this job's Windows entry ran — root-caused to exactly this: the
-      # env was present on the Build llmman step above, but this step
-      # never inherits another step's `env:` block, and never had its own.
       # LLAMA_ARG_N_GPU_LAYERS=0 on macOS only: llama-server reads this
       # itself (it's the env form of its own --gpu-layers flag), and this
       # process's environment reaches the llama-server subprocess
@@ -479,21 +470,36 @@ jobs:
       # real users' models (the overwhelming majority of which have no
       # such issue and would lose real Metal acceleration for nothing).
       #
-      # LLAMA_ARG_N_GPU_LAYERS is exported conditionally in-script (not
-      # set via this step's own `env:` with an empty-string fallback for
-      # non-macOS) — confirmed against a real x86_64-unknown-linux-gnu run
-      # that llama-server does not treat an *empty* value as "unset": it
-      # tries to parse it as an integer regardless ("error while handling
-      # environment variable \"LLAMA_ARG_N_GPU_LAYERS\": stoi"), which
-      # broke every platform this env: block's fallback reached, not just
-      # the macOS one it was meant for.
+      # Set via a separate, macOS-only step into $GITHUB_ENV rather than
+      # this step's own `env:` (confirmed broken on a real
+      # x86_64-unknown-linux-gnu run: llama-server treats even an *empty*
+      # value as present and tries to parse it as an integer regardless —
+      # "error while handling environment variable
+      # \"LLAMA_ARG_N_GPU_LAYERS\": stoi") — or inline in this step's own
+      # script with `shell: bash` (confirmed broken on a real
+      # aarch64-pc-windows-msvc run a different way: forcing bash here
+      # reorders PATH enough that rustc's link.exe resolves to Git for
+      # Windows' own unrelated /usr/bin/link.exe — a hardlink-creation
+      # utility that happens to share the name — instead of MSVC's
+      # linker). A step gated on `if:` so it only even runs on macOS,
+      # writing to $GITHUB_ENV, avoids both: every other platform's
+      # environment and shell for the actual test step below stays
+      # completely untouched.
+      - name: Force CPU-only llama-server (macOS only)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: echo "LLAMA_ARG_N_GPU_LAYERS=0" >> "$GITHUB_ENV"
+
+      # --target: for the same reason as the Build llmman step above —
+      # and RUSTFLAGS needs repeating here too, not just there: this step
+      # compiles its own separate test binary (tests/launch_e2e.rs), which
+      # links against the exact same Go-shim-produced llmman_shim.lib the
+      # main binary does, and hit that same LNK1223 lld-link exists to
+      # avoid (see the `build` job's own comment) the first several times
+      # this job's Windows entry ran — root-caused to exactly this: the
+      # env was present on the Build llmman step above, but this step
+      # never inherits another step's `env:` block, and never had its own.
       - name: cargo test --test launch_e2e
-        shell: bash
-        run: |
-          if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
-            export LLAMA_ARG_N_GPU_LAYERS=0
-          fi
-          cargo test --release --target ${{ matrix.target }} --test launch_e2e -- --test-threads=1 --nocapture
+        run: cargo test --release --target ${{ matrix.target }} --test launch_e2e -- --test-threads=1 --nocapture
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
