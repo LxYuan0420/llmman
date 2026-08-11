@@ -650,6 +650,27 @@ jobs:
             echo "no serve.log found at $log"
           fi
 
+      # ── Diagnostic: partial blob sizes on a failed pull ──────────────────
+      # TEMPORARY — investigating the podman e2e job's real pull taking
+      # far longer than expected. serve.log's own bar-rendering output
+      # (mpb, above) tells us nothing useful when redirected to a plain
+      # file rather than a real TTY, so this exists purely to answer one
+      # question directly: at failure time, is the target blob sitting at
+      # 0 bytes (a true stall — the new watchdog in backend_podman.go
+      # should already prevent this) or some large-but-incomplete size
+      # (genuinely slow/throttled network, not a stall at all)?
+      - name: Show partial blob sizes (diagnostic, podman only)
+        if: always() && matrix.backend == 'podman'
+        shell: bash
+        run: |
+          dir="$HOME/.local/share/llmman/store/blobs/sha256"
+          if [ -d "$dir" ]; then
+            echo "--- $dir ---"
+            ls -la "$dir"
+          else
+            echo "no blobs dir found at $dir"
+          fi
+
   # --------------------------------------------------------------------------
   # Release: attach binaries to GitHub Releases on tag push
   # --------------------------------------------------------------------------
