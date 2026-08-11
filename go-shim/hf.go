@@ -32,22 +32,6 @@ const hfGGUFMediaType = "application/vnd.docker.ai.gguf.v3"
 // Registry detection
 // ---------------------------------------------------------------------------
 
-// traceLog is temporary diagnostic logging (see this repo's own git
-// history) for an elusive windows-2025/windows-11-arm-only pull hang —
-// timestamped so a gap between two consecutive lines is directly visible
-// as time actually spent in whichever call sits between them, the same
-// way tests/launch_e2e.rs's own spawn_with_timeout heartbeat already
-// works for the Rust-side half of this same investigation. Lives here
-// (rather than backend_docker.go, its original home) specifically
-// because this file — unlike that one — has no //go:build constraint,
-// so it's the one place both the docker- and podman-backend builds can
-// both call it from without duplicating it. Remove once that hang is
-// understood; this package has no general-purpose logger of its own to
-// fold this into instead.
-func traceLog(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "[llmman-trace] %s %s\n", time.Now().Format(time.RFC3339Nano), fmt.Sprintf(format, args...))
-}
-
 // isKnownOCIHost returns true for registries that are definitely OCI-compliant,
 // skipping the network probe entirely.
 func isKnownOCIHost(host string) bool {
@@ -112,11 +96,9 @@ func isOCIHost(ctx context.Context, host string) bool {
 // defaulted in, and isOCI reports whether normalizedRef's host should be
 // pulled via the OCI registry protocol (true) or the shared HF path (false).
 func classifyPullRef(ctx context.Context, ref, layoutDir string) (normalizedRef string, isOCI, handled bool, dispatchErr error) {
-	traceLog("classifyPullRef(%s): calling dispatchPull", ref)
 	if handled, err := dispatchPull(ctx, ref, layoutDir); handled {
 		return ref, false, true, err
 	}
-	traceLog("classifyPullRef(%s): dispatchPull declined, normalizing + checking host", ref)
 
 	// Normalize: append :latest if reference has no tag or digest.
 	if strings.LastIndex(ref, ":") <= strings.LastIndex(ref, "/") {
@@ -124,9 +106,7 @@ func classifyPullRef(ctx context.Context, ref, layoutDir string) (normalizedRef 
 	}
 
 	host := strings.SplitN(ref, "/", 2)[0]
-	isOCI = isOCIHost(ctx, host)
-	traceLog("classifyPullRef(%s): host=%s isOCI=%v", ref, host, isOCI)
-	return ref, isOCI, false, nil
+	return ref, isOCIHost(ctx, host), false, nil
 }
 
 // ---------------------------------------------------------------------------

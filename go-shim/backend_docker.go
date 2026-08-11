@@ -54,14 +54,10 @@ import (
 // surfaced this beyond a confusing downstream "insufficient_scope" or
 // 401 on push).
 func dockerCredentials(host string) (string, string, error) {
-	traceLog("dockerCredentials(%q): loading default config file", host)
 	cfg := dockercliconfig.LoadDefaultConfigFile(io.Discard)
-	traceLog("dockerCredentials(%q): config loaded, credsStore=%q credHelpers=%v", host, cfg.CredentialsStore, cfg.CredentialHelpers)
 	for _, lookup := range dockerHubCredentialKeys(host) {
 		store := cfg.GetCredentialsStore(lookup)
-		traceLog("dockerCredentials(%q): looking up %q", host, lookup)
 		creds, err := getCredentialsWithTimeout(store, lookup)
-		traceLog("dockerCredentials(%q): lookup %q done, err=%v", host, lookup, err)
 		if err != nil {
 			continue // not found under this key — try the next one
 		}
@@ -86,18 +82,20 @@ func dockerCredentials(host string) (string, string, error) {
 // credential helper, this call execs an external "docker-credential-
 // <name>" *subprocess* (see docker-cli's NewNativeStore/
 // client.NewShellProgramFunc), piping the lookup over stdin/stdout —
-// with no timeout of its own either. On a machine where such a helper is
-// configured but can't actually complete (observed directly: a real
-// windows-2025/windows-11-arm CI runner — likely Docker Desktop's own
-// pre-configured credsStore trying to reach a Desktop backend service
-// that isn't running in a headless CI VM) that subprocess call blocks
-// forever, and so — since this is on containerd's own credential-lookup
-// path, called synchronously before the actual registry request it's
-// authenticating even goes out — does every pull/push through it, with
-// nothing above this in the call stack able to time it out on its own
-// (see cmd::serve's PULL_LOCK-turned-per-model-lock and llmman run's own
-// spawn timeout in tests/launch_e2e.rs, neither of which ever got a
-// chance to fire before this).
+// with no timeout of its own either. If such a helper is configured but
+// can't actually complete (e.g. a GUI-backed one — Docker Desktop's own
+// credsStore, say — invoked on a headless machine with no session for it
+// to reach), that subprocess call blocks forever, and so — since this is
+// on containerd's own credential-lookup path, called synchronously
+// before the actual registry request it's authenticating even goes out —
+// does every pull/push through it, with nothing above this in the call
+// stack able to time it out on its own. This was investigated as a
+// candidate for an elusive Windows-only pull hang (see this repo's own
+// git history) but ultimately ruled out — trace logging showed that hang
+// occurring before this function, or even llmman_pull itself, ever ran —
+// so it remains here purely as a real, independent hardening fix against
+// a genuinely hanging credential helper on any platform, not a fix for
+// that specific issue.
 func getCredentialsWithTimeout(store credentials.Store, lookup string) (clitypes.AuthConfig, error) {
 	type result struct {
 		creds clitypes.AuthConfig
@@ -516,14 +514,11 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 //export llmman_pull
 func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	ref := C.GoString(cRef)
-	traceLog("llmman_pull entered for %s", ref)
 	progressReset(ref, "pulling manifest")
 	defer progressDone(ref)
 	if err := pullToLayout(context.Background(), ref, C.GoString(cLayoutDir)); err != nil {
-		traceLog("llmman_pull for %s failed: %v", ref, err)
 		return errResp(err)
 	}
-	traceLog("llmman_pull for %s succeeded", ref)
 	return okResp("")
 }
 
@@ -550,16 +545,6 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	}
 
 	resolver := newResolver(ctx)
-	// Temporary trace logging (see this repo's own git history): a
-	// windows-2025/windows-11-arm-only hang gets stuck somewhere between
-	// "pulling manifest" (set well above, before classifyPullRef) and the
-	// next status update (progressSetStatus(progressKey, "pulling"),
-	// well below) with zero visibility into which of resolve/Fetcher/
-	// Fetch — each a distinct network round-trip, and (for Resolve/Fetch)
-	// each also where containerd's own docker.Authorizer synchronously
-	// calls into dockerCredentials, which just got a hang-guard of its own
-	// for exactly this reason — is the one actually stuck.
-	traceLog("resolving manifest for %s", ref)
 	// Deliberately not "resolve %s: %w" — containerd's own resolve errors
 	// (e.g. errdefs.ErrNotFound) already embed ref themselves, and every
 	// caller of llmman_pull (the Rust daemon's /api/pull handler) already
@@ -569,19 +554,16 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 	if err != nil {
 		return fmt.Errorf("resolve: %w", err)
 	}
-	traceLog("resolved to %s; creating fetcher", name)
 	fetcher, err := resolver.Fetcher(ctx, name)
 	if err != nil {
 		return fmt.Errorf("create fetcher: %w", err)
 	}
 
 	// Fetch and store manifest
-	traceLog("fetching manifest blob %s", manifestDesc.Digest)
 	rc, err := fetcher.Fetch(ctx, manifestDesc)
 	if err != nil {
 		return fmt.Errorf("fetch manifest: %w", err)
 	}
-	traceLog("got manifest reader; reading body")
 	manifestData, err := io.ReadAll(rc)
 	rc.Close()
 	if err != nil {
