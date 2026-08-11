@@ -272,6 +272,20 @@ fn launch_codex(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     // Write codex config
     write_codex_config()?;
 
+    // Regression: this used to pass a bare PathBuf::from("codex") straight
+    // to exec_with_env instead of resolving it via find_on_path like every
+    // other integration here does. That happened to work on Unix (bare
+    // relative names go through $PATH search via execvp with no extension
+    // needed), but on Windows, Command::status() calls CreateProcess
+    // directly (not cmd.exe), which — unlike a shell — does not consult
+    // PATHEXT to try .cmd/.bat alternatives for an extensionless name: it
+    // only ever auto-appends a single ".exe". Since `npm install -g
+    // @openai/codex` installs a "codex.cmd" shim on Windows, not a
+    // "codex.exe", every real Windows codex launch failed with "program
+    // not found" — a real E2E-verified failure, not a theoretical one.
+    let bin = find_on_path("codex")
+        .ok_or_else(|| anyhow::anyhow!("codex is not installed: npm install -g @openai/codex"))?;
+
     let mut args: Vec<String> = Vec::new();
     if !model.is_empty() {
         args.extend(["--model".to_string(), model.to_string()]);
@@ -281,7 +295,7 @@ fn launch_codex(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     args.extend_from_slice(extra_args);
 
     exec_with_env(
-        &PathBuf::from("codex"),
+        &bin,
         &args,
         &[("OPENAI_API_KEY", "llmman")],
     )
