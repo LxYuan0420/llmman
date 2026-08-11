@@ -74,7 +74,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The exact short name every `llmman launch ... --model` invocation in
@@ -153,6 +153,18 @@ fn fresh_home(label: &str) -> PathBuf {
     dir
 }
 
+/// Returns the last `n` bytes of `buf` as a lossy string, prefixed with an
+/// ellipsis marker when truncated — used by spawn_with_timeout's
+/// heartbeat to show recent output without the printed heartbeat itself
+/// growing unboundedly as a slow child produces more and more of it.
+fn tail_str(buf: &[u8], n: usize) -> String {
+    if buf.len() > n {
+        format!("...<{} bytes total>...{}", buf.len(), String::from_utf8_lossy(&buf[buf.len() - n..]))
+    } else {
+        String::from_utf8_lossy(buf).into_owned()
+    }
+}
+
 /// Runs `cmd`, waiting up to `timeout` and killing (then panicking with
 /// `description` in the message) it if it hasn't exited by then.
 /// stdout/stderr are drained on background threads while polling for
@@ -166,27 +178,46 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
 
     let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {description}: {e}"));
     // Temporary diagnostic (see this repo's own git history): an elusive
-    // Windows-only hang in this file has, so far, produced zero output at
-    // all even well past every timeout this function or its callers
-    // enforce — meaning either the hang is somewhere *before* this point
-    // even runs, or log output during a forceful GH Actions job
-    // cancellation isn't reliably flushed/uploaded. A heartbeat every 30s
-    // rather than only a single message at spawn/exit narrows down which,
-    // and exactly how far a genuinely slow (rather than truly stuck) run
-    // gets, the next time this reproduces.
+    // Windows/macOS-only hang in this file has, so far, only ever shown a
+    // bare "still running" heartbeat with no insight into what the child
+    // itself is doing at that point — its own stdout/stderr used to only
+    // become visible once it exited (or was killed at the timeout), by
+    // which point a forceful GH Actions job cancellation (the outer
+    // timeout-minutes, not this function's own) has sometimes lost the
+    // last several minutes of log output entirely. Reading into shared
+    // buffers the heartbeat can peek at live (rather than only handing
+    // them back once each reader thread's `read_to_end` finally returns)
+    // means the child's own progress up to the very last heartbeat before
+    // that happens is visible even if everything after it is lost.
     eprintln!("[spawn_with_timeout] pid={} spawned: {description}", child.id());
     let mut stdout_pipe = child.stdout.take().expect("child stdout");
     let mut stderr_pipe = child.stderr.take().expect("child stderr");
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
+    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+    let stdout_thread = {
+        let buf = Arc::clone(&stdout_buf);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stdout_pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
+        })
+    };
+    let stderr_thread = {
+        let buf = Arc::clone(&stderr_buf);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stderr_pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
+        })
+    };
 
     let start = Instant::now();
     let mut last_heartbeat = start;
@@ -202,9 +233,11 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
         if last_heartbeat.elapsed() > Duration::from_secs(30) {
             last_heartbeat = Instant::now();
             eprintln!(
-                "[spawn_with_timeout] pid={} still running after {:?}: {description}",
+                "[spawn_with_timeout] pid={} still running after {:?}: {description}\n  stdout tail: {:?}\n  stderr tail: {:?}",
                 child.id(),
-                start.elapsed()
+                start.elapsed(),
+                tail_str(&stdout_buf.lock().unwrap(), 300),
+                tail_str(&stderr_buf.lock().unwrap(), 300),
             );
         }
         if start.elapsed() > timeout {
@@ -212,16 +245,16 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
             let _ = child.wait();
             // Join the reader threads (rather than just discarding them)
             // before panicking: killing the child closes its end of both
-            // pipes, so read_to_end on each should return promptly — and
-            // whatever the process printed before it got stuck is exactly
-            // what's needed to tell "genuinely still downloading/loading
-            // a large model" apart from "stuck in a real hang" from the
-            // outside, instead of a bare timeout message that can't
-            // distinguish either.
-            let stdout = stdout_thread.join().map(|b| String::from_utf8_lossy(&b).into_owned())
-                .unwrap_or_else(|_| "<stdout reader thread panicked>".into());
-            let stderr = stderr_thread.join().map(|b| String::from_utf8_lossy(&b).into_owned())
-                .unwrap_or_else(|_| "<stderr reader thread panicked>".into());
+            // pipes, so each thread's blocking read should return promptly
+            // — and whatever the process printed before it got stuck is
+            // exactly what's needed to tell "genuinely still downloading/
+            // loading a large model" apart from "stuck in a real hang"
+            // from the outside, instead of a bare timeout message that
+            // can't distinguish either.
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            let stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap()).into_owned();
+            let stderr = String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned();
             panic!(
                 "{description} did not finish within {timeout:?} — likely a hang\n\
                  --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
@@ -230,10 +263,12 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
         std::thread::sleep(Duration::from_millis(200));
     };
 
+    stdout_thread.join().expect("join stdout reader thread");
+    stderr_thread.join().expect("join stderr reader thread");
     std::process::Output {
         status,
-        stdout: stdout_thread.join().expect("join stdout reader thread"),
-        stderr: stderr_thread.join().expect("join stderr reader thread"),
+        stdout: Arc::try_unwrap(stdout_buf).expect("stdout_buf uniquely owned after join").into_inner().unwrap(),
+        stderr: Arc::try_unwrap(stderr_buf).expect("stderr_buf uniquely owned after join").into_inner().unwrap(),
     }
 }
 
@@ -404,3 +439,4 @@ fn launch_codex_with_model() {
     let output = run_launch(&home, "codex", &extra_args);
     assert_launch_succeeded("codex", &extra_args, &output);
 }
+
