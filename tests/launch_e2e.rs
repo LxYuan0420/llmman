@@ -165,6 +165,16 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
         .stderr(Stdio::piped());
 
     let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {description}: {e}"));
+    // Temporary diagnostic (see this repo's own git history): an elusive
+    // Windows-only hang in this file has, so far, produced zero output at
+    // all even well past every timeout this function or its callers
+    // enforce — meaning either the hang is somewhere *before* this point
+    // even runs, or log output during a forceful GH Actions job
+    // cancellation isn't reliably flushed/uploaded. A heartbeat every 30s
+    // rather than only a single message at spawn/exit narrows down which,
+    // and exactly how far a genuinely slow (rather than truly stuck) run
+    // gets, the next time this reproduces.
+    eprintln!("[spawn_with_timeout] pid={} spawned: {description}", child.id());
     let mut stdout_pipe = child.stdout.take().expect("child stdout");
     let mut stderr_pipe = child.stderr.take().expect("child stderr");
     let stdout_thread = std::thread::spawn(move || {
@@ -179,9 +189,23 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
     });
 
     let start = Instant::now();
+    let mut last_heartbeat = start;
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll child status") {
+            eprintln!(
+                "[spawn_with_timeout] pid={} exited after {:?}: {description}",
+                child.id(),
+                start.elapsed()
+            );
             break status;
+        }
+        if last_heartbeat.elapsed() > Duration::from_secs(30) {
+            last_heartbeat = Instant::now();
+            eprintln!(
+                "[spawn_with_timeout] pid={} still running after {:?}: {description}",
+                child.id(),
+                start.elapsed()
+            );
         }
         if start.elapsed() > timeout {
             let _ = child.kill();
@@ -251,9 +275,11 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
 /// themselves expose.
 fn warm_model() {
     WARM.call_once(|| {
+        eprintln!("[warm_model] starting");
         let mut cmd = Command::new(llmman_bin());
         cmd.arg("run").arg(MODEL).arg("--think").arg("false").arg("--num-predict").arg("64").arg(PROMPT);
         let output = spawn_with_timeout(cmd, TIMEOUT, "llmman run (model warm-up)");
+        eprintln!("[warm_model] done, status={:?}", output.status);
         assert!(
             output.status.success(),
             "llmman run {MODEL} {PROMPT:?} (model warm-up) failed (status: {:?})\n\
@@ -268,7 +294,9 @@ fn warm_model() {
 /// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
 /// with `home` as its `HOME`. See `warm_model` and `spawn_with_timeout`.
 fn run_launch(home: &Path, integration: &str, extra_args: &[&str]) -> std::process::Output {
+    eprintln!("[run_launch] {integration}: calling warm_model()");
     warm_model();
+    eprintln!("[run_launch] {integration}: warm_model() returned, spawning launch");
 
     let mut cmd = Command::new(llmman_bin());
     cmd.arg("launch").arg(integration).arg("--model").arg(MODEL);
@@ -307,7 +335,9 @@ fn assert_launch_succeeded(integration: &str, extra_args: &[&str], output: &std:
 
 #[test]
 fn launch_claude_with_model() {
+    eprintln!("[test] launch_claude_with_model: acquiring SERIAL");
     let _guard = SERIAL.lock().unwrap();
+    eprintln!("[test] launch_claude_with_model: acquired SERIAL");
     if !on_path("llama-server") {
         eprintln!("skipping: llama-server not on PATH (required to serve any model)");
         return;
@@ -328,7 +358,9 @@ fn launch_claude_with_model() {
 
 #[test]
 fn launch_opencode_with_model() {
+    eprintln!("[test] launch_opencode_with_model: acquiring SERIAL");
     let _guard = SERIAL.lock().unwrap();
+    eprintln!("[test] launch_opencode_with_model: acquired SERIAL");
     if !on_path("llama-server") {
         eprintln!("skipping: llama-server not on PATH (required to serve any model)");
         return;
@@ -354,7 +386,9 @@ fn launch_opencode_with_model() {
 
 #[test]
 fn launch_codex_with_model() {
+    eprintln!("[test] launch_codex_with_model: acquiring SERIAL");
     let _guard = SERIAL.lock().unwrap();
+    eprintln!("[test] launch_codex_with_model: acquired SERIAL");
     if !on_path("llama-server") {
         eprintln!("skipping: llama-server not on PATH (required to serve any model)");
         return;
