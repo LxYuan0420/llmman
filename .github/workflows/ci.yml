@@ -154,14 +154,57 @@ jobs:
 
   # --------------------------------------------------------------------------
   # Unit tests: every #[cfg(test)] module under src/ (`cargo test --bin`,
-  # since this crate has no lib target — see Cargo.toml). Linux x86_64 only:
-  # these are pure-Rust logic tests with no OS-specific behavior, so one
-  # platform is enough to catch a regression.
+  # since this crate has no lib target — see Cargo.toml). These are pure-
+  # Rust logic tests with no OS-specific behavior, but the crate itself
+  # still links the Go shim via CGO, so a target-specific toolchain issue
+  # (the exact kind the `build`/`e2e` jobs' own git history is full of —
+  # lld-link vs MSVC link.exe, msvc-arch, ...) could just as easily break
+  # `cargo test` as `cargo build`. Mirrors the `build` job's own 5-target
+  # matrix exactly for that reason, rather than assuming Linux x86_64 is
+  # representative of the other four.
   # --------------------------------------------------------------------------
   test:
-    name: Unit tests
-    runs-on: ubuntu-24.04
+    name: Unit tests (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux x86_64 ──────────────────────────────────────────────────
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            go-os: linux
+
+          # ── Linux aarch64 ─────────────────────────────────────────────────
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            go-os: linux
+
+          # ── macOS aarch64 (Apple Silicon) ─────────────────────────────────
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            go-os: darwin
+
+          # ── Windows x86_64 ────────────────────────────────────────────────
+          # lld-link, not MSVC link.exe — see the `build` job's own comment
+          # on why (same CGO-produced-object-format issue, native build or
+          # not).
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            go-os: windows
+            msvc-arch: amd64
+            rustflags: "-C linker=lld-link"
+
+          # ── Windows aarch64 ───────────────────────────────────────────────
+          # rustflags empty (MSVC-native link.exe, not lld-link) — see the
+          # `build` job's own comment on why this one architecture is the
+          # opposite of the x86_64 Windows entry just above.
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            go-os: windows
+            msvc-arch: arm64
+            rustflags: ""
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -172,13 +215,18 @@ jobs:
           go-version: "1.25"
           cache-dependency-path: go-shim/go.sum
 
+      # targets: matches the build job's own Set up Rust step — needed
+      # there for genuinely cross-compiled targets, harmless here where
+      # every target is actually native.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          key: test-x86_64-unknown-linux-gnu
+          key: test-${{ matrix.target }}
 
       - name: Cache Go modules
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -186,14 +234,38 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-linux-${{ hashFiles('go-shim/go.sum') }}
-          restore-keys: go-linux-
+          key: go-${{ matrix.go-os }}-${{ hashFiles('go-shim/go.sum') }}
+          restore-keys: go-${{ matrix.go-os }}-
 
-      - name: Install build dependencies
+      # ── Windows: set up MSVC (needed for CGO, same as the `build` job) ────
+      # arch: matrix-driven (not a hardcoded amd64) — the ARM64 runner
+      # needs the ARM64 toolchain, or CGO compiling Go's ARM64 runtime
+      # stubs would use the wrong assembler (see the `build` job's own
+      # comment on its identical msvc-arch matrix field).
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: ${{ matrix.msvc-arch }}
+
+      # ── Linux: C compiler (always needed for CGO). macOS/Windows need
+      # neither: Xcode's command-line tools already provide a C compiler
+      # on the macOS runner image, and Windows' MSVC setup above covers it.
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get install -y gcc
 
+      # --target: matches the build job's own invocation (every one of
+      # these is a native build, but explicit --target keeps the output
+      # path/build-plan identical to that job's). RUSTFLAGS is needed here
+      # too, not just on a separate build step — see the e2e job's own
+      # comment on cargo test compiling its own separate test binary,
+      # which links against the same Go-shim-produced llmman_shim.lib the
+      # main binary does and hit the exact same lld-link requirement.
       - name: cargo test --bin llmman
-        run: cargo test --release --bin llmman
+        run: cargo test --release --target ${{ matrix.target }} --bin llmman
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
 
   # --------------------------------------------------------------------------
   # E2E: `llmman launch <claude|opencode|codex> --model qwen3.5:0.8b`
