@@ -687,7 +687,18 @@ jobs:
     name: Release
     needs: build
     runs-on: ubuntu-24.04
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Two release channels, both attaching one binary per matrix.target
+    # (see the build job above — this is where "all the platforms
+    # llama.app does" is actually decided, not here):
+    #   - a real v* tag push  -> a proper versioned release, tag as-is.
+    #   - any other push to main -> a single rolling "main" release,
+    #     re-tagged at the new commit every time, so `curl install.sh |
+    #     sh` (which defaults to /releases/latest/download/, see
+    #     install.sh/install.ps1) always gets a binary built from the
+    #     tip of main even before the first versioned release exists.
+    # PRs never reach this job at all (github.event_name == 'pull_request'
+    # is excluded by construction: neither condition below matches it).
+    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && github.event_name == 'push')
     permissions:
       contents: write
 
@@ -713,7 +724,34 @@ jobs:
             cp "$src" "llmman-${triple}${ext}"
           done
 
+      - name: Determine release tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "tag_name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "release_name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_name=main" >> "$GITHUB_OUTPUT"
+            echo "release_name=main (continuous build, ${GITHUB_SHA:0:7})" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The rolling "main" release/tag needs to move to the new commit on
+      # every push — delete-then-recreate rather than relying on
+      # action-gh-release to relocate an existing tag on its own, since
+      # that behavior isn't documented. Never touches a real v* tag: this
+      # only runs for the "main" channel.
+      - name: Move the rolling "main" tag to this commit
+        if: steps.tag.outputs.tag_name == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete main --yes --cleanup-tag -R "${{ github.repository }}" || true
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag_name }}
+          name: ${{ steps.tag.outputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          prerelease: false
           files: dist/llmman-*
