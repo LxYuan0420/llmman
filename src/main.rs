@@ -78,6 +78,11 @@ fn main() {
     // this same `main()`. See ffi::ensure_runtime_init's own doc comment
     // for why this is necessary on Windows specifically.
     ffi::ensure_runtime_init();
+    // As early as possible, before this process (directly, or via
+    // daemon::ensure_server) can spawn anything else on Windows — see
+    // daemon::disable_std_handle_inheritance's own doc comment for the
+    // real E2E hang this fixes.
+    daemon::disable_std_handle_inheritance();
 
     let cli = Cli::parse();
     let result = match &cli.command {

@@ -308,6 +308,95 @@ fn detach(cmd: &mut Command) {
     cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
+// ---------------------------------------------------------------------------
+// Windows-only: stop this process's own stdio handles from leaking into
+// whatever it spawns
+// ---------------------------------------------------------------------------
+
+/// Root-caused a real Windows-only E2E hang: `cargo test`'s own harness
+/// (tests/launch_e2e.rs's `spawn_with_timeout`) spawns `llmman run` with
+/// piped stdout/stderr to capture its output live, and that child's own
+/// `try_wait()`-detected exit was always reported correctly and promptly
+/// — the hang was in the *next* step, `stdout_thread`/`stderr_thread`'s
+/// `.join()`, which blocks on each reader thread's `read()` returning
+/// `Ok(0)` (EOF). A pipe only reaches EOF once *every* handle to its
+/// write end is closed — not just the one held by the process the reader
+/// thinks it's reading from.
+///
+/// On Windows, any `CreateProcess` call that redirects a child's stdio via
+/// a handle (a `File`, or another pipe — exactly what `ensure_server`
+/// below does, redirecting the daemon's stdout/stderr to its log file)
+/// requires `bInheritHandles = TRUE`, and that flag does not selectively
+/// inherit only the handles you asked to redirect — it inherits *every*
+/// handle in the parent's own handle table that's currently marked
+/// inheritable. `llmman run`'s own stdout/stderr handles — received from
+/// the test harness above specifically so they could be piped and
+/// captured, which requires them to be inheritable in the first place —
+/// are exactly such handles. So when `llmman run` calls `ensure_server`
+/// and spawns the detached daemon below, that daemon process — which is
+/// deliberately left running indefinitely — ends up with its own
+/// duplicate, still-open handle to `llmman run`'s original stdout/stderr
+/// pipes, even though its own stdio was separately, correctly redirected
+/// to the log file. The pipe's write end therefore never fully closes,
+/// the test harness's reader thread blocks on `read()` forever waiting
+/// for an EOF that can now never come, and the *entire* E2E job times out
+/// 45 minutes later with no error of its own — indistinguishable from
+/// there being no bug at all up to that point, since `llmman run` itself
+/// already exited successfully.
+///
+/// The fix: explicitly clear the inheritable flag on this process's own
+/// three standard handles, once, as early as possible (see `main.rs`) —
+/// before this process (or anything it calls into) ever spawns another
+/// child with `bInheritHandles = TRUE` for any reason. This does not
+/// affect this process's own use of those handles at all (only whether a
+/// *future child* of this process can inherit them), and is safe to call
+/// unconditionally even when nothing was ever piped in the first place
+/// (`GetStdHandle` returning a real console handle, or even
+/// `INVALID_HANDLE_VALUE`/null when there's no console at all, are all
+/// handled as no-ops below).
+#[cfg(windows)]
+mod win_handles {
+    use std::ffi::c_void;
+
+    #[allow(non_snake_case)]
+    extern "system" {
+        fn GetStdHandle(nStdHandle: i32) -> *mut c_void;
+        fn SetHandleInformation(hObject: *mut c_void, dwMask: u32, dwFlags: u32) -> i32;
+    }
+
+    const STD_INPUT_HANDLE: i32 = -10;
+    const STD_OUTPUT_HANDLE: i32 = -11;
+    const STD_ERROR_HANDLE: i32 = -12;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+
+    pub fn disable_std_handle_inheritance() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                // SAFETY: GetStdHandle/SetHandleInformation are ordinary
+                // kernel32 calls; `handle` is only ever passed to the one
+                // API that accepts exactly this value (including the
+                // documented NULL/INVALID_HANDLE_VALUE "no such stream"
+                // cases, which SetHandleInformation simply fails on
+                // harmlessly — the return value is deliberately ignored).
+                unsafe {
+                    let handle = GetStdHandle(which);
+                    if !handle.is_null() && handle != usize::MAX as *mut c_void {
+                        let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// See `win_handles`' own module doc comment. Must be called once, as
+/// early as possible in `main()` — a no-op on every platform but Windows.
+pub fn disable_std_handle_inheritance() {
+    #[cfg(windows)]
+    win_handles::disable_std_handle_inheritance();
+}
+
 /// A single line of Ollama's streamed NDJSON progress protocol (see
 /// api.ProgressResponse) — status text plus an optional error, and
 /// (unlike real Ollama's per-layer digest/total/completed) our own
