@@ -10,6 +10,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The single place to bump when a newer llama.cpp release is needed —
+  # every matrix.llama-asset entry below (e2e job) is just this release's
+  # OS/arch-specific asset suffix (e.g. "ubuntu-x64.tar.gz"), combined
+  # with this value at the "Install llama-server" step's own point of use
+  # ("llama-${LLAMA_CPP_RELEASE}-bin-${{ matrix.llama-asset }}") rather
+  # than each duplicating the full "llama-<release>-bin-..." filename
+  # independently.
+  LLAMA_CPP_RELEASE: b10293
 
 jobs:
   build:
@@ -298,7 +306,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             go-os: linux
-            llama-asset: llama-b10293-bin-ubuntu-x64.tar.gz
+            llama-asset: ubuntu-x64.tar.gz
             backend: docker
             feature-flags: ""
 
@@ -306,7 +314,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             go-os: linux
-            llama-asset: llama-b10293-bin-ubuntu-arm64.tar.gz
+            llama-asset: ubuntu-arm64.tar.gz
             backend: docker
             feature-flags: ""
 
@@ -321,7 +329,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             go-os: linux
-            llama-asset: llama-b10293-bin-ubuntu-x64.tar.gz
+            llama-asset: ubuntu-x64.tar.gz
             backend: podman
             feature-flags: "--no-default-features --features podman"
 
@@ -329,7 +337,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             go-os: linux
-            llama-asset: llama-b10293-bin-ubuntu-arm64.tar.gz
+            llama-asset: ubuntu-arm64.tar.gz
             backend: podman
             feature-flags: "--no-default-features --features podman"
 
@@ -337,7 +345,7 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-15
             go-os: darwin
-            llama-asset: llama-b10293-bin-macos-arm64.tar.gz
+            llama-asset: macos-arm64.tar.gz
             backend: docker
             feature-flags: ""
 
@@ -349,7 +357,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             go-os: windows
-            llama-asset: llama-b10293-bin-win-cpu-x64.zip
+            llama-asset: win-cpu-x64.zip
             msvc-arch: amd64
             rustflags: "-C linker=lld-link"
             backend: docker
@@ -362,7 +370,7 @@ jobs:
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             go-os: windows
-            llama-asset: llama-b10293-bin-win-cpu-arm64.zip
+            llama-asset: win-cpu-arm64.zip
             msvc-arch: arm64
             rustflags: ""
             backend: docker
@@ -474,19 +482,20 @@ jobs:
       # ── llama-server (the inference backend `llmman serve` shells out to) ──
       # A prebuilt release straight from upstream llama.cpp, pinned so CI
       # doesn't silently pick up a build that changes behavior mid-flight;
-      # bump LLAMA_CPP_RELEASE deliberately when a newer one is needed.
-      # `matrix.llama-asset` is this OS/arch's release asset (the Windows
-      # one's a .zip, the other two .tar.gz — extracted differently per
-      # OS below, see that step's own comment on why). The ubuntu/macOS
-      # archives unpack into one llama-<tag> subdirectory; the Windows one
-      # doesn't — found dynamically below rather than hardcoding either
-      # layout.
+      # bump the top-level env's LLAMA_CPP_RELEASE deliberately when a
+      # newer one is needed — that one edit is enough, unlike the old
+      # per-matrix-entry hardcoded filenames it replaced. `matrix.llama-asset`
+      # is just this OS/arch's release asset *suffix* (the Windows ones are
+      # .zip, the other three .tar.gz — extracted differently per OS below,
+      # see that step's own comment on why); combined with LLAMA_CPP_RELEASE
+      # below into the real filename. The ubuntu/macOS archives unpack into
+      # one llama-<tag> subdirectory; the Windows one doesn't — found
+      # dynamically below rather than hardcoding either layout.
       - name: Install llama-server
         shell: bash
-        env:
-          LLAMA_CPP_RELEASE: b10293
         run: |
           set -euo pipefail
+          asset="llama-${LLAMA_CPP_RELEASE}-bin-${{ matrix.llama-asset }}"
           # $HOME, not $RUNNER_TEMP: on Windows the latter is a native
           # `D:\a\_temp`-style path, and Git Bash's tar.exe (bsdtar) reads
           # the drive letter's colon as its own old rmt "host:path" remote-
@@ -495,16 +504,16 @@ jobs:
           # already the plain POSIX-style path (`/c/Users/...`) Git Bash
           # itself uses throughout, on every OS this runs on.
           #
-          # The local filename keeps matrix.llama-asset's own extension
-          # (not a fixed generic name) — confirmed directly against a real
-          # windows-2025 run that Expand-Archive (see below) determines
-          # archive format purely from the filename extension, unlike
-          # tar/file, which sniff actual file content: an extension-less
-          # name downloaded and byte-for-byte verified as a real zip still
-          # got "is not a supported archive file format" from it.
-          archive="$HOME/$(basename "${{ matrix.llama-asset }}")"
+          # The local filename keeps $asset's own extension (not a fixed
+          # generic name) — confirmed directly against a real windows-2025
+          # run that Expand-Archive (see below) determines archive format
+          # purely from the filename extension, unlike tar/file, which
+          # sniff actual file content: an extension-less name downloaded
+          # and byte-for-byte verified as a real zip still got "is not a
+          # supported archive file format" from it.
+          archive="$HOME/$asset"
           curl -fsSL --retry 5 --retry-all-errors -o "$archive" \
-            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE}/${{ matrix.llama-asset }}"
+            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE}/${asset}"
           dir="$HOME/llama-cpp"
           mkdir -p "$dir"
           # Windows needs Expand-Archive, not tar -xf: confirmed against a
