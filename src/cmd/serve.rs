@@ -171,6 +171,27 @@ impl Drop for ModelProcess {
     }
 }
 
+impl ModelProcess {
+    /// True if the underlying child process hasn't exited on its own since
+    /// this model was marked running. Nothing else ever tells `mgr.running`
+    /// about a process exiting unexpectedly (the only place that removes an
+    /// entry today is the explicit Ollama unload signal in
+    /// `handle_ollama_generate`) — a crash, an OOM kill, or anything else
+    /// that takes `llama-server`/vllm down on its own would otherwise keep
+    /// handing out that now-dead port forever, indistinguishable from a
+    /// real live one until whichever caller's request to it fails with a
+    /// bare connection error. `try_wait` is non-blocking either way: `Ok(None)`
+    /// (still running) is the overwhelmingly common case this needs to stay
+    /// cheap for.
+    fn is_alive(&mut self) -> bool {
+        let child = match self {
+            ModelProcess::Local(_, child) => child,
+            ModelProcess::Container(_, child) => child,
+        };
+        matches!(child.try_wait(), Ok(None))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Ollama API types
 // ---------------------------------------------------------------------------
@@ -833,11 +854,20 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
     let model_ref = canonical_ref(&state.0.store_path, &model_ref);
     let model_ref = model_ref.as_str();
 
-    // Fast path: model already running.
+    // Fast path: model already running. See ModelProcess::is_alive's own
+    // doc comment on why this checks the actual process, not just presence
+    // in the map.
     {
-        let mgr = state.0.manager.lock().await;
-        if let Some(m) = mgr.running.get(model_ref) {
-            return Ok(m.port);
+        let mut mgr = state.0.manager.lock().await;
+        if let Some(m) = mgr.running.get_mut(model_ref) {
+            if m.process.is_alive() {
+                return Ok(m.port);
+            }
+            eprintln!(
+                "[llmman] {model_ref} was marked running on port {} but its process has exited — reloading",
+                m.port
+            );
+            mgr.running.remove(model_ref);
         }
     } // mutex released before any I/O
 
@@ -861,9 +891,18 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
     let model_ref = model_ref.as_str();
 
     let mut mgr = state.0.manager.lock().await;
-    // Double-check: another task may have started the server while we were pulling.
-    if let Some(m) = mgr.running.get(model_ref) {
-        return Ok(m.port);
+    // Double-check: another task may have started the server while we were
+    // pulling — or, per the fast path's own check above, been marked
+    // running by one that has since exited on its own.
+    if let Some(m) = mgr.running.get_mut(model_ref) {
+        if m.process.is_alive() {
+            return Ok(m.port);
+        }
+        eprintln!(
+            "[llmman] {model_ref} was marked running on port {} but its process has exited — reloading",
+            m.port
+        );
+        mgr.running.remove(model_ref);
     }
     let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
         .with_context(|| format!("resolve model {model_ref}"))?;
