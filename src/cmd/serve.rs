@@ -83,6 +83,21 @@ pub struct ServeArgs {
     /// `llmman serve --ociman ...` (without `--pull-oci`) separately.
     #[arg(long, requires = "ociman")]
     pub pull_oci: bool,
+
+    /// Proactively download and cache the local `llama-server` binary
+    /// `llmman serve` would otherwise fetch on first use (see
+    /// crate::llama_release), as its own explicit foreground step, then
+    /// exit — the non-container equivalent of --pull-oci: same rationale,
+    /// same "run this first, in the foreground, then start the real
+    /// `llmman serve` separately" pattern, just for the local-binary path
+    /// instead of --ociman's container path. Backend selection (CPU,
+    /// CUDA, ROCm, Vulkan, Metal) uses the same host detection
+    /// (crate::hostgpu) as a normal `llmman serve` would, mirroring
+    /// llama.cpp's own installer's CUDA > ROCm > Vulkan > CPU probing
+    /// order. Not meaningful together with --ociman (that path never
+    /// resolves a local binary at all).
+    #[arg(long, conflicts_with_all = ["ociman", "pull_oci"])]
+    pub pull_bin: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2187,6 +2202,21 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     if _args.pull_oci {
         let ociman = _args.ociman.context("--pull-oci requires --ociman")?;
         crate::container::pull_image(ociman, _args.llama_cpp_version.as_deref())?;
+        return Ok(());
+    }
+    // Same idea as --pull-oci above, but for the local (non-container)
+    // llama-server binary path: resolve_llama_server's own download
+    // (crate::llama_release) normally happens further down regardless of
+    // --pull-bin, but by then this process may already be detached with
+    // its stdio redirected to a log file (see daemon.rs) — a caller
+    // waiting on the daemon to come up within ensure_server's short
+    // timeout would see nothing and could time out mid-download,
+    // indistinguishable from a hang. Run in the foreground first instead.
+    if _args.pull_bin {
+        let pinned_version = _args.llama_cpp_version.clone();
+        tokio::task::spawn_blocking(move || resolve_llama_server(pinned_version.as_deref()))
+            .await
+            .context("resolve llama-server task panicked")??;
         return Ok(());
     }
     // Only resolve (and require) a local llama-server binary when it'll

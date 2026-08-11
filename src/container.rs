@@ -14,11 +14,21 @@
 //! score here, just one container image to run, so detection below is a
 //! fixed priority order (CUDA > ROCm > Vulkan > CPU) rather than a
 //! numeric score.
+//!
+//! Host GPU detection itself (the real CUDA Driver/HIP runtime/Vulkan API
+//! probing) is entirely [`crate::hostgpu::detect`]'s job, shared with the
+//! local (non-container) `llama-server` binary path in
+//! `crate::llama_release` — this module only adds the mapping from that
+//! one shared [`HostGpu`] result to *which container image and
+//! `--device`/`--gpus` flags* to run, which `crate::hostgpu` has no
+//! reason to know about.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
+
+use crate::hostgpu::{self, HostGpu};
 
 /// Container engine to run the picked image with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -102,83 +112,37 @@ impl GpuBackend {
     }
 }
 
-/// Detects the best available GPU backend, in priority order
-/// CUDA > ROCm > Vulkan > CPU. Each check only inspects the *host* (via
-/// `nvidia-smi`, `/dev/kfd`, `/dev/dri`) — it can't verify the container
-/// engine itself is configured to pass a GPU through (e.g. whether
-/// nvidia-container-toolkit is actually registered with Docker/Podman).
-/// `docker run --gpus all` surfaces that misconfiguration directly and
-/// clearly enough on its own if it's missing, so detection here stays a
-/// simple, fast host probe rather than trying to fully replicate GPU
-/// passthrough validation too.
+/// Detects the best available GPU backend by delegating to
+/// [`crate::hostgpu::detect`] (real CUDA Driver/HIP runtime/Vulkan API
+/// probing — see that module) and mapping its result onto which
+/// `ghcr.io/ggml-org/llama.cpp` image to run. This can't verify the
+/// container engine itself is configured to pass a GPU through (e.g.
+/// whether nvidia-container-toolkit is actually registered with
+/// Docker/Podman) — `docker run --gpus all` surfaces that
+/// misconfiguration directly and clearly enough on its own if it's
+/// missing, so this stays a plain host probe rather than trying to fully
+/// replicate GPU passthrough validation too.
 fn detect_backend() -> GpuBackend {
-    if let Some(cuda) = detect_cuda() {
-        return cuda;
-    }
-    if detect_rocm() {
-        return GpuBackend::Rocm;
-    }
-    if detect_vulkan() {
-        return GpuBackend::Vulkan;
-    }
-    GpuBackend::Cpu
+    backend_from_hostgpu(hostgpu::detect())
 }
 
-/// `nvidia-smi` ships with the NVIDIA driver itself (not the container
-/// toolkit), so its presence and a successful exit is a reliable "there's
-/// an NVIDIA GPU with a working driver here" signal. Its human-readable
-/// output is parsed by [`cuda_backend_from_nvidia_smi_output`] to pick
-/// cuda12 vs. cuda13.
-fn detect_cuda() -> Option<GpuBackend> {
-    let output = std::process::Command::new("nvidia-smi").output().ok()?;
-    if !output.status.success() {
-        return None;
+/// Pure mapping from [`HostGpu`] to [`GpuBackend`], split out from
+/// [`detect_backend`] so the CUDA 12-vs-13 image split (llama.cpp's own
+/// CUDA Dockerfile split between the `cuda`/`cuda12` tag, built against
+/// CUDA_VERSION 12.8.1, and `cuda13`, 13.3.0 — see docs/docker.md) can be
+/// tested directly without needing real GPU hardware. `HostGpu::Metal`
+/// has no container image (Docker/Podman GPU passthrough isn't a macOS
+/// concept, and `--ociman` is rejected on non-Linux before this is ever
+/// called — see `cmd::serve::serve_async`) and falls back to CPU here
+/// only so this match stays exhaustive.
+fn backend_from_hostgpu(gpu: HostGpu) -> GpuBackend {
+    match gpu {
+        HostGpu::Cuda { major } if major >= 13 => GpuBackend::Cuda13,
+        HostGpu::Cuda { .. } => GpuBackend::Cuda12,
+        HostGpu::Rocm => GpuBackend::Rocm,
+        HostGpu::Vulkan => GpuBackend::Vulkan,
+        HostGpu::Metal | HostGpu::None => GpuBackend::Cpu,
     }
-    Some(cuda_backend_from_nvidia_smi_output(
-        &String::from_utf8_lossy(&output.stdout),
-    ))
-}
-
-/// Picks cuda12 vs. cuda13 from `nvidia-smi`'s human-readable header, which
-/// reports the driver's supported CUDA version as e.g. "CUDA Version: 13.0"
-/// — major version 13 and up picks the cuda13 image, matching llama.cpp's
-/// own CUDA Dockerfile split between the `cuda`/`cuda12` tag (built against
-/// CUDA_VERSION 12.8.1) and `cuda13` (13.3.0); see docs/docker.md. Defaults
-/// to cuda12 if the version can't be parsed out of the output at all,
-/// since that tag covers a much wider range of driver versions.
-fn cuda_backend_from_nvidia_smi_output(text: &str) -> GpuBackend {
-    let major: Option<u32> = text
-        .split("CUDA Version:")
-        .nth(1)
-        .and_then(|rest| rest.trim().split(['.', ' ']).next())
-        .and_then(|v| v.parse().ok());
-    match major {
-        Some(m) if m >= 13 => GpuBackend::Cuda13,
-        _ => GpuBackend::Cuda12,
-    }
-}
-
-/// `/dev/kfd` is the ROCm kernel-fusion-driver device node; its presence
-/// means the amdgpu kernel driver is loaded *with* ROCm compute support (a
-/// plain display-only amdgpu driver doesn't create it) — the same device
-/// [`GpuBackend::engine_args`] then mounts into the container.
-fn detect_rocm() -> bool {
-    Path::new("/dev/kfd").exists()
-}
-
-/// Any DRI render node is a reasonable enough signal for "there's a GPU
-/// with a kernel driver loaded" to try the generic Vulkan image as a
-/// catch-all (Intel iGPUs, and NVIDIA/AMD systems that have a GPU but no
-/// CUDA/ROCm toolkit installed) — the same device docs/docker.md's own
-/// Vulkan and SYCL examples mount.
-fn detect_vulkan() -> bool {
-    std::fs::read_dir("/dev/dri")
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .any(|e| e.file_name().to_string_lossy().starts_with("renderD"))
-        })
-        .unwrap_or(false)
 }
 
 /// Runs `llama-server` inside a container: `docker run --rm --init -t`
@@ -344,43 +308,32 @@ pub fn stop(_pid: u32) {
 mod tests {
     use super::*;
 
-    // Real `nvidia-smi` header excerpt shape (whitespace-padded table),
-    // trimmed to just the line this module actually parses.
-    const SMI_HEADER_124: &str = "\
-+-----------------------------------------------------------------------------+
-| NVIDIA-SMI 550.54.15    Driver Version: 550.54.15    CUDA Version: 12.4     |
-+-------------------------------+----------------------+----------------------+
-";
-    const SMI_HEADER_130: &str = "\
-+-----------------------------------------------------------------------------+
-| NVIDIA-SMI 580.65.06    Driver Version: 580.65.06    CUDA Version: 13.0     |
-+-------------------------------+----------------------+----------------------+
-";
-
     #[test]
-    fn cuda12_driver_picks_cuda12_image() {
-        assert_eq!(
-            cuda_backend_from_nvidia_smi_output(SMI_HEADER_124),
-            GpuBackend::Cuda12
-        );
+    fn cuda_major_12_picks_cuda12_image() {
+        assert_eq!(backend_from_hostgpu(HostGpu::Cuda { major: 12 }), GpuBackend::Cuda12);
         assert_eq!(GpuBackend::Cuda12.image_tag(), "server-cuda");
     }
 
     #[test]
-    fn cuda13_driver_picks_cuda13_image() {
-        assert_eq!(
-            cuda_backend_from_nvidia_smi_output(SMI_HEADER_130),
-            GpuBackend::Cuda13
-        );
+    fn cuda_major_13_picks_cuda13_image() {
+        assert_eq!(backend_from_hostgpu(HostGpu::Cuda { major: 13 }), GpuBackend::Cuda13);
         assert_eq!(GpuBackend::Cuda13.image_tag(), "server-cuda13");
     }
 
     #[test]
-    fn unparseable_output_defaults_to_cuda12() {
-        assert_eq!(
-            cuda_backend_from_nvidia_smi_output("garbage, no version here"),
-            GpuBackend::Cuda12
-        );
+    fn cuda_major_above_13_still_picks_cuda13_image() {
+        // No cuda14+ image exists yet -- a future driver reporting a
+        // higher major version should still bucket into the newer of the
+        // two published images rather than falling back to cuda12.
+        assert_eq!(backend_from_hostgpu(HostGpu::Cuda { major: 14 }), GpuBackend::Cuda13);
+    }
+
+    #[test]
+    fn non_cuda_hostgpu_variants_map_to_their_matching_backend() {
+        assert_eq!(backend_from_hostgpu(HostGpu::Rocm), GpuBackend::Rocm);
+        assert_eq!(backend_from_hostgpu(HostGpu::Vulkan), GpuBackend::Vulkan);
+        assert_eq!(backend_from_hostgpu(HostGpu::None), GpuBackend::Cpu);
+        assert_eq!(backend_from_hostgpu(HostGpu::Metal), GpuBackend::Cpu);
     }
 
     #[test]
@@ -442,5 +395,18 @@ mod tests {
     fn container_manager_binary_names() {
         assert_eq!(ContainerManager::Docker.binary(), "docker");
         assert_eq!(ContainerManager::Podman.binary(), "podman");
+    }
+
+    /// Exercises real end-to-end backend detection (via
+    /// `crate::hostgpu::detect`'s own real hardware probing — see that
+    /// module's own real-hardware test) against whatever GPU is actually
+    /// present on the machine running the test. Run explicitly with
+    /// `cargo test --bin llmman -- --ignored --nocapture
+    /// detect_backend_reports_this_hosts_real_hardware`.
+    #[test]
+    #[ignore = "result depends on this host's actual GPU/driver setup"]
+    fn detect_backend_reports_this_hosts_real_hardware() {
+        let backend = detect_backend();
+        println!("container::detect_backend() -> {backend:?} ({})", backend.image_ref(None));
     }
 }
