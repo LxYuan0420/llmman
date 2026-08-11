@@ -130,18 +130,6 @@ func dockerHubCredentialKeys(host string) []string {
 	}
 }
 
-// traceLog is temporary diagnostic logging (see this repo's own git
-// history) for an elusive windows-2025/windows-11-arm-only pull hang —
-// timestamped so a gap between two consecutive lines is directly visible
-// as time actually spent in whichever call sits between them, the same
-// way tests/launch_e2e.rs's own spawn_with_timeout heartbeat already
-// works for the Rust-side half of this same investigation. Remove once
-// that hang is understood; this package has no general-purpose logger
-// of its own to fold this into instead.
-func traceLog(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "[llmman-trace] %s %s\n", time.Now().Format(time.RFC3339Nano), fmt.Sprintf(format, args...))
-}
-
 func newResolver(ctx context.Context) remotes.Resolver {
 	return docker.NewResolver(docker.ResolverOptions{
 		Hosts: dockerconfig.ConfigureHosts(ctx, dockerconfig.HostOptions{
@@ -528,11 +516,14 @@ func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, e
 //export llmman_pull
 func llmman_pull(cRef, cLayoutDir *C.char) *C.char {
 	ref := C.GoString(cRef)
+	traceLog("llmman_pull entered for %s", ref)
 	progressReset(ref, "pulling manifest")
 	defer progressDone(ref)
 	if err := pullToLayout(context.Background(), ref, C.GoString(cLayoutDir)); err != nil {
+		traceLog("llmman_pull for %s failed: %v", ref, err)
 		return errResp(err)
 	}
+	traceLog("llmman_pull for %s succeeded", ref)
 	return okResp("")
 }
 
