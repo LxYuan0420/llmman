@@ -437,7 +437,55 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 	close(ch)
 	<-progDone
 	<-watchdogDone
-	prog.Wait()
+
+	// The real root cause of a hang that was chased through several
+	// earlier attempts here (single shared stall clock, then a per-
+	// artifact one): none of that was ever the problem. A goroutine dump
+	// of a real hung local repro showed copy.Image above had *already
+	// returned successfully* — the pull had fully completed, every blob
+	// correctly written, index.json correctly committed — and the caller
+	// was blocked forever in prog.Wait() below instead, because 3 of the
+	// 4 bars in `bars` were still alive, waiting in mpb's own Bar.serve
+	// select loop: go.podman.io/image does not reliably send a
+	// ProgressEventDone/Skipped for every ProgressEventNewArtifact it
+	// sends (confirmed empirically, not documented).
+	//
+	// bar.Abort() does not reliably fix this either (also confirmed with
+	// a second repro, after adding it): Abort's own doc comment says it
+	// "interrupts bar's running goroutine", but internally (bar.go's
+	// done()) that only calls bar.cancel() when the bar isn't
+	// auto-refreshing — when it is (the default here, since none of
+	// AddBar's options below disable it), it instead just schedules an
+	// async "early refresh" that isn't guaranteed to actually observe
+	// the abort and unblock serve()'s select loop in every case, e.g.
+	// once nothing is left driving further renders. mpb's own
+	// Progress.Wait() has no timeout of its own — it simply blocks on a
+	// WaitGroup until every bar it was ever given reports done, with no
+	// way to force that from outside short of cancelling each bar's
+	// context, which prog := mpb.New(...) above never gave us a handle
+	// to (mpb.New, not mpb.NewWithContext).
+	//
+	// Given none of that is fixable from here without depending on mpb
+	// internals more deeply than its own public API supports, treat
+	// Wait() itself as untrustworthy and never let it block this
+	// function: prog was created with mpb.WithOutput(os.Stderr), which
+	// for `llmman serve`'s daemon is a redirected log file, not a live
+	// terminal (see daemon.rs), so these bars' own rendering has no
+	// real audience to begin with. Giving up on waiting for their
+	// cleanup after a short grace period and leaking their now-idle
+	// goroutines is strictly safer than blocking the entire pull/push on
+	// a cosmetic detail that copy.Image's own success or failure above
+	// never depended on.
+	progWaitDone := make(chan struct{})
+	go func() {
+		defer close(progWaitDone)
+		prog.Wait()
+	}()
+	select {
+	case <-progWaitDone:
+	case <-time.After(5 * time.Second):
+		fmt.Fprintf(os.Stderr, "[llmman] warning: giving up waiting on progress-bar cleanup after 5s (cosmetic only, not a real stall)\n")
+	}
 	mu.Lock()
 	stalled := stalledArtifact
 	mu.Unlock()

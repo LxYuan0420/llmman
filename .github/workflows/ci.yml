@@ -633,39 +633,6 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
-      # ── Diagnostic: goroutine-stack dump from a hung podman pull ─────────
-      # TEMPORARY — investigating the podman e2e job hanging the full 600s
-      # test timeout on a pull whose blobs are *already* sitting at their
-      # full expected size on disk by the time it's killed (see the "Show
-      # partial blob sizes" step below, and backend_podman.go's per-
-      # artifact stall watchdog, which — per two real CI runs now — never
-      # fires at all here: no "[llmman] retrying ..." line ever appears in
-      # serve.log). That means copy.Image() itself is blocked somewhere
-      # past blob transfer (its own manifest/config-copy or commit phase —
-      # see copy.go's copySingleImage/CommitWithOptions) in a way that
-      # doesn't respond to context cancellation either, which the
-      # existing Progress-channel-based watchdog has no visibility into
-      # at all. Sending SIGQUIT is Go's standard "dump every goroutine's
-      # stack trace, then exit" signal (the same thing a real deadlock
-      # detector or `kill -QUIT` against any Go program triggers) — the
-      # only way to find out *which* line it's actually blocked on
-      # instead of continuing to guess from reading copy.Image's source.
-      # Only meaningful for a process that's still alive and stuck, so
-      # `|| true` on the kill: a run where the pull succeeded (or the
-      # daemon already exited some other way) has nothing to dump.
-      - name: Dump goroutine stacks from a hung llmman serve (diagnostic, podman only)
-        if: always() && matrix.backend == 'podman'
-        shell: bash
-        run: |
-          pid=$(pgrep -f 'llmman serve' | head -n1)
-          if [ -n "$pid" ]; then
-            echo "sending SIGQUIT to llmman serve (pid $pid)"
-            kill -QUIT "$pid" || true
-            sleep 2
-          else
-            echo "no running llmman serve process found to dump"
-          fi
-
       # `llmman serve`'s own stdout/stderr never reach the test's own logs
       # above at all — see daemon::ensure_server's doc comment on why it's
       # detached and redirected to this file instead. A real macOS run
