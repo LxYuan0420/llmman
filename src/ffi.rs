@@ -25,6 +25,91 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
+// Windows-only: manual Go runtime bootstrap
+// ---------------------------------------------------------------------------
+//
+// On Linux (ELF) and macOS (Mach-O), `go build -buildmode=c-archive`'s
+// runtime-init entry point (`_rt0_<arch>_lib`) gets registered as a real
+// global constructor that the platform's own C runtime startup invokes
+// automatically before `main()` ever runs (`.init_array`/`__mod_init_
+// func`), exactly as cgo's docs promise — every FFI call above just works.
+//
+// On windows-gnu (MinGW-w64's own ld + CRT startup) this mechanism is
+// emitted differently but still works: `cmd/link` (Go's own linker —
+// this is unconditional, regardless of which C compiler compiled the
+// shim's cgo object files) always emits an old-style GNU `.ctors` COFF
+// section for this (see $GOROOT/src/cmd/link/internal/ld/pe.go's
+// addInitArray), and MinGW-w64's CRT startup scans exactly that section
+// for constructors to run before `main()` — confirmed locally with a
+// minimal repro. But that is *not* a convention the MSVC/UCRT startup
+// code that Rust's own *-pc-windows-msvc targets link against (via
+// lld-link/link.exe, see build.rs) understands at all; it looks for
+// `.CRT$XCU` instead. The net effect — confirmed by reproducing it
+// locally against the exact same clang+lld-link toolchain this
+// project's Windows CI build uses, with this crate's own real go-shim
+// archive, and by reading $GOROOT's own runtime/cgo and cmd/link source
+// — is that the constructor meant to kick off the Go runtime's
+// background init thread (the one that unblocks every cgo call's own
+// `_cgo_wait_runtime_init_done()`, which cmd/cgo generates into the
+// front of every `//export`ed function — see backend_docker.go's
+// llmman_pull) never runs on an MSVC target, and the very first call
+// into this shim from anywhere in the process hangs forever waiting on
+// an event nothing will ever signal. This was the cause of the
+// Windows-only `llmman_pull` hang tracked across this repo's earlier
+// trace-logging commits, which had already narrowed it down to
+// "somewhere before llmman_pull's own first line ever runs" — i.e.
+// squarely in this gap.
+//
+// The fix: call the Go runtime's own entry point ourselves. It's an
+// ordinary exported symbol (`_rt0_<arch>_windows_lib`, see
+// $GOROOT/src/runtime/rt0_windows_{amd64,arm64}.s) that's always present
+// in the archive whether or not anything actually invokes it as a
+// constructor. Calling it directly, exactly once, before any other call
+// into this shim, starts the same background init thread the (non-
+// functional, on this target) automatic constructor was always meant to
+// start; every generated `_cgo_wait_runtime_init_done()` call proceeds
+// normally after that.
+//
+// Scoped to `target_env = "msvc"` specifically (not all of `windows`):
+// on windows-gnu the `.ctors` constructor already runs automatically as
+// described above, and `_rt0_<arch>_lib`'s own body is *not* idempotent
+// (it unconditionally spins up a fresh runtime-init thread every time
+// it's called, with no once-guard of its own — confirmed by reading
+// $GOROOT/src/runtime/asm_amd64.s) — calling it a second time here would
+// race a second Go runtime bootstrap against the one already running.
+// llmman doesn't currently ship a windows-gnu target (see ci.yml's
+// build matrix), but scoping this to the target that actually needs it
+// costs nothing and avoids relying on that.
+#[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
+extern "C" {
+    fn _rt0_amd64_windows_lib(argc: i32, argv: *mut *mut u8);
+}
+
+#[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "aarch64"))]
+extern "C" {
+    fn _rt0_arm64_windows_lib();
+}
+
+/// Must be called once, before the first call into any other function in
+/// this module — see the doc comment above. A no-op on every target
+/// except windows-msvc, where the platform's own C runtime already runs
+/// this automatically as a real constructor. Idempotent and cheap to
+/// call more than once (guarded by a `Once`), so callers can simply
+/// invoke it defensively rather than needing to prove they're first.
+pub fn ensure_runtime_init() {
+    #[cfg(all(target_os = "windows", target_env = "msvc"))]
+    {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| unsafe {
+            #[cfg(target_arch = "x86_64")]
+            _rt0_amd64_windows_lib(0, std::ptr::null_mut());
+            #[cfg(target_arch = "aarch64")]
+            _rt0_arm64_windows_lib();
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Response envelope (mirrors the Go `response` struct)
 // ---------------------------------------------------------------------------
 

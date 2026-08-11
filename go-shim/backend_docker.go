@@ -92,10 +92,13 @@ func dockerCredentials(host string) (string, string, error) {
 // stack able to time it out on its own. This was investigated as a
 // candidate for an elusive Windows-only pull hang (see this repo's own
 // git history) but ultimately ruled out — trace logging showed that hang
-// occurring before this function, or even llmman_pull itself, ever ran —
-// so it remains here purely as a real, independent hardening fix against
-// a genuinely hanging credential helper on any platform, not a fix for
-// that specific issue.
+// occurring before this function, or even llmman_pull itself, ever ran.
+// (That hang's actual cause turned out to be one layer further down
+// than any Go code: see ffi.rs's ensure_runtime_init on the Rust side —
+// Go's own c-archive auto-init constructor for Windows never runs under
+// an MSVC-ABI target at all.) This timeout remains here purely as a
+// real, independent hardening fix against a genuinely hanging
+// credential helper on any platform, not a fix for that specific issue.
 func getCredentialsWithTimeout(store credentials.Store, lookup string) (clitypes.AuthConfig, error) {
 	type result struct {
 		creds clitypes.AuthConfig

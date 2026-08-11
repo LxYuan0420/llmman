@@ -69,6 +69,14 @@ enum Commands {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Must happen before any other call into the `ffi` module, from every
+    // process that links the Go shim in — both this CLI's own process and
+    // the detached `llmman serve` daemon it spawns (a separate process,
+    // with its own copy of the shim's Go runtime to bootstrap) each reach
+    // this same `main()`. See ffi::ensure_runtime_init's own doc comment
+    // for why this is necessary on Windows specifically.
+    ffi::ensure_runtime_init();
+
     let cli = Cli::parse();
     let result = match &cli.command {
         Commands::Launch(a)   => cmd::launch::run(a),
