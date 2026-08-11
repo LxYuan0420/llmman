@@ -20,6 +20,28 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 | `login`   | Log in to a container registry |
 | `logout`  | Log out from a container registry |
 
+## Install
+
+**Linux, macOS:**
+
+```
+curl -fsSL https://raw.githubusercontent.com/ericcurtin/llmman/main/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```
+irm https://raw.githubusercontent.com/ericcurtin/llmman/main/install.ps1 | iex
+```
+
+Both scripts download the `llmman` binary matching your OS/arch from this
+repo's [GitHub Releases](https://github.com/ericcurtin/llmman/releases) and
+put it on `PATH` — see `install.sh`/`install.ps1` for supported
+architectures and environment overrides (`LLMMAN_VERSION`, `SKIP_INSTALL`).
+GPU acceleration is detected separately and automatically the first time
+`llmman serve` runs (see the "Serve" section below) — no GPU-specific
+install step is needed.
+
 ## Quick start
 
 ### Pull a model
@@ -43,7 +65,7 @@ destination.
 
 ### Serve
 
-Start the inference server. Requires `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp) to be on `PATH`.
+Start the inference server. Uses `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp) if it's already on `PATH`; otherwise `llmman` downloads and caches a prebuilt release matching your OS/arch/GPU automatically (see `--llama-cpp-version` to pin a specific release).
 
 ```
 llmman serve
