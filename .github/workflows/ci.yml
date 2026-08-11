@@ -458,10 +458,31 @@ jobs:
       # this job's Windows entry ran — root-caused to exactly this: the
       # env was present on the Build llmman step above, but this step
       # never inherits another step's `env:` block, and never had its own.
+      # LLAMA_ARG_N_GPU_LAYERS=0 on macOS only: llama-server reads this
+      # itself (it's the env form of its own --gpu-layers flag), and this
+      # process's environment reaches the llama-server subprocess
+      # cmd::serve spawns several layers down (llmman launch -> llmman
+      # serve -> llama-server, each just inheriting the parent's env by
+      # default) without llmman itself needing any change. Root-caused via
+      # the new serve.log diagnostic against a real macOS run: this
+      # specific pinned llama.cpp release's Metal backend cannot actually
+      # run qwen3.5's Gated Delta Net / Flash Attention ops at all ("...
+      # assigned to device MTL0 but ... is assigned to device CPU (usually
+      # due to missing support)" — logged for both, immediately followed
+      # by thousands of "ggml_metal_buffer_get_id: error: tensor '(view)'
+      # buffer is nil"), and did in fact crash outright under a real
+      # Claude Code prompt's actual size, not this suite's own tiny one —
+      # a real, pre-existing llama.cpp/Metal gap for this specific model
+      # architecture, not anything about llmman's own code, so forcing
+      # pure CPU inference is scoped to this one test's environment,
+      # not any change to how llmman itself launches llama-server for
+      # real users' models (the overwhelming majority of which have no
+      # such issue and would lose real Metal acceleration for nothing).
       - name: cargo test --test launch_e2e
         run: cargo test --release --target ${{ matrix.target }} --test launch_e2e -- --test-threads=1 --nocapture
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+          LLAMA_ARG_N_GPU_LAYERS: ${{ matrix.target == 'aarch64-apple-darwin' && '0' || '' }}
 
       # `llmman serve`'s own stdout/stderr never reach the test's own logs
       # above at all — see daemon::ensure_server's doc comment on why it's
