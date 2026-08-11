@@ -106,7 +106,7 @@ cargo build --release
 
 ### Podman
 
-Uses [`go.podman.io/image/v5` and `go.podman.io/common`](https://github.com/podman-container-tools/container-libs) — the same libraries Podman uses internally.
+Uses [`github.com/podman-container-tools/container-libs`](https://github.com/podman-container-tools/container-libs) — the same library Podman uses internally.
 
 ```
 cargo build --release --no-default-features --features podman
