@@ -478,11 +478,24 @@ jobs:
       # not any change to how llmman itself launches llama-server for
       # real users' models (the overwhelming majority of which have no
       # such issue and would lose real Metal acceleration for nothing).
+      #
+      # LLAMA_ARG_N_GPU_LAYERS is exported conditionally in-script (not
+      # set via this step's own `env:` with an empty-string fallback for
+      # non-macOS) — confirmed against a real x86_64-unknown-linux-gnu run
+      # that llama-server does not treat an *empty* value as "unset": it
+      # tries to parse it as an integer regardless ("error while handling
+      # environment variable \"LLAMA_ARG_N_GPU_LAYERS\": stoi"), which
+      # broke every platform this env: block's fallback reached, not just
+      # the macOS one it was meant for.
       - name: cargo test --test launch_e2e
-        run: cargo test --release --target ${{ matrix.target }} --test launch_e2e -- --test-threads=1 --nocapture
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
+            export LLAMA_ARG_N_GPU_LAYERS=0
+          fi
+          cargo test --release --target ${{ matrix.target }} --test launch_e2e -- --test-threads=1 --nocapture
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-          LLAMA_ARG_N_GPU_LAYERS: ${{ matrix.target == 'aarch64-apple-darwin' && '0' || '' }}
 
       # `llmman serve`'s own stdout/stderr never reach the test's own logs
       # above at all — see daemon::ensure_server's doc comment on why it's
