@@ -463,6 +463,32 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
+      # `llmman serve`'s own stdout/stderr never reach the test's own logs
+      # above at all — see daemon::ensure_server's doc comment on why it's
+      # detached and redirected to this file instead. A real macOS run
+      # failed with the daemon returning a stale port for an already-
+      # loaded model ("Connection refused" — the process backing it must
+      # have exited without cmd::serve's own `running` map being told),
+      # and this file is the only place that could show why (e.g. an
+      # unexpected daemon restart, a crashed llama-server, ...) — always
+      # run (not just on failure) since a *passing* run's log is useful
+      # comparison context for a failing one on another platform/run.
+      - name: Show llmman serve.log (diagnostic)
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            log="$LOCALAPPDATA/llmman/serve.log"
+          else
+            log="$HOME/.local/share/llmman/serve.log"
+          fi
+          if [ -f "$log" ]; then
+            echo "--- $log ---"
+            cat "$log"
+          else
+            echo "no serve.log found at $log"
+          fi
+
   # --------------------------------------------------------------------------
   # Release: attach binaries to GitHub Releases on tag push
   # --------------------------------------------------------------------------
