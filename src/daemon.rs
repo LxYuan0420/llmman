@@ -80,6 +80,18 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
         .ok()
         .and_then(|store| store.parent().map(|p| p.join("serve.log")));
 
+    // create_dir_all the log's parent (e.g. ~/.local/share/llmman) before
+    // ever trying to open it below: `OpenOptions::create(true)` only
+    // creates the *file*, never missing intermediate directories, so on a
+    // genuinely fresh machine (nothing has ever pulled/served a model
+    // yet — confirmed missing on a real macOS CI runner) the `.open()`
+    // below would otherwise fail every single time, permanently losing
+    // the daemon's entire stdout/stderr to the `None` branch's
+    // `Stdio::null()` fallback instead of just this one first call.
+    if let Some(p) = log_path.as_ref().and_then(|p| p.parent()) {
+        let _ = std::fs::create_dir_all(p);
+    }
+
     let mut cmd = Command::new(&exe);
     cmd.arg("serve");
     if !preload_model.is_empty() {
