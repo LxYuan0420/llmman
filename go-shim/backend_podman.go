@@ -279,6 +279,20 @@ func copyImageWithProgress(ctx context.Context, pctx *signature.PolicyContext, d
 // dlStallTimeout passes with no such callback at all — which, since it
 // covers the time before the first callback too, also catches a stall
 // during manifest/credential resolution, not just mid-blob-download.
+//
+// Tracked *per artifact*, not as one process-wide "any event at all"
+// clock: MaxParallelDownloads (see pullToLayout) means several artifacts
+// can be in flight at once, and an image with more artifacts than that
+// cap queues the rest behind whichever ones are currently running. A
+// single shared clock reset by *any* artifact's event can never notice
+// one specific artifact wedged indefinitely (dead connection, stuck
+// mid-read) as long as its concurrent siblings keep producing events of
+// their own — exactly the failure mode a real podman-backend e2e run hit
+// after the original single-clock version of this watchdog shipped: the
+// job's own diagnostic step showed every blob already sitting at its
+// full expected size on disk, yet the pull never returned, which a
+// per-artifact check (rather than the aggregate one) is what's actually
+// needed to catch.
 func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, src types.ImageReference, present, pastTense string, opts *copy.Options, changed *bool, progressKey string) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -289,19 +303,26 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 	progDone := make(chan struct{})
 
 	var mu sync.Mutex
-	lastEvent := time.Now()
-	stalled := false
+	callStart := time.Now()
+	// Last-event time for each artifact copy.Image has told us about via
+	// ProgressEventNewArtifact but not yet finished (Done/Skipped) —
+	// entries are removed on completion so a finished artifact can never
+	// be (mis)reported as the stalled one.
+	openArtifacts := make(map[string]time.Time)
+	var stalledArtifact string // set once, only when the watchdog actually fires
 
 	go func() {
 		defer close(progDone)
 		for p := range ch {
-			mu.Lock()
-			lastEvent = time.Now()
-			mu.Unlock()
-
 			key := p.Artifact.Digest.String()
+			now := time.Now()
+
 			switch p.Event {
 			case types.ProgressEventNewArtifact:
+				mu.Lock()
+				openArtifacts[key] = now
+				mu.Unlock()
+
 				total := p.Artifact.Size
 				if total < 0 {
 					total = 0
@@ -327,11 +348,21 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 				}
 				bars[key] = bar
 			case types.ProgressEventRead:
+				mu.Lock()
+				if _, ok := openArtifacts[key]; ok {
+					openArtifacts[key] = now
+				}
+				mu.Unlock()
+
 				progressAddCompleted(progressKey, int64(p.OffsetUpdate))
 				if bar, ok := bars[key]; ok {
 					bar.IncrInt64(int64(p.OffsetUpdate))
 				}
 			case types.ProgressEventDone:
+				mu.Lock()
+				delete(openArtifacts, key)
+				mu.Unlock()
+
 				if changed != nil {
 					*changed = true
 				}
@@ -342,6 +373,10 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 					delete(bars, key)
 				}
 			case types.ProgressEventSkipped:
+				mu.Lock()
+				delete(openArtifacts, key)
+				mu.Unlock()
+
 				// This artifact turned out to already exist at the
 				// destination — no bytes will ever flow for it via
 				// ProgressEventRead, so undo the provisional total
@@ -367,12 +402,27 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 				return
 			case <-ticker.C:
 				mu.Lock()
-				timedOut := time.Since(lastEvent) > dlStallTimeout
-				if timedOut {
-					stalled = true
+				stale := ""
+				if len(openArtifacts) == 0 {
+					// Nothing opened yet at all (manifest/credential
+					// resolution, or an image with zero artifacts) — fall
+					// back to the call's own start time as the baseline.
+					if time.Since(callStart) > dlStallTimeout {
+						stale = "<manifest/credential resolution>"
+					}
+				} else {
+					for key, last := range openArtifacts {
+						if time.Since(last) > dlStallTimeout {
+							stale = key
+							break
+						}
+					}
+				}
+				if stale != "" {
+					stalledArtifact = stale
 				}
 				mu.Unlock()
-				if timedOut {
+				if stale != "" {
 					cancel()
 					return
 				}
@@ -389,10 +439,10 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 	<-watchdogDone
 	prog.Wait()
 	mu.Lock()
-	wasStalled := stalled
+	stalled := stalledArtifact
 	mu.Unlock()
-	if err != nil && wasStalled {
-		return fmt.Errorf("stalled: no progress for over %v: %w", dlStallTimeout, err)
+	if err != nil && stalled != "" {
+		return fmt.Errorf("stalled: artifact %s made no progress for over %v: %w", stalled, dlStallTimeout, err)
 	}
 	return err
 }
