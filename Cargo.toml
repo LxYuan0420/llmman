@@ -29,6 +29,8 @@ tokio      = { version = "1", features = ["full"] }
 reqwest    = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls", "http2", "charset"] }
 futures    = "0.3"
 indicatif  = "0.18"
+flate2     = "1"
+zip        = { version = "2", default-features = false, features = ["deflate"] }
 
 [features]
 default = ["docker"]

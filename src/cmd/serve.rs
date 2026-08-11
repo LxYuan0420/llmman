@@ -50,14 +50,18 @@ pub struct ServeArgs {
     #[arg(long, value_name = "docker|podman")]
     pub ociman: Option<crate::container::ContainerManager>,
 
-    /// Pin the ghcr.io/ggml-org/llama.cpp container image to a specific
-    /// release tag (e.g. b9994) instead of the floating server/server-cuda/
-    /// ... tags — only meaningful together with --ociman, ignored
-    /// otherwise. llmman itself has no default or opinion here: pick a
-    /// tag that's actually published for every backend variant you might
-    /// run (see docs/docker.md in ggml-org/llama.cpp) and pass it
-    /// explicitly if you want reproducible behavior across runs.
-    #[arg(long, value_name = "TAG", requires = "ociman")]
+    /// Pin the llama.cpp release used for this server, instead of always
+    /// taking whatever is currently latest. With --ociman, this pins the
+    /// ghcr.io/ggml-org/llama.cpp container image tag (e.g. `b9994`
+    /// instead of the floating `server`/`server-cuda`/... tags — pick one
+    /// that's actually published for every backend variant you might run;
+    /// see docs/docker.md in ggml-org/llama.cpp). Without --ociman, this
+    /// pins which GitHub release of llama.cpp's own prebuilt
+    /// `llama-server` `llmman serve` downloads and caches (see
+    /// crate::llama_release) — set this to force that managed download
+    /// even when some other `llama-server` is already on PATH, which is
+    /// otherwise preferred untouched.
+    #[arg(long, value_name = "TAG")]
     pub llama_cpp_version: Option<String>,
 
     /// Proactively pull the ghcr.io/ggml-org/llama.cpp image `--ociman`
@@ -683,16 +687,23 @@ async fn spawn_llama_server(
     model: &Path,
     port: u16,
 ) -> anyhow::Result<tokio::process::Child> {
-    tokio::process::Command::new(bin)
-        .args([
-            "--model",
-            model.to_str().context("non-UTF-8 model path")?,
-            "--port",
-            &port.to_string(),
-            "--host",
-            "127.0.0.1",
-        ])
-        .kill_on_drop(true)
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args([
+        "--model",
+        model.to_str().context("non-UTF-8 model path")?,
+        "--port",
+        &port.to_string(),
+        "--host",
+        "127.0.0.1",
+    ]);
+    // See GPU_VISIBLE_DEVICE_VARS's own doc comment — already inherited
+    // by default, forwarded explicitly here for clarity.
+    for var in GPU_VISIBLE_DEVICE_VARS {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+    cmd.kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawn llama-server from {}", bin.display()))
 }
@@ -2118,10 +2129,39 @@ fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
 // llama-server binary resolution
 // ---------------------------------------------------------------------------
 
-fn resolve_llama_server() -> anyhow::Result<PathBuf> {
-    find_on_path("llama-server").ok_or_else(|| {
-        anyhow!("llama-server not found; install llama.cpp and ensure it is on PATH")
-    })
+/// Env var names Ollama documents for selecting specific GPU device(s)
+/// within whichever backend is active (see docs/gpu.mdx's "Overrides"
+/// sections: `CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`,
+/// `ROCR_VISIBLE_DEVICES`, `GGML_VK_VISIBLE_DEVICES`). A local
+/// `llama-server` child already inherits these from `llmman serve`'s own
+/// environment with no extra code — they're forwarded explicitly here
+/// anyway so intent doesn't silently depend on `Command`'s default
+/// env-inheritance behavior, and so the exact same list can be reused
+/// as-is by `crate::container::spawn`, whose `docker run`/`podman run`
+/// does *not* inherit the host environment into the container on its own.
+pub const GPU_VISIBLE_DEVICE_VARS: &[&str] =
+    &["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "GGML_VK_VISIBLE_DEVICES"];
+
+/// Resolves the `llama-server` binary to run locally (no `--ociman`):
+/// prefers whatever is already on `PATH` untouched, unless
+/// `pinned_version` explicitly asks for a specific llama.cpp release, in
+/// which case that pin always wins. Falls back to downloading and caching
+/// a release build matching this host's OS/arch/GPU backend via
+/// `crate::llama_release` when nothing suitable is on PATH.
+fn resolve_llama_server(pinned_version: Option<&str>) -> anyhow::Result<PathBuf> {
+    if pinned_version.is_none() {
+        if let Some(p) = find_on_path("llama-server") {
+            return Ok(p);
+        }
+    }
+    let resolved = crate::llama_release::ensure_llama_server(pinned_version)
+        .context("no llama-server on PATH and automatic download failed")?;
+    eprintln!(
+        "[llmman] using downloaded llama-server ({}): {}",
+        resolved.backend_label,
+        resolved.bin.display()
+    );
+    Ok(resolved.bin)
 }
 
 // ---------------------------------------------------------------------------
@@ -2152,8 +2192,18 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     // Only resolve (and require) a local llama-server binary when it'll
     // actually be used: --ociman runs llama-server in a container instead,
     // picking the image itself (see crate::container).
+    //
+    // resolve_llama_server does blocking network I/O (a GitHub API call,
+    // and possibly a multi-hundred-MB download) when no llama-server is
+    // already on PATH — spawn_blocking so that doesn't stall this async
+    // fn's own executor thread while it runs.
     let llama_server_bin = if _args.ociman.is_none() {
-        Some(resolve_llama_server()?)
+        let pinned_version = _args.llama_cpp_version.clone();
+        Some(
+            tokio::task::spawn_blocking(move || resolve_llama_server(pinned_version.as_deref()))
+                .await
+                .context("resolve llama-server task panicked")??,
+        )
     } else {
         None
     };

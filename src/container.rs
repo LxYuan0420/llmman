@@ -281,6 +281,18 @@ pub fn spawn(
         format!("{model_dir_str}:/models:ro"),
     ];
     args.extend(backend.engine_args());
+    // Unlike a local llama-server child process, `docker run`/`podman run`
+    // does not inherit the host's environment into the container on its
+    // own — forward the same GPU device-selection vars Ollama documents
+    // (see cmd::serve::GPU_VISIBLE_DEVICE_VARS) so `GGML_VK_VISIBLE_DEVICES=1`
+    // etc. set on the host actually reaches llama-server inside the
+    // container too.
+    for var in crate::cmd::serve::GPU_VISIBLE_DEVICE_VARS {
+        if let Ok(val) = std::env::var(var) {
+            args.push("-e".into());
+            args.push(format!("{var}={val}"));
+        }
+    }
     args.push(image);
     args.extend([
         "-m".into(),

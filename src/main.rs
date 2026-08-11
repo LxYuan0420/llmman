@@ -6,6 +6,8 @@ mod daemon;
 mod ffi;
 mod fmt;
 mod hf;
+mod hostgpu;
+mod llama_release;
 mod oauth;
 mod shortnames;
 mod storage;
