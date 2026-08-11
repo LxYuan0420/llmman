@@ -526,6 +526,29 @@ fn ref_matches(desc: &Descriptor, reference: &str) -> bool {
         return true;
     }
 
+    // The podman backend's own OCI-layout writer can only ever record a
+    // bare tag here, never a full reference: go-shim/backend_podman.go's
+    // pullToLayout builds the destination as `oci:<layoutDir>:<tag>`
+    // (via tagFromRef), and go.podman.io/image's oci transport uses that
+    // trailing component verbatim as the stored annotation
+    // (oci/layout/oci_dest.go's PutManifest) — there's no repository
+    // component in that reference shape at all to also record. This is
+    // architecturally different from the docker/containerd backend's own
+    // writer (shared_oci.go's updateIndex), which always stores the
+    // *full* reference it was called with, matched by the first check
+    // above. A `stored` value with no '/' is that shape: match it
+    // against the incoming reference's own tag instead of requiring an
+    // (impossible, for this backend) full-reference match.
+    //
+    // Known limitation, not fixed here: two different repositories
+    // pulled with the podman backend that happen to share the same bare
+    // tag are indistinguishable once stored this way — podman's
+    // OCI-layout writer has no way to record more than a tag per entry
+    // to begin with, regardless of what this lookup does.
+    if !stored.contains('/') && stored.as_str() == tag_from_ref(reference) {
+        return true;
+    }
+
     // If reference carries no tag (no ':' after the last '/'), try `:latest`.
     let after_slash = &reference[reference.rfind('/').unwrap_or(0)..];
     if !after_slash.contains(':') && stored.as_str() == format!("{reference}:latest") {
@@ -566,4 +589,72 @@ fn make_single_file_tar(path: &Path, name: &str) -> anyhow::Result<Vec<u8>> {
         archive.finish()?;
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn desc_with_ref(ref_name: &str) -> Descriptor {
+        let mut ann = std::collections::HashMap::new();
+        ann.insert("org.opencontainers.image.ref.name".to_string(), ref_name.to_string());
+        Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:deadbeef".into(),
+            size: 123,
+            annotations: Some(ann),
+        }
+    }
+
+    /// The docker/containerd backend's own writer (shared_oci.go's
+    /// updateIndex) always stores the full reference it was called with.
+    #[test]
+    fn ref_matches_a_full_reference_stored_verbatim() {
+        let d = desc_with_ref("docker.io/ai/qwen3.5:0.8b");
+        assert!(ref_matches(&d, "docker.io/ai/qwen3.5:0.8b"));
+        assert!(!ref_matches(&d, "docker.io/ai/qwen3.5:1.5b"));
+        assert!(!ref_matches(&d, "docker.io/ai/other:0.8b"));
+    }
+
+    /// Regression test: the podman backend's OCI-layout writer
+    /// (go.podman.io/image, via the `oci:<dir>:<tag>` reference shape —
+    /// see backend_podman.go's pullToLayout) can only ever store a bare
+    /// tag here, never a full reference — a real pull otherwise
+    /// succeeded but the model could never be found again afterward
+    /// (`resolve model ...: image not found`) until this matched.
+    #[test]
+    fn ref_matches_a_bare_tag_stored_by_the_podman_backend() {
+        let d = desc_with_ref("0.8b");
+        assert!(ref_matches(&d, "docker.io/ai/qwen3.5:0.8b"));
+        assert!(ref_matches(&d, "0.8b"));
+        assert!(!ref_matches(&d, "docker.io/ai/qwen3.5:1.5b"));
+    }
+
+    #[test]
+    fn ref_matches_defaults_a_tagless_reference_to_latest() {
+        let d = desc_with_ref("docker.io/ai/qwen3.5:latest");
+        assert!(ref_matches(&d, "docker.io/ai/qwen3.5"));
+    }
+
+    #[test]
+    fn ref_matches_returns_false_without_a_ref_name_annotation() {
+        let d = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:deadbeef".into(),
+            size: 123,
+            annotations: None,
+        };
+        assert!(!ref_matches(&d, "docker.io/ai/qwen3.5:0.8b"));
+    }
+
+    #[test]
+    fn tag_from_ref_extracts_the_tag_after_the_last_slash() {
+        assert_eq!(tag_from_ref("docker.io/ai/qwen3.5:0.8b"), "0.8b");
+        assert_eq!(tag_from_ref("docker.io/ai/qwen3.5"), "latest");
+        // A bare tag with no slash and no colon (podman's own stored
+        // shape) has nothing to extract from — falls back to "latest",
+        // which is why ref_matches needs its own dedicated bare-tag
+        // check above rather than reusing this for both directions.
+        assert_eq!(tag_from_ref("0.8b"), "latest");
+    }
 }
