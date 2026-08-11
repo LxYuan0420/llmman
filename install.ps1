@@ -6,37 +6,18 @@
 #
 #   irm https://raw.githubusercontent.com/ericcurtin/llmman/main/install.ps1 | iex
 #
-# Modeled after llama.cpp's own installer
-# (https://github.com/ggml-org/llama-install.sh, served at
-# https://llama.app/install.ps1) but considerably simpler: that script has
-# to probe the host for CUDA/Vulkan itself and download one of several
-# GPU-specific `llama` wrapper builds, because llama.cpp publishes a
-# separate binary per backend. llmman publishes exactly one binary per
-# architecture (see .github/workflows/ci.yml's release job) — the
-# GPU/backend detection instead happens *inside* that one binary, at
-# runtime, the first time `llmman serve` actually needs a `llama-server`:
-# it downloads and caches whichever prebuilt llama.cpp release build
-# (CPU, Vulkan, ROCm, CUDA) matches whatever it finds on the host (see
-# src/hostgpu.rs and src/llama_release.rs). This script's own job is just
-# getting that one llmman.exe itself onto PATH — but, as a convenience
-# (and so llama.cpp's own CLI is available too, not just through
-# llmman), it finishes by handing off to that same upstream installer
-# directly:
-#
-#   irm https://llama.app/install.ps1 | iex
-#
-# That's best-effort and non-fatal here: llmman itself is already fully
-# installed by the time this runs, and falls back to its own
-# hostgpu.rs/llama_release.rs download regardless of whether it succeeds.
+# GPU/backend detection happens at runtime inside the llmman binary
+# itself, the first time `llmman serve` needs a `llama-server` (see
+# src/hostgpu.rs and src/llama_release.rs) — this script just gets
+# llmman.exe onto PATH.
 #
 # Supported today (matches .github/workflows/ci.yml's build matrix):
 #   Windows x86_64, aarch64
 #
 # Env overrides:
-#   LLMMAN_VERSION       pin an exact release tag (e.g. "v0.2.0"); default: latest
-#   LLMMAN_REPO          "owner/repo" to fetch from; default: ericcurtin/llmman
-#   SKIP_INSTALL         download and verify only, don't install
-#   SKIP_LLAMA_INSTALL   don't hand off to llama.app/install.ps1 at the end
+#   LLMMAN_VERSION   pin an exact release tag (e.g. "v0.2.0"); default: latest
+#   LLMMAN_REPO      "owner/repo" to fetch from; default: ericcurtin/llmman
+#   SKIP_INSTALL     download and verify only, don't install
 
 function Die {
     param([string[]]$Messages)
@@ -95,34 +76,8 @@ function Main {
         Move-Item $Tmp $Dest -Force
 
         "Installation completed successfully"
-        ""
-        "Run the following command to start it:"
-        ""
-        "  llmman serve"
-        ""
     } finally {
         Remove-Item $Dir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-
-    Install-Llama
-}
-
-# Hands off to llama.cpp's own installer — see this script's header
-# comment for why. Best-effort: llmman is already fully installed by the
-# time this runs, so a failure here (network hiccup, llama.app
-# unreachable, ...) is only a warning, never fatal — `llmman serve` falls
-# back to downloading its own llama-server regardless (see
-# src/llama_release.rs).
-function Install-Llama {
-    if ($env:SKIP_LLAMA_INSTALL) { return }
-    ""
-    "Installing llama.cpp (llama.app)..."
-    try {
-        Invoke-RestMethod https://llama.app/install.ps1 | Invoke-Expression
-    } catch {
-        [Console]::Error.WriteLine(
-            "Warning: llama.app installer failed ($_); continuing (llmman serve will fetch its own llama-server automatically)"
-        )
     }
 }
 

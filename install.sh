@@ -5,38 +5,19 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/ericcurtin/llmman/main/install.sh | sh
 #
-# Modeled after llama.cpp's own installer
-# (https://github.com/ggml-org/llama-install.sh, served at
-# https://llama.app/install.sh) but considerably simpler: that script has
-# to probe the host for CUDA/ROCm/Vulkan/Metal itself and download one of
-# several GPU-specific `llama` wrapper builds, because llama.cpp publishes
-# a separate binary per backend. llmman publishes exactly one binary per
-# OS/arch (see .github/workflows/ci.yml's release job) — the GPU/backend
-# detection instead happens *inside* that one binary, at runtime, the
-# first time `llmman serve` actually needs a `llama-server`: it downloads
-# and caches whichever prebuilt llama.cpp release build (CPU, Vulkan,
-# ROCm, CUDA on Windows, Metal on macOS) matches whatever it finds on the
-# host (see src/hostgpu.rs and src/llama_release.rs). This script's own
-# job is just getting that one llmman binary itself onto PATH — but, as a
-# convenience (and so llama.cpp's own CLI is available too, not just
-# through llmman), it finishes by handing off to that same upstream
-# installer directly:
-#
-#   curl https://llama.app/install.sh | sh
-#
-# That's best-effort and non-fatal here: llmman itself is already fully
-# installed by the time this runs, and falls back to its own
-# hostgpu.rs/llama_release.rs download regardless of whether it succeeds.
+# GPU/backend detection happens at runtime inside the llmman binary
+# itself, the first time `llmman serve` needs a `llama-server` (see
+# src/hostgpu.rs and src/llama_release.rs) — this script just gets llmman
+# onto PATH.
 #
 # Supported today (matches .github/workflows/ci.yml's build matrix):
 #   Linux   x86_64, aarch64
 #   macOS   aarch64 (Apple Silicon) — Intel (x86_64) Macs are not built
 #
 # Env overrides:
-#   LLMMAN_VERSION       pin an exact release tag (e.g. "v0.2.0"); default: latest
-#   LLMMAN_REPO          "owner/repo" to fetch from; default: ericcurtin/llmman
-#   SKIP_INSTALL         download and verify only, don't install to ~/.local/bin
-#   SKIP_LLAMA_INSTALL   don't hand off to llama.app/install.sh at the end
+#   LLMMAN_VERSION   pin an exact release tag (e.g. "v0.2.0"); default: latest
+#   LLMMAN_REPO      "owner/repo" to fetch from; default: ericcurtin/llmman
+#   SKIP_INSTALL     download and verify only, don't install to ~/.local/bin
 
 : "${LLMMAN_REPO:=ericcurtin/llmman}"
 
@@ -113,25 +94,11 @@ main() {
 
 	printf "Installation completed successfully\n\n"
 
-	if check_path "$PATH"; then
-		cat <<-EOF
-		Run the following command to start it:
-
-		  llmman serve
-
-		EOF
-	else
+	if ! check_path "$PATH"; then
 		LOGIN_SHELL="${SHELL:-/bin/sh}"
 		LOGIN_PATH=$("$LOGIN_SHELL" -l -c 'echo $PATH' 2>/dev/null)
 
-		if check_path "$LOGIN_PATH"; then
-			cat <<-'EOF'
-			Please open a new terminal window or restart your shell.
-
-			  llmman serve
-
-			EOF
-		else
+		if ! check_path "$LOGIN_PATH"; then
 			RC_FILE=
 			case "${SHELL##*/}" in
 			(bash) RC_FILE=".bash_profile" ;;
@@ -152,35 +119,8 @@ main() {
 
 				EOF
 			fi
-			cat <<-EOF
-			Then open a new terminal and run:
-
-			  llmman serve
-
-			EOF
 		fi
-		cat <<-EOF
-		To start it now without modifying your PATH, run:
-
-		  $HOME/.local/bin/llmman serve
-
-		EOF
 	fi
-
-	install_llama
-}
-
-# Hands off to llama.cpp's own installer — see this script's header
-# comment for why. Best-effort: llmman is already fully installed by the
-# time this runs, so a failure here (network hiccup, llama.app
-# unreachable, ...) is only a warning, never fatal — `llmman serve` falls
-# back to downloading its own llama-server regardless (see
-# src/llama_release.rs).
-install_llama() {
-	[ "$SKIP_LLAMA_INSTALL" ] && return
-	printf "\nInstalling llama.cpp (llama.app)...\n"
-	curl -fsSL https://llama.app/install.sh | sh || \
-		printf "Warning: llama.app installer failed; continuing (llmman serve will fetch its own llama-server automatically)\n" >&2
 }
 
 main "$@"
