@@ -177,18 +177,20 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
         .stderr(Stdio::piped());
 
     let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {description}: {e}"));
-    // Temporary diagnostic (see this repo's own git history): an elusive
-    // Windows/macOS-only hang in this file has, so far, only ever shown a
-    // bare "still running" heartbeat with no insight into what the child
-    // itself is doing at that point — its own stdout/stderr used to only
-    // become visible once it exited (or was killed at the timeout), by
-    // which point a forceful GH Actions job cancellation (the outer
-    // timeout-minutes, not this function's own) has sometimes lost the
-    // last several minutes of log output entirely. Reading into shared
-    // buffers the heartbeat can peek at live (rather than only handing
-    // them back once each reader thread's `read_to_end` finally returns)
-    // means the child's own progress up to the very last heartbeat before
-    // that happens is visible even if everything after it is lost.
+    // Kept permanently (not removed once the investigation that added it
+    // concluded — see this repo's own git history): a real Windows/macOS
+    // hang in this file once showed only a bare "still running" heartbeat
+    // with no insight into what the child itself was doing at that point
+    // — its own stdout/stderr used to only become visible once it exited
+    // (or was killed at the timeout), by which point a forceful GH
+    // Actions job cancellation (the outer timeout-minutes, not this
+    // function's own) can lose the last several minutes of log output
+    // entirely. Reading into shared buffers the heartbeat can peek at
+    // live (rather than only handing them back once each reader thread's
+    // `read_to_end` finally returns) means a hung/slow child's progress
+    // up to the very last heartbeat before that happens stays visible
+    // even if everything after it is lost — useful for whatever the next
+    // one of these turns out to be, not just the one this was built for.
     eprintln!("[spawn_with_timeout] pid={} spawned: {description}", child.id());
     let mut stdout_pipe = child.stdout.take().expect("child stdout");
     let mut stderr_pipe = child.stderr.take().expect("child stderr");
