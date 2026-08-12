@@ -71,6 +71,21 @@ enum Commands {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Deliberately checked before anything else in this function — not a
+    // documented subcommand (absent from `Commands`/`--help` on purpose)
+    // and not routed through clap at all: this is `hostgpu::detect`'s own
+    // internal re-exec target, isolating its real CUDA/HIP/Vulkan FFI
+    // probing (see that module's doc comment) in a disposable child
+    // process of exactly this same binary. See
+    // `hostgpu::probe_subprocess_main`'s own doc comment for why that
+    // isolation exists at all, and why this has to run before
+    // `ffi::ensure_runtime_init`/`daemon::disable_std_handle_inheritance`
+    // below: this child is meant to do nothing but the one raw probe and
+    // exit, as fast and dependency-free as possible.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(hostgpu::PROBE_SUBPROCESS_ARG)) {
+        hostgpu::probe_subprocess_main();
+    }
+
     // Must happen before any other call into the `ffi` module, from every
     // process that links the Go shim in — both this CLI's own process and
     // the detached `llmman serve` daemon it spawns (a separate process,
