@@ -526,7 +526,16 @@ jobs:
           # and byte-for-byte verified as a real zip still got "is not a
           # supported archive file format" from it.
           archive="$HOME/$asset"
-          curl -fsSL --retry 5 --retry-all-errors -o "$archive" \
+          # --retry 16, not 5: confirmed on real ubuntu-24.04 and
+          # windows-2025 runs that this specific download (GitHub's
+          # release-assets CDN, not this repo's own code) can 503/"Empty
+          # reply from server" for longer than curl's default exponential
+          # backoff burns through 5 retries in (~30s total) — every attempt
+          # failing without ever reaching a working response. More retries
+          # (same exponential backoff, just more of it) rides out a longer
+          # CDN blip while still eventually giving up if the asset is
+          # genuinely gone.
+          curl -fsSL --retry 16 --retry-all-errors -o "$archive" \
             "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_CPP_RELEASE}/${asset}"
           dir="$HOME/llama-cpp"
           mkdir -p "$dir"
