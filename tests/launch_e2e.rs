@@ -106,6 +106,22 @@ const TIMEOUT: Duration = Duration::from_secs(600);
 /// invocation targets (see the module doc comment).
 static SERIAL: Mutex<()> = Mutex::new(());
 
+/// Locks [`SERIAL`], recovering from poisoning instead of panicking with
+/// an opaque `PoisonError` (via the default `.lock().unwrap()`) — this
+/// mutex only ever guards *ordering*, never any data an earlier panicking
+/// test could have left inconsistent (its payload is `()`), so there's
+/// nothing to actually protect against here. Without this, one test
+/// legitimately failing (including via `launch_and_assert`'s own retries
+/// being exhausted) poisons the lock for the remaining two, which then
+/// fail with a meaningless `PoisonError` instead of ever getting to run
+/// and report their own real result — exactly what happened live in CI:
+/// a `launch_claude_with_model` failure took down `launch_codex_with_model`
+/// and `launch_opencode_with_model` too, hiding whether either of *those*
+/// would have actually passed on their own.
+fn lock_serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Guards `warm_model` so its real (slow, first-time) work happens only
 /// once per test binary run, no matter how many of the three tests below
 /// actually reach it.
@@ -352,28 +368,75 @@ fn run_launch(home: &Path, integration: &str, extra_args: &[&str]) -> std::proce
     )
 }
 
-/// Shared assertion for all three integrations: the launch must succeed,
-/// and the model's real answer must show up somewhere in stdout.
-fn assert_launch_succeeded(integration: &str, extra_args: &[&str], output: &std::process::Output) {
+/// How many times [`launch_and_assert`] will (re-)run a whole
+/// `llmman launch <integration> ...` invocation, against a fresh `HOME`
+/// each time, before giving up — see that function's own doc comment for
+/// why this exists at all.
+const MAX_ATTEMPTS: u32 = 3;
+
+/// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
+/// (via [`run_launch`], against a fresh temp `HOME` each attempt) and
+/// asserts it succeeded and that the model's real answer shows up in
+/// stdout — retrying up to [`MAX_ATTEMPTS`] times, but *only* when the
+/// launch itself exited successfully and merely didn't happen to answer
+/// with "pong" this particular time.
+///
+/// That retry exists because real batched inference through llama-server
+/// (`n_slots` continuous batching serving whatever concurrent requests
+/// each of these real, un-mocked third-party CLIs' own startup traffic —
+/// title generation, memory/skill checks, etc. — happens to send
+/// alongside the actual prompt) is not bit-for-bit deterministic run to
+/// run even for identical input text: a small quantized model's sampling
+/// can tip a different way depending on exactly how those concurrent
+/// requests happen to batch together. Directly observed in practice
+/// (not hypothetical): real `qwen3.5:0.8b` runs through a real `claude
+/// --model ... -p ...` occasionally answer with a nonsensical safety
+/// refusal, or attempt a spurious tool call, instead of the one literal
+/// word asked for — see this file's module doc comment's own catalogue of
+/// similar small-model degeneracy already fought here (`warm_model`'s
+/// `--think false --num-predict 64`). A *real* regression (a non-zero
+/// exit status: an actual crash, a rejected request, a 500) is never
+/// retried — only "the process exited 0 but the live model's one-shot
+/// answer this time didn't include the word" is, so this can't mask the
+/// actual API-compat bugs this suite exists to catch (see that same doc
+/// comment).
+fn launch_and_assert(integration: &str, extra_args: &[&str]) {
+    let mut last_output = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let home = fresh_home(integration);
+        let output = run_launch(&home, integration, extra_args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` failed \
+             (status: {:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            output.status
+        );
+        if stdout.to_lowercase().contains("pong") {
+            return;
+        }
+        eprintln!(
+            "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} succeeded but the reply \
+             didn't contain \"pong\" (small-model sampling variance — see launch_and_assert's \
+             own doc comment); {}",
+            if attempt < MAX_ATTEMPTS { "retrying with a fresh HOME" } else { "giving up" }
+        );
+        last_output = Some(output);
+    }
+    let output = last_output.expect("loop runs at least once, so this is always set");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "`llmman launch {integration} --model {MODEL} -- {extra_args:?}` failed \
-         (status: {:?})\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-        output.status
-    );
-    assert!(
-        stdout.to_lowercase().contains("pong"),
-        "expected {integration}'s reply to contain \"pong\"\n\
-         --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    panic!(
+        "expected {integration}'s reply to contain \"pong\" after {MAX_ATTEMPTS} attempts\n\
+         --- stdout (last attempt) ---\n{stdout}\n--- stderr (last attempt) ---\n{stderr}"
     );
 }
 
 #[test]
 fn launch_claude_with_model() {
     eprintln!("[test] launch_claude_with_model: acquiring SERIAL");
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = lock_serial();
     eprintln!("[test] launch_claude_with_model: acquired SERIAL");
     if !on_path("llama-server") {
         eprintln!("skipping: llama-server not on PATH (required to serve any model)");
@@ -384,19 +447,16 @@ fn launch_claude_with_model() {
         return;
     }
 
-    let home = fresh_home("claude");
     // `-p`/`--print`: Claude Code's non-interactive one-shot mode — the
     // scriptable equivalent of typing a message into the interactive TUI
     // `llmman launch claude --model qwen3.5:0.8b` would otherwise open.
-    let extra_args = ["-p", PROMPT];
-    let output = run_launch(&home, "claude", &extra_args);
-    assert_launch_succeeded("claude", &extra_args, &output);
+    launch_and_assert("claude", &["-p", PROMPT]);
 }
 
 #[test]
 fn launch_opencode_with_model() {
     eprintln!("[test] launch_opencode_with_model: acquiring SERIAL");
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = lock_serial();
     eprintln!("[test] launch_opencode_with_model: acquired SERIAL");
     if !on_path("llama-server") {
         eprintln!("skipping: llama-server not on PATH (required to serve any model)");
@@ -407,7 +467,6 @@ fn launch_opencode_with_model() {
         return;
     }
 
-    let home = fresh_home("opencode");
     // `run <message>`: opencode's non-interactive one-shot mode.
     // --print-logs --log-level DEBUG: opencode's provider (configured via
     // OPENCODE_CONFIG_CONTENT's "npm" field — see launch::opencode_config)
@@ -416,15 +475,13 @@ fn launch_opencode_with_model() {
     // step in one environment during development; keep this on so a CI
     // failure's logs show exactly what opencode was doing right up to a
     // timeout, instead of just the banner and silence.
-    let extra_args = ["run", PROMPT, "--print-logs", "--log-level", "DEBUG"];
-    let output = run_launch(&home, "opencode", &extra_args);
-    assert_launch_succeeded("opencode", &extra_args, &output);
+    launch_and_assert("opencode", &["run", PROMPT, "--print-logs", "--log-level", "DEBUG"]);
 }
 
 #[test]
 fn launch_codex_with_model() {
     eprintln!("[test] launch_codex_with_model: acquiring SERIAL");
-    let _guard = SERIAL.lock().unwrap();
+    let _guard = lock_serial();
     eprintln!("[test] launch_codex_with_model: acquired SERIAL");
     if !on_path("llama-server") {
         eprintln!("skipping: llama-server not on PATH (required to serve any model)");
@@ -435,10 +492,7 @@ fn launch_codex_with_model() {
         return;
     }
 
-    let home = fresh_home("codex");
     // `exec <prompt>`: codex's non-interactive one-shot mode.
-    let extra_args = ["exec", PROMPT];
-    let output = run_launch(&home, "codex", &extra_args);
-    assert_launch_succeeded("codex", &extra_args, &output);
+    launch_and_assert("codex", &["exec", PROMPT]);
 }
 
