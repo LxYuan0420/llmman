@@ -1376,29 +1376,9 @@ async fn handle_props() -> impl IntoResponse {
 }
 
 async fn handle_version() -> impl IntoResponse {
-    // `build` is llmman-specific (real Ollama's /api/version has no such
-    // field) — extra JSON keys are ignored by every well-behaved client, so
-    // this stays wire-compatible while letting daemon::ensure_server detect
-    // a stale already-running `llmman serve` (see build_fingerprint's own
-    // doc comment) and restart it instead of silently talking to
-    // already-superseded code forever.
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "build": crate::daemon::build_fingerprint(),
     }))
-}
-
-/// Handles `POST /api/shutdown` — used only by `daemon::ensure_server` to
-/// terminate a stale `llmman serve` it's about to replace (see
-/// build_fingerprint's doc comment). Responds first, then exits from a
-/// detached task after a brief delay so the response actually reaches the
-/// client instead of the connection just dropping mid-write.
-async fn handle_shutdown() -> impl IntoResponse {
-    tokio::spawn(async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        std::process::exit(0);
-    });
-    StatusCode::OK
 }
 
 async fn handle_tags(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
@@ -2267,7 +2247,6 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .route("/props", get(handle_props))
         // Ollama API
         .route("/api/version", get(handle_version))
-        .route("/api/shutdown", post(handle_shutdown))
         .route("/api/tags", get(handle_tags))
         .route("/api/ps", get(handle_ps))
         .route("/api/show", post(handle_show))

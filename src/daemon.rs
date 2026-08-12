@@ -10,21 +10,15 @@
 
 use std::io::BufRead;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Context;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 /// The fixed loopback origin `llmman serve` always binds to (see
 /// cmd::serve's own doc comment on why this isn't configurable).
 pub const SERVER: &str = "http://127.0.0.1:17434";
-
-/// `SERVER`'s port, broken out on its own for `pid_listening_on` below
-/// (which needs a bare `u16`, not a URL) — keep the two in sync.
-const PORT: u16 = 17434;
 
 /// Quick synchronous reachability check — none of this module's callers
 /// run inside an async runtime, so a plain TCP connect attempt is enough
@@ -59,20 +53,7 @@ pub fn server_alive() -> bool {
 /// integration it's about to hand off to).
 pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     if server_alive() {
-        if server_is_current_build() {
-            return Ok(());
-        }
-        // The already-running daemon was started from a now-superseded
-        // build of this same binary (see build_fingerprint's doc comment
-        // for how that's detected) — e.g. `cargo build`/a package upgrade
-        // replaced the file on disk after it was spawned. Left alone, every
-        // command would keep silently talking to already-fixed-elsewhere
-        // code indefinitely, with no way for a user to know why a bug they
-        // just fixed (or a model added to a curated namespace, etc.) still
-        // doesn't seem to take effect. Shut it down and fall through to
-        // spawn a fresh one below.
-        eprintln!("[llmman] restarting llmman serve (running an outdated build)");
-        shut_down_stale_server();
+        return Ok(());
     }
     let exe = std::env::current_exe().context("could not resolve own executable")?;
 
@@ -128,166 +109,6 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
         }
     }
     anyhow::bail!("llmman serve did not start within 60s")
-}
-
-/// A fingerprint of the currently *running* llmman binary's on-disk bytes,
-/// computed once and cached for the lifetime of this process.
-///
-/// This exists to catch a "stale daemon" class of bug: `ensure_server`
-/// only ever checks whether *something* is listening on `SERVER` before
-/// deciding to reuse it, never whether that something was built from the
-/// same source as the client currently asking. If the on-disk binary is
-/// replaced (a fresh `cargo build`, a package upgrade, ...) while an
-/// `llmman serve` spawned from the old one is still running, every later
-/// command silently keeps talking to that already-superseded process
-/// forever — e.g. a bare-name resolution bug fixed in a newer build would
-/// keep failing exactly as before, with no indication why, until someone
-/// thinks to manually kill the old daemon.
-///
-/// Reads via `/proc/self/exe` rather than `std::env::current_exe()`
-/// matters here: on Linux, `current_exe()` re-resolves the *path*, which
-/// after a replacement points at the new file — useless for detecting
-/// that the currently-executing code differs from what's on disk now. A
-/// process's own `/proc/self/exe` is a magic symlink the kernel always
-/// resolves to the exact inode it's actually executing, even after that
-/// inode has been unlinked from its original path by a newer build, so
-/// hashing it always reflects the bytes actually running. Platforms
-/// without `/proc` (non-Linux) fall back to `current_exe()`, which can't
-/// detect this case but is no worse than not checking at all.
-pub fn build_fingerprint() -> &'static str {
-    static FP: OnceLock<String> = OnceLock::new();
-    FP.get_or_init(|| {
-        let bytes = std::fs::read("/proc/self/exe")
-            .or_else(|_| std::env::current_exe().and_then(std::fs::read))
-            .unwrap_or_default();
-        hex::encode(Sha256::digest(&bytes))
-    })
-}
-
-#[derive(Deserialize, Default)]
-struct VersionResponse {
-    #[serde(default)]
-    build: String,
-}
-
-/// Reports whether the already-running daemon (see `server_alive`) was
-/// built from the exact same binary bytes as this process — see
-/// `build_fingerprint`'s doc comment for why that can differ. Any failure
-/// to ask it (network error, an older daemon predating the `/api/version`
-/// `build` field entirely, ...) is treated as "not current": safest
-/// default is to restart rather than risk silently running stale code, and
-/// an older daemon lacking the field is itself exactly the staleness this
-/// exists to catch.
-fn server_is_current_build() -> bool {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .ok()
-        .and_then(|c| c.get(format!("{SERVER}/api/version")).send().ok())
-        .and_then(|r| r.json::<VersionResponse>().ok())
-        .is_some_and(|v| !v.build.is_empty() && v.build == build_fingerprint())
-}
-
-/// Asks an already-running daemon to exit (best-effort — a connection
-/// error/reset while it's shutting down is expected, not a failure) and
-/// waits up to ~5s for it to stop accepting connections. Falls back to
-/// finding and killing the listening process directly (see
-/// `pid_listening_on`) if that doesn't work — notably the case for a
-/// daemon old enough to predate the `/api/shutdown` route entirely (i.e.
-/// exactly the kind of staleness this whole mechanism exists to replace),
-/// which just 404s and keeps running. Gives up (leaving the stale daemon
-/// in place — `ensure_server`'s subsequent spawn will then simply fail to
-/// bind the port, surfacing as a normal "did not start" error rather than
-/// silently doing nothing) after a further ~10s.
-fn shut_down_stale_server() {
-    if let Ok(client) = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        let _ = client.post(format!("{SERVER}/api/shutdown")).send();
-    }
-    for _ in 0..20 {
-        if !server_alive() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-
-    force_kill_listening_process();
-    for _ in 0..40 {
-        if !server_alive() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
-/// Sends SIGTERM (then, if it's still alive half a second later, SIGKILL)
-/// to whatever process `pid_listening_on(PORT)` finds — the graceful
-/// `/api/shutdown` fallback for daemons too old to have that route. A
-/// no-op if the port's owning process can't be identified, or on
-/// non-Linux platforms (see `pid_listening_on`).
-#[cfg(target_os = "linux")]
-fn force_kill_listening_process() {
-    let Some(pid) = pid_listening_on(PORT) else {
-        return;
-    };
-    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    std::thread::sleep(Duration::from_millis(500));
-    if server_alive() {
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn force_kill_listening_process() {}
-
-/// Finds the PID of the process with a listening socket bound to
-/// `127.0.0.1:<port>`, by cross-referencing `/proc/net/tcp` (socket inode
-/// for the listening endpoint) against every process's `/proc/<pid>/fd/*`
-/// entries (which symlinks matching sockets do reference by that same
-/// inode). There's no portable syscall for "which PID owns this port", and
-/// shelling out to `lsof`/`fuser` isn't guaranteed to be installed, so this
-/// reads the same `/proc` files those tools do themselves.
-#[cfg(target_os = "linux")]
-fn pid_listening_on(port: u16) -> Option<u32> {
-    const TCP_LISTEN: &str = "0A";
-    let hex_port = format!("{port:04X}");
-
-    let table = std::fs::read_to_string("/proc/net/tcp").ok()?;
-    let inode = table.lines().skip(1).find_map(|line| {
-        let f: Vec<&str> = line.split_whitespace().collect();
-        // Columns: sl local_address rem_address st ... inode
-        if f.len() < 10 || f[3] != TCP_LISTEN {
-            return None;
-        }
-        let (_, local_port) = f[1].split_once(':')?;
-        if local_port.eq_ignore_ascii_case(&hex_port) {
-            Some(f[9].to_string())
-        } else {
-            None
-        }
-    })?;
-    let target = format!("socket:[{inode}]");
-
-    for proc_entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        let Some(pid) = proc_entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Ok(fds) = std::fs::read_dir(proc_entry.path().join("fd")) else {
-            continue;
-        };
-        for fd in fds.flatten() {
-            if std::fs::read_link(fd.path()).is_ok_and(|l| l.to_string_lossy() == target) {
-                return Some(pid);
-            }
-        }
-    }
-    None
 }
 
 /// Puts the about-to-be-spawned child in its own process group (Unix) or
@@ -555,35 +376,4 @@ pub fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T>
         anyhow::bail!("{path}: server returned {status}: {body}");
     }
     resp.json().with_context(|| format!("parse response from {path}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn build_fingerprint_is_stable_and_nonempty() {
-        // Same process, called twice: must be the exact same string both
-        // times (OnceLock-cached) and never empty (this test process's own
-        // binary is always readable, unlike some hypothetical daemon under
-        // test).
-        let a = build_fingerprint();
-        let b = build_fingerprint();
-        assert_eq!(a, b);
-        assert!(!a.is_empty());
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn pid_listening_on_finds_a_real_listener_and_rejects_a_free_port() {
-        use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let port = listener.local_addr().unwrap().port();
-        assert_eq!(pid_listening_on(port), Some(std::process::id()));
-
-        // An unbound port near the ephemeral range almost certainly has no
-        // listener at all right after the one above is dropped.
-        drop(listener);
-        assert_eq!(pid_listening_on(port), None);
-    }
 }
