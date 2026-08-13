@@ -98,6 +98,26 @@ pub struct ServeArgs {
     /// resolves a local binary at all).
     #[arg(long, conflicts_with_all = ["ociman", "pull_oci"])]
     pub pull_bin: bool,
+
+    /// Force every `llama-server` this daemon spawns to load with this
+    /// many tokens of context (`--ctx-size`/`-c`), instead of leaving it
+    /// unset and letting llama-server fall back to each model's own
+    /// trained context length (`n_ctx_train` from its GGUF metadata).
+    /// Some small models' trained context (e.g. SmolLM2-135M's 8192) is
+    /// too little room for a real coding agent's system prompt and tool
+    /// schema on top of the user's own prompt — every request then 400s
+    /// with llama-server's own "exceeds the available context size"
+    /// error before the model gets a chance to reply at all. This is a
+    /// single value applied to every model this daemon loads (there is
+    /// no per-model override): raising it costs KV-cache memory for
+    /// every model, and, for a model whose position embeddings were
+    /// only trained up to its own n_ctx_train, anything requested above
+    /// that trained length is unverified territory — llama-server will
+    /// still allocate and serve it, but coherence for tokens beyond
+    /// n_ctx_train isn't guaranteed the way it is for ordinary
+    /// same-length requests.
+    #[arg(long, value_name = "N")]
+    pub ctx_size: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +134,9 @@ struct Inner {
     llama_server_bin: Option<PathBuf>,
     ociman: Option<crate::container::ContainerManager>,
     llama_cpp_version: Option<String>,
+    // See ServeArgs::ctx_size's doc comment — forwarded verbatim to every
+    // spawn_llama_server/container::spawn call, local or containerized.
+    ctx_size: Option<u32>,
     store_path: PathBuf,
     cache_path: PathBuf,
     client: Client,
@@ -701,6 +724,7 @@ async fn spawn_llama_server(
     bin: &Path,
     model: &Path,
     port: u16,
+    ctx_size: Option<u32>,
 ) -> anyhow::Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([
@@ -711,6 +735,11 @@ async fn spawn_llama_server(
         "--host",
         "127.0.0.1",
     ]);
+    // See ServeArgs::ctx_size's doc comment — unset leaves llama-server's
+    // own default (each model's trained n_ctx_train) untouched.
+    if let Some(n) = ctx_size {
+        cmd.args(["--ctx-size", &n.to_string()]);
+    }
     // See GPU_VISIBLE_DEVICE_VARS's own doc comment — already inherited
     // by default, forwarded explicitly here for clarity.
     for var in GPU_VISIBLE_DEVICE_VARS {
@@ -948,14 +977,23 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         (ModelPath::Gguf(path), Some(ociman)) => {
             ModelProcess::Container(
                 ociman,
-                crate::container::spawn(ociman, path, port, state.0.llama_cpp_version.as_deref())?,
+                crate::container::spawn(
+                    ociman,
+                    path,
+                    port,
+                    state.0.llama_cpp_version.as_deref(),
+                    state.0.ctx_size,
+                )?,
             )
         }
         (ModelPath::Gguf(path), None) => {
             let bin = state.0.llama_server_bin.as_deref().ok_or_else(|| {
                 anyhow!("no local llama-server binary resolved and --ociman was not set")
             })?;
-            ModelProcess::Local(Engine::LlamaServer, spawn_llama_server(bin, path, port).await?)
+            ModelProcess::Local(
+                Engine::LlamaServer,
+                spawn_llama_server(bin, path, port, state.0.ctx_size).await?,
+            )
         }
         (ModelPath::SafeTensors(dir), _) => {
             ModelProcess::Local(Engine::Vllm, spawn_vllm_server(dir, port, model_ref).await?)
@@ -2231,6 +2269,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         llama_server_bin,
         ociman: _args.ociman,
         llama_cpp_version: _args.llama_cpp_version.clone(),
+        ctx_size: _args.ctx_size,
         store_path,
         cache_path,
         client: Client::new(),

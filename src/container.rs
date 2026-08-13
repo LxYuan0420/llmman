@@ -208,11 +208,16 @@ pub fn pull_image(ociman: ContainerManager, llama_cpp_version: Option<&str>) -> 
 ///
 /// `llama_cpp_version`, when given, pins the image to that release tag
 /// (see [`GpuBackend::image_ref`]) instead of the floating one.
+///
+/// `ctx_size`, when given, is forwarded as `--ctx-size` to the
+/// containerized `llama-server` — see `cmd::serve::ServeArgs::ctx_size`'s
+/// doc comment for what this does and doesn't guarantee.
 pub fn spawn(
     ociman: ContainerManager,
     model_path: &Path,
     port: u16,
     llama_cpp_version: Option<&str>,
+    ctx_size: Option<u32>,
 ) -> Result<tokio::process::Child> {
     let backend = detect_backend();
     let image = backend.image_ref(llama_cpp_version);
@@ -266,6 +271,10 @@ pub fn spawn(
         "--host".into(),
         "0.0.0.0".into(),
     ]);
+    if let Some(n) = ctx_size {
+        args.push("--ctx-size".into());
+        args.push(n.to_string());
+    }
 
     tokio::process::Command::new(ociman.binary())
         .args(&args)
