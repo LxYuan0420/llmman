@@ -27,6 +27,105 @@ pub fn server_alive() -> bool {
     std::net::TcpStream::connect("127.0.0.1:17434").is_ok()
 }
 
+/// The daemon's self-identity from GET /api/version — both fields absent
+/// on daemons built before they were reported (which is itself the
+/// strongest possible staleness signal: only a long-forgotten daemon from
+/// an old install still runs such a build).
+#[derive(Deserialize, Default)]
+struct DaemonIdentity {
+    #[serde(default)]
+    exe: Option<String>,
+    #[serde(default)]
+    pid: Option<u32>,
+}
+
+/// Returns the running daemon's identity if it should be stopped and
+/// replaced rather than reused: its own executable no longer exists on
+/// disk (the install that provided it was upgraded or removed — e.g. a
+/// Homebrew cask upgrade deleting the old version directory out from
+/// under a daemon it left running), or it predates identity reporting
+/// entirely. Returns None both for a healthy daemon and when /api/version
+/// can't be fetched/parsed at all — whatever is holding the port in that
+/// case, killing processes based on it would be a guess.
+fn stale_daemon() -> Option<DaemonIdentity> {
+    let resp = reqwest::blocking::Client::builder()
+        .timeout(Some(Duration::from_secs(2)))
+        .build()
+        .ok()?
+        .get(format!("{SERVER}/api/version"))
+        .send()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let identity: DaemonIdentity = resp.json().ok()?;
+    match &identity.exe {
+        Some(exe) if std::path::Path::new(exe).exists() => None,
+        _ => Some(identity),
+    }
+}
+
+/// Best-effort stop of a stale daemon (see `stale_daemon`), then waits for
+/// the port to actually free up. Kills the daemon's whole process group —
+/// it was started as a group leader (see `detach`/sbx's equivalent), so
+/// this takes its spawned llama-server children down with it instead of
+/// orphaning them with models still loaded in memory.
+fn stop_stale_daemon(identity: &DaemonIdentity) -> anyhow::Result<()> {
+    eprintln!("stopping stale llmman serve daemon (its binary no longer exists); restarting");
+    kill_daemon(identity);
+    for _ in 0..50 {
+        if !server_alive() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::bail!(
+        "a stale llmman serve daemon is still holding 127.0.0.1:17434 after being asked to stop; \
+         stop it manually (e.g. pkill -f 'llmman serve') and retry"
+    )
+}
+
+#[cfg(unix)]
+fn kill_daemon(identity: &DaemonIdentity) {
+    match identity.pid {
+        // Negative pid = the whole process group (the daemon is its own
+        // group leader), falling back to just the pid if that fails.
+        Some(pid) => {
+            let group = Command::new("kill").args(["-TERM", &format!("-{pid}")]).status();
+            if !group.map(|s| s.success()).unwrap_or(false) {
+                let _ = Command::new("kill").arg(pid.to_string()).status();
+            }
+        }
+        // A daemon too old to report its pid: match on the command line
+        // ("<path>/llmman serve ..."), which no plain llmman CLI client
+        // invocation shares.
+        None => {
+            let _ = Command::new("pkill").args(["-f", "llmman serve"]).status();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn kill_daemon(identity: &DaemonIdentity) {
+    match identity.pid {
+        // /T takes the daemon's llama-server children down with it.
+        Some(pid) => {
+            let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).status();
+        }
+        None => {
+            let _ = Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "Get-CimInstance Win32_Process -Filter \"Name='llmman.exe'\" | \
+                     Where-Object { $_.CommandLine -match ' serve' } | \
+                     ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+                ])
+                .status();
+        }
+    }
+}
+
 /// Starts `llmman serve` as a background process if one isn't already
 /// running, and waits (up to 60s) for it to start accepting connections.
 /// The process is intentionally never stopped by this command — once
@@ -53,7 +152,13 @@ pub fn server_alive() -> bool {
 /// integration it's about to hand off to).
 pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     if server_alive() {
-        return Ok(());
+        // Reuse the running daemon — unless it outlived its own install
+        // (see stale_daemon): reusing that one means serving with a
+        // long-obsolete build whose llama-server (and bug fixes) are gone.
+        match stale_daemon() {
+            None => return Ok(()),
+            Some(identity) => stop_stale_daemon(&identity)?,
+        }
     }
     let exe = std::env::current_exe().context("could not resolve own executable")?;
 
