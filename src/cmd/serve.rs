@@ -2404,8 +2404,50 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         });
     }
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // Unload every running inference backend before exiting — the same
+    // explicit unload `ollama serve` does when it traps SIGINT/SIGTERM
+    // (server/routes.go's signal handler calling sched.unloadAllRunners).
+    // Dropping each RunningModel kills local llama-server/vllm children
+    // (kill_on_drop) and SIGTERMs container ones (ModelProcess::drop), so
+    // nothing is left orphaned with a model still loaded in memory.
+    state.0.manager.lock().await.running.clear();
     Ok(())
+}
+
+/// Resolves when the daemon is asked to shut down: SIGINT (Ctrl-C) on all
+/// platforms, plus SIGTERM on Unix — the same pair `ollama serve` traps
+/// (see server/routes.go) and the graceful signal every supervisor sends
+/// first (Ollama's app on darwin, llmman's own daemon::stop_stale_daemon,
+/// sbx). Trapping it means an in-flight request gets a chance to finish
+/// (axum stops accepting and drains) and loaded models are unloaded
+/// deliberately, instead of the whole process group being torn down
+/// mid-write.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // Installing the handler failed: never resolve on this arm
+            // rather than shutting down immediately for no reason.
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    eprintln!("llmman serve shutting down");
 }
 
 #[cfg(test)]
