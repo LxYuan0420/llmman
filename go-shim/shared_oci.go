@@ -211,8 +211,8 @@ func findManifestDesc(idx ocispec.Index, refName string) (ocispec.Descriptor, er
 // ---------------------------------------------------------------------------
 
 const (
-	dlMaxAttempts  = 6               // was 3 — matches Ollama's own retry budget for blob transfers
-	dlRetryBase    = 2 * time.Second // doubles each retry: 2s, 4s, 8s, 16s, 32s
+	dlMaxAttempts  = 8               // generous budget: transient blips must never fail a whole transfer
+	dlRetryBase    = 1 * time.Second // doubles each retry: 1s, 2s, 4s, 8s, 16s, 32s, 64s
 	dlStallTimeout = 60 * time.Second
 )
 

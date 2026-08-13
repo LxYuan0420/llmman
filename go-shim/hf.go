@@ -329,24 +329,40 @@ func parseInt64(s string) (int64, error) {
 	return n, err
 }
 
-// hfGet issues an authenticated GET and decodes JSON into dst.
+// hfGet issues an authenticated GET and decodes JSON into dst. Transient
+// failures — a connection reset mid-handshake, a 5xx, a timeout — are
+// retried with the same backoff budget as blob downloads (see
+// retryStream); without this, one TCP blip on a cheap metadata call
+// fails an entire transfer that the much larger blob traffic would have
+// survived. 4xx responses are permanent (isHTTP4xx) and fail
+// immediately, exactly as before. The body is buffered and decoded only
+// after a fully successful response so a failed attempt can never leave
+// dst partially populated.
 func hfGet(ctx context.Context, client *http.Client, url, token string, dst any) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	var body []byte
+	err := retryStream(ctx, "GET "+url, isHTTP4xx, func() error {
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return err
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("GET %s: %w", url, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
+		}
+		body, err = io.ReadAll(resp.Body)
+		return err
+	})
 	if err != nil {
 		return err
 	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("GET %s: %w", url, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
-	}
-	return json.NewDecoder(resp.Body).Decode(dst)
+	return json.Unmarshal(body, dst)
 }
 
 // hfModelInfo is the subset of HuggingFace's GET /api/models/{owner}/{repo}
