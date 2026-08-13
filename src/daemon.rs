@@ -27,12 +27,14 @@ pub fn server_alive() -> bool {
     std::net::TcpStream::connect("127.0.0.1:17434").is_ok()
 }
 
-/// The daemon's self-identity from GET /api/version — both fields absent
-/// on daemons built before they were reported (which is itself the
-/// strongest possible staleness signal: only a long-forgotten daemon from
-/// an old install still runs such a build).
+/// The daemon's self-identity from GET /api/version — the identity fields
+/// are absent on daemons built before they were reported (which is itself
+/// the strongest possible staleness signal: only a long-forgotten daemon
+/// from an old install still runs such a build).
 #[derive(Deserialize, Default)]
 struct DaemonIdentity {
+    #[serde(default)]
+    version: Option<String>,
     #[serde(default)]
     exe: Option<String>,
     #[serde(default)]
@@ -40,13 +42,23 @@ struct DaemonIdentity {
 }
 
 /// Returns the running daemon's identity if it should be stopped and
-/// replaced rather than reused: its own executable no longer exists on
-/// disk (the install that provided it was upgraded or removed — e.g. a
-/// Homebrew cask upgrade deleting the old version directory out from
-/// under a daemon it left running), or it predates identity reporting
-/// entirely. Returns None both for a healthy daemon and when /api/version
-/// can't be fetched/parsed at all — whatever is holding the port in that
-/// case, killing processes based on it would be a guess.
+/// replaced rather than reused, matching how Ollama's app never lets a
+/// server from a superseded install keep serving (its supervisor stops the
+/// previous server on startup and after every update — see ollama's
+/// app/server cleanup/killOtherInstances). A daemon is stale when:
+///
+/// - its own executable no longer exists on disk (the install that
+///   provided it was upgraded or removed — e.g. a Homebrew cask upgrade
+///   deleting the old version directory out from under a daemon it left
+///   running),
+/// - its version differs from this client's (the binary was replaced in
+///   place by an update, so the same path now holds a newer build than
+///   the one still serving — the installed binary wins), or
+/// - it predates identity reporting entirely.
+///
+/// Returns None both for a healthy daemon and when /api/version can't be
+/// fetched/parsed at all — whatever is holding the port in that case,
+/// killing processes based on it would be a guess.
 fn stale_daemon() -> Option<DaemonIdentity> {
     let resp = reqwest::blocking::Client::builder()
         .timeout(Some(Duration::from_secs(2)))
@@ -59,8 +71,12 @@ fn stale_daemon() -> Option<DaemonIdentity> {
         return None;
     }
     let identity: DaemonIdentity = resp.json().ok()?;
-    match &identity.exe {
-        Some(exe) if std::path::Path::new(exe).exists() => None,
+    match (&identity.version, &identity.exe) {
+        (Some(version), Some(exe))
+            if version == env!("LLMMAN_VERSION") && std::path::Path::new(exe).exists() =>
+        {
+            None
+        }
         _ => Some(identity),
     }
 }
@@ -70,14 +86,22 @@ fn stale_daemon() -> Option<DaemonIdentity> {
 /// it was started as a group leader (see `detach`/sbx's equivalent), so
 /// this takes its spawned llama-server children down with it instead of
 /// orphaning them with models still loaded in memory.
+///
+/// The stop sequence mirrors Ollama's app supervisor (app/server's
+/// `stop()`): ask nicely first, poll for the port to free within a 5s
+/// deadline, and only then escalate to a forceful kill — with one more 5s
+/// wait before giving up entirely.
 fn stop_stale_daemon(identity: &DaemonIdentity) -> anyhow::Result<()> {
-    eprintln!("stopping stale llmman serve daemon (its binary no longer exists); restarting");
-    kill_daemon(identity);
-    for _ in 0..50 {
-        if !server_alive() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    eprintln!("stopping stale llmman serve daemon (superseded by this install); restarting");
+    kill_daemon(identity, false);
+    if wait_for_port_free() {
+        return Ok(());
+    }
+    // Graceful stop timed out — force-kill, like Ollama's supervisor
+    // hard-killing a server that ignored its graceful signal for 5s.
+    kill_daemon(identity, true);
+    if wait_for_port_free() {
+        return Ok(());
     }
     anyhow::bail!(
         "a stale llmman serve daemon is still holding 127.0.0.1:17434 after being asked to stop; \
@@ -85,28 +109,43 @@ fn stop_stale_daemon(identity: &DaemonIdentity) -> anyhow::Result<()> {
     )
 }
 
+/// Polls for the daemon port to free up, every 100ms for up to 5s.
+fn wait_for_port_free() -> bool {
+    for _ in 0..50 {
+        if !server_alive() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
 #[cfg(unix)]
-fn kill_daemon(identity: &DaemonIdentity) {
+fn kill_daemon(identity: &DaemonIdentity, force: bool) {
+    let signal = if force { "-KILL" } else { "-TERM" };
     match identity.pid {
         // Negative pid = the whole process group (the daemon is its own
         // group leader), falling back to just the pid if that fails.
         Some(pid) => {
-            let group = Command::new("kill").args(["-TERM", &format!("-{pid}")]).status();
+            let group = Command::new("kill").args([signal, &format!("-{pid}")]).status();
             if !group.map(|s| s.success()).unwrap_or(false) {
-                let _ = Command::new("kill").arg(pid.to_string()).status();
+                let _ = Command::new("kill").args([signal, &pid.to_string()]).status();
             }
         }
         // A daemon too old to report its pid: match on the command line
         // ("<path>/llmman serve ..."), which no plain llmman CLI client
         // invocation shares.
         None => {
-            let _ = Command::new("pkill").args(["-f", "llmman serve"]).status();
+            let _ = Command::new("pkill").args([signal, "-f", "llmman serve"]).status();
         }
     }
 }
 
 #[cfg(windows)]
-fn kill_daemon(identity: &DaemonIdentity) {
+fn kill_daemon(identity: &DaemonIdentity, _force: bool) {
+    // taskkill /F and Stop-Process -Force are already forceful — Windows
+    // has no in-between graceful signal for a detached, windowless
+    // process, so the graceful/forceful distinction collapses here.
     match identity.pid {
         // /T takes the daemon's llama-server children down with it.
         Some(pid) => {
@@ -178,6 +217,17 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
         let _ = std::fs::create_dir_all(p);
     }
 
+    // Rotate the previous daemon's log out of the way (serve.log ->
+    // serve-1.log -> ... -> serve-5.log) instead of appending forever,
+    // the same scheme Ollama's app uses for server.log (app/logrotate):
+    // each spawned daemon gets a fresh log, the last MAX_LOG_FILES
+    // daemons' logs stay around for diagnostics, and nothing grows
+    // without bound. Only rotated here, right before an actual spawn — a
+    // call that reuses an already-running daemon never touches its log.
+    if let Some(p) = &log_path {
+        rotate_log(p);
+    }
+
     let mut cmd = Command::new(&exe);
     cmd.arg("serve");
     if !preload_model.is_empty() {
@@ -192,7 +242,7 @@ pub fn ensure_server(preload_model: &str) -> anyhow::Result<()> {
     // needs to know still can — see log_path above / `llmman serve.log`.
     match log_path
         .as_ref()
-        .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
+        .and_then(|p| std::fs::File::create(p).ok())
         .and_then(|f| f.try_clone().ok().map(|f2| (f, f2)))
     {
         Some((out, err)) => {
@@ -232,6 +282,38 @@ fn detach(cmd: &mut Command) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+/// How many rotated generations of serve.log to keep — the same count as
+/// Ollama's app/logrotate.MaxLogFiles.
+const MAX_LOG_FILES: u32 = 5;
+
+/// Rotates `path` (e.g. serve.log) through numbered generations
+/// (serve-1.log ... serve-5.log), dropping the oldest — a direct port of
+/// Ollama's app/logrotate.Rotate, which its supervisor runs on every
+/// server spawn. Purely best-effort: a rotation failure must never stop
+/// the daemon from starting, the worst case is just an appended log.
+fn rotate_log(path: &std::path::Path) {
+    if !path.exists() {
+        return;
+    }
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("serve");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("log");
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    for i in (1..=MAX_LOG_FILES).rev() {
+        let older = dir.join(format!("{stem}-{i}.{ext}"));
+        let newer = if i == 1 {
+            path.to_path_buf()
+        } else {
+            dir.join(format!("{stem}-{}.{ext}", i - 1))
+        };
+        if newer.exists() {
+            if older.exists() {
+                let _ = std::fs::remove_file(&older);
+            }
+            let _ = std::fs::rename(&newer, &older);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
