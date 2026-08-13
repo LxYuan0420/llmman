@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "llmman",
     about = "LLM model image manager",
-    version,
+    version = env!("LLMMAN_VERSION"),
     propagate_version = true
 )]
 struct Cli {

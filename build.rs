@@ -57,7 +57,31 @@ fn repack_as_msvc_lib(lib_path: &PathBuf, out_dir: &PathBuf) {
     let _ = fs::remove_dir_all(&extract_dir);
 }
 
+/// Emits `LLMMAN_VERSION`: the Cargo package version plus, when built from
+/// a git checkout, the commit it was built from (e.g. "0.1.0 (a1b2c3d)").
+/// Every nightly/CI build shares the same Cargo.toml version, so without
+/// the commit suffix two different builds are indistinguishable to
+/// `llmman --version` and the daemon's /api/version.
+fn emit_version() {
+    let pkg = env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let describe = Command::new("git")
+        .args(["describe", "--always", "--dirty"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let version = match describe {
+        Some(desc) => format!("{pkg} ({desc})"),
+        None => pkg,
+    };
+    println!("cargo:rustc-env=LLMMAN_VERSION={version}");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+}
+
 fn main() {
+    emit_version();
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let shim_dir = manifest_dir.join("go-shim");
