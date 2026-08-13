@@ -211,13 +211,18 @@ pub fn pull_image(ociman: ContainerManager, llama_cpp_version: Option<&str>) -> 
 ///
 /// `ctx_size`, when given, is forwarded as `--ctx-size` to the
 /// containerized `llama-server` — see `cmd::serve::ServeArgs::ctx_size`'s
-/// doc comment for what this does and doesn't guarantee.
+/// doc comment for what this does and doesn't guarantee. `ctx_override_kv`,
+/// when given, is forwarded as `--override-kv` alongside it — see
+/// `cmd::serve::gguf_context_length_override`'s doc comment for why
+/// `ctx_size` alone is not sufficient to make llama-server actually use
+/// a context larger than the model's own trained length.
 pub fn spawn(
     ociman: ContainerManager,
     model_path: &Path,
     port: u16,
     llama_cpp_version: Option<&str>,
     ctx_size: Option<u32>,
+    ctx_override_kv: Option<&str>,
 ) -> Result<tokio::process::Child> {
     let backend = detect_backend();
     let image = backend.image_ref(llama_cpp_version);
@@ -274,6 +279,10 @@ pub fn spawn(
     if let Some(n) = ctx_size {
         args.push("--ctx-size".into());
         args.push(n.to_string());
+        if let Some(kv) = ctx_override_kv {
+            args.push("--override-kv".into());
+            args.push(kv.to_string());
+        }
     }
 
     tokio::process::Command::new(ociman.binary())

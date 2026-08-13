@@ -585,6 +585,104 @@ fn is_safetensors_layer(l: &crate::storage::oci::Descriptor) -> bool {
     layer_filepath(l).map(|p| p.to_lowercase().ends_with(".safetensors")).unwrap_or(false)
 }
 
+/// Reads a GGUF file's `general.architecture` metadata string (e.g.
+/// "llama", "qwen2", "gemma3") by walking just enough of its key-value
+/// metadata table to find that one key — see
+/// https://github.com/ggml-org/ggml/blob/master/docs/gguf.md for the
+/// format this parses (GGUF v2/v3: magic, version, tensor_count,
+/// kv_count, then kv_count key/type/value triples). Returns None on any
+/// I/O error, malformed header, or missing/non-string key: this is only
+/// ever used as a best-effort input to [`gguf_context_length_override`],
+/// not something that should fail model loading outright if some GGUF
+/// producer's output can't be parsed.
+fn gguf_architecture(path: &Path) -> Option<String> {
+    use std::io::Read;
+
+    fn read_string(f: &mut std::fs::File) -> Option<String> {
+        let mut len_buf = [0u8; 8];
+        f.read_exact(&mut len_buf).ok()?;
+        let len = u64::from_le_bytes(len_buf) as usize;
+        // Cap absurd lengths from a corrupted/truncated file rather than
+        // trying to allocate an unbounded buffer for one.
+        if len > 1 << 20 {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf).ok()?;
+        String::from_utf8(buf).ok()
+    }
+
+    // GGUF value type tags (ggml's gguf_type enum) this needs to skip
+    // past values it doesn't care about without knowing their shape in
+    // advance. Arrays nest one element type + count, never another
+    // array (GGUF disallows nested arrays), so this doesn't need to be
+    // recursive beyond one level.
+    fn skip_value(f: &mut std::fs::File, value_type: u32) -> Option<()> {
+        match value_type {
+            0 | 1 | 7 => f.read_exact(&mut [0u8; 1]).ok(),   // u8/i8/bool
+            2 | 3 => f.read_exact(&mut [0u8; 2]).ok(),       // u16/i16
+            4 | 5 | 6 => f.read_exact(&mut [0u8; 4]).ok(),   // u32/i32/f32
+            10 | 11 | 12 => f.read_exact(&mut [0u8; 8]).ok(), // u64/i64/f64
+            8 => read_string(f).map(|_| ()),                 // string
+            9 => {
+                let mut et_buf = [0u8; 4];
+                f.read_exact(&mut et_buf).ok()?;
+                let element_type = u32::from_le_bytes(et_buf);
+                let mut count_buf = [0u8; 8];
+                f.read_exact(&mut count_buf).ok()?;
+                let count = u64::from_le_bytes(count_buf);
+                for _ in 0..count {
+                    skip_value(f, element_type)?;
+                }
+                Some(())
+            }
+            _ => None, // unknown/future type — bail rather than guess its width
+        }
+    }
+
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).ok()?;
+    if &magic != b"GGUF" {
+        return None;
+    }
+    f.read_exact(&mut [0u8; 4]).ok()?; // version — not needed
+    f.read_exact(&mut [0u8; 8]).ok()?; // tensor_count — not needed
+    let mut kv_count_buf = [0u8; 8];
+    f.read_exact(&mut kv_count_buf).ok()?;
+    let kv_count = u64::from_le_bytes(kv_count_buf);
+
+    for _ in 0..kv_count {
+        let key = read_string(&mut f)?;
+        let mut type_buf = [0u8; 4];
+        f.read_exact(&mut type_buf).ok()?;
+        let value_type = u32::from_le_bytes(type_buf);
+        if key == "general.architecture" {
+            return if value_type == 8 { read_string(&mut f) } else { None };
+        }
+        skip_value(&mut f, value_type)?;
+    }
+    None
+}
+
+/// Builds the `--override-kv <arch>.context_length=int:<ctx_size>` value
+/// that makes llama-server's own `--ctx-size` request actually stick for
+/// a model whose native trained context is smaller than ctx_size — see
+/// ServeArgs::ctx_size's doc comment. Verified live: llama-server
+/// otherwise silently caps `--ctx-size` back down to whatever
+/// `<arch>.context_length` its own GGUF metadata reports whenever the
+/// requested value exceeds it (logged as "the slot context (N) exceeds
+/// the training context of the model (M) - capping"), so passing
+/// --ctx-size alone is not sufficient — overriding that one metadata key
+/// is the only way found to make a larger request stick. Returns None
+/// (best-effort only, see gguf_architecture) if the GGUF's own
+/// `general.architecture` can't be determined, in which case --ctx-size
+/// alone still applies fine to any model whose native context is
+/// already >= ctx_size, just not to smaller ones.
+fn gguf_context_length_override(path: &Path, ctx_size: u32) -> Option<String> {
+    gguf_architecture(path).map(|arch| format!("{arch}.context_length=int:{ctx_size}"))
+}
+
 fn resolve_model(store_path: &Path, cache_path: &Path, model_ref: &str) -> anyhow::Result<ModelPath> {
     let store = OciStore::open(store_path)?;
     let desc = store
@@ -725,6 +823,7 @@ async fn spawn_llama_server(
     model: &Path,
     port: u16,
     ctx_size: Option<u32>,
+    ctx_override_kv: Option<&str>,
 ) -> anyhow::Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([
@@ -739,6 +838,12 @@ async fn spawn_llama_server(
     // own default (each model's trained n_ctx_train) untouched.
     if let Some(n) = ctx_size {
         cmd.args(["--ctx-size", &n.to_string()]);
+        // See gguf_context_length_override's doc comment — without this,
+        // --ctx-size above is silently capped back down for any model
+        // whose own trained context is smaller than n.
+        if let Some(kv) = ctx_override_kv {
+            cmd.args(["--override-kv", kv]);
+        }
     }
     // See GPU_VISIBLE_DEVICE_VARS's own doc comment — already inherited
     // by default, forwarded explicitly here for clarity.
@@ -973,6 +1078,15 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         .unwrap_or_default();
     let port = find_free_port()?;
     eprintln!("[llmman] loading {model_ref} on port {port}");
+    // See gguf_context_length_override's doc comment: computed once here
+    // (not inside each spawn path) since both the local-binary and
+    // --ociman container paths need the identical override, and it's a
+    // property of the GGUF file itself, not of how llama-server ends up
+    // running.
+    let ctx_override_kv = match (&model_path, state.0.ctx_size) {
+        (ModelPath::Gguf(path), Some(n)) => gguf_context_length_override(path, n),
+        _ => None,
+    };
     let process = match (&model_path, state.0.ociman) {
         (ModelPath::Gguf(path), Some(ociman)) => {
             ModelProcess::Container(
@@ -983,6 +1097,7 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
                     port,
                     state.0.llama_cpp_version.as_deref(),
                     state.0.ctx_size,
+                    ctx_override_kv.as_deref(),
                 )?,
             )
         }
@@ -992,7 +1107,7 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
             })?;
             ModelProcess::Local(
                 Engine::LlamaServer,
-                spawn_llama_server(bin, path, port, state.0.ctx_size).await?,
+                spawn_llama_server(bin, path, port, state.0.ctx_size, ctx_override_kv.as_deref()).await?,
             )
         }
         (ModelPath::SafeTensors(dir), _) => {
@@ -2384,6 +2499,136 @@ mod tests {
             messages,
             vec![OAIMessage { role: "user".into(), content: "hi".into() }]
         );
+    }
+
+    /// Builds a minimal synthetic GGUF byte buffer — just enough of the
+    /// real format (see gguf_architecture's doc comment) for these tests
+    /// to exercise the parser without a real multi-hundred-MB model file.
+    enum GgufTestValue<'a> {
+        Str(&'a str),
+        U32(u32),
+        StringArray(&'a [&'a str]),
+    }
+
+    fn write_gguf_string(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    fn build_test_gguf(kvs: &[(&str, GgufTestValue)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&(kvs.len() as u64).to_le_bytes()); // metadata_kv_count
+        for (key, value) in kvs {
+            write_gguf_string(&mut buf, key);
+            match value {
+                GgufTestValue::Str(s) => {
+                    buf.extend_from_slice(&8u32.to_le_bytes()); // type: string
+                    write_gguf_string(&mut buf, s);
+                }
+                GgufTestValue::U32(n) => {
+                    buf.extend_from_slice(&4u32.to_le_bytes()); // type: u32
+                    buf.extend_from_slice(&n.to_le_bytes());
+                }
+                GgufTestValue::StringArray(items) => {
+                    buf.extend_from_slice(&9u32.to_le_bytes()); // type: array
+                    buf.extend_from_slice(&8u32.to_le_bytes()); // element type: string
+                    buf.extend_from_slice(&(items.len() as u64).to_le_bytes());
+                    for item in *items {
+                        write_gguf_string(&mut buf, item);
+                    }
+                }
+            }
+        }
+        buf
+    }
+
+    /// Writes `bytes` to a uniquely-named file under the OS temp dir and
+    /// returns its path; the caller's test is responsible for no cleanup
+    /// beyond the OS's own temp-dir housekeeping (mirrors this crate
+    /// having no tempfile-crate dependency elsewhere either).
+    fn write_temp_file(name_hint: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "llmman-test-{name_hint}-{}-{:?}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, bytes).expect("write temp gguf file");
+        path
+    }
+
+    #[test]
+    fn gguf_architecture_reads_the_general_architecture_key() {
+        let path = write_temp_file(
+            "arch-first",
+            &build_test_gguf(&[
+                ("general.architecture", GgufTestValue::Str("llama")),
+                ("llama.context_length", GgufTestValue::U32(8192)),
+            ]),
+        );
+        assert_eq!(gguf_architecture(&path), Some("llama".to_string()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gguf_architecture_skips_array_values_before_the_target_key() {
+        let path = write_temp_file(
+            "arch-after-array",
+            &build_test_gguf(&[
+                (
+                    "tokenizer.ggml.tokens",
+                    GgufTestValue::StringArray(&["<s>", "</s>", "hello"]),
+                ),
+                ("general.architecture", GgufTestValue::Str("qwen2")),
+            ]),
+        );
+        assert_eq!(gguf_architecture(&path), Some("qwen2".to_string()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gguf_architecture_returns_none_when_key_is_absent() {
+        let path = write_temp_file(
+            "arch-missing",
+            &build_test_gguf(&[("llama.context_length", GgufTestValue::U32(8192))]),
+        );
+        assert_eq!(gguf_architecture(&path), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gguf_architecture_returns_none_for_a_non_gguf_file() {
+        let path = write_temp_file("not-gguf", b"not a gguf file at all");
+        assert_eq!(gguf_architecture(&path), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gguf_architecture_returns_none_for_a_missing_file() {
+        let path = std::env::temp_dir().join("llmman-test-does-not-exist.gguf");
+        assert_eq!(gguf_architecture(&path), None);
+    }
+
+    #[test]
+    fn gguf_context_length_override_formats_the_override_kv_string() {
+        let path = write_temp_file(
+            "override-kv",
+            &build_test_gguf(&[("general.architecture", GgufTestValue::Str("llama"))]),
+        );
+        assert_eq!(
+            gguf_context_length_override(&path, 16384),
+            Some("llama.context_length=int:16384".to_string())
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gguf_context_length_override_returns_none_when_architecture_is_unknown() {
+        let path = write_temp_file("override-kv-unknown", b"not a gguf file");
+        assert_eq!(gguf_context_length_override(&path, 16384), None);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Regression test for the Codex tool-type bug described on
