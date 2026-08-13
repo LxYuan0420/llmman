@@ -2,7 +2,7 @@
 //! Responses API), and Anthropic-compatible APIs backed by `llama-server`
 //! sub-processes from llama.cpp.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
@@ -18,6 +18,7 @@ use clap::Args;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 
@@ -750,12 +751,51 @@ fn find_free_port() -> anyhow::Result<u16> {
     Ok(l.local_addr()?.port())
 }
 
+/// Shared handle onto the last few lines a spawned inference backend wrote
+/// to stdout/stderr — see `spawn_tail_relay`'s own doc comment for why
+/// this exists and `wait_for_ready`'s use of it.
+type OutputTail = Arc<StdMutex<VecDeque<String>>>;
+
+/// How many trailing output lines `OutputTail` keeps — enough to catch a
+/// one-or-two-line startup failure (a dynamic-linker error, "no such
+/// file", an out-of-memory abort, ...) without holding onto an unbounded
+/// amount of a chatty child's output.
+const TAIL_LINES: usize = 20;
+
+/// Relays a spawned child's piped stdout/stderr line-by-line to this
+/// process's own stdout/stderr — preserving exactly what an inherited
+/// (the previous default) stdio handle would have shown up as in
+/// `llmman serve`'s own log (see daemon.rs's redirection of that to
+/// serve.log) — while also appending each line to `tail` (bounded to the
+/// last `TAIL_LINES`), so a caller that only learns of a crash after the
+/// fact (see `wait_for_ready`) can still report *why*, instead of just
+/// "the process exited" with the actual reason sitting only in a log file
+/// the caller (an HTTP client, ultimately a chat UI) never sees.
+fn spawn_tail_relay(reader: impl AsyncRead + Unpin + Send + 'static, tail: OutputTail, to_stderr: bool) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if to_stderr {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+            if let Ok(mut buf) = tail.lock() {
+                if buf.len() >= TAIL_LINES {
+                    buf.pop_front();
+                }
+                buf.push_back(line);
+            }
+        }
+    });
+}
+
 async fn spawn_llama_server(
     bin: &Path,
     model: &Path,
     port: u16,
     ctx_size: Option<u32>,
-) -> anyhow::Result<tokio::process::Child> {
+) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([
         "--model",
@@ -780,9 +820,27 @@ async fn spawn_llama_server(
             cmd.env(var, val);
         }
     }
-    cmd.kill_on_drop(true)
+    // Piped (not inherited) so a startup crash's own explanation — e.g. a
+    // dynamic linker's "error while loading shared libraries" — can be
+    // captured into `tail` and surfaced by `wait_for_ready`, not just
+    // dropped into a log file nobody making the request ever sees. See
+    // `spawn_tail_relay`'s own doc comment for how this keeps showing up
+    // in that log too.
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("spawn llama-server from {}", bin.display()))
+        .with_context(|| format!("spawn llama-server from {}", bin.display()))?;
+
+    let tail: OutputTail = Arc::new(StdMutex::new(VecDeque::with_capacity(TAIL_LINES)));
+    if let Some(stdout) = child.stdout.take() {
+        spawn_tail_relay(stdout, tail.clone(), false);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_tail_relay(stderr, tail.clone(), true);
+    }
+    Ok((child, tail))
 }
 
 async fn spawn_vllm_server(model_dir: &Path, port: u16, model_name: &str) -> anyhow::Result<tokio::process::Child> {
@@ -821,13 +879,41 @@ fn which_binary(name: &str) -> anyhow::Result<PathBuf> {
     find_on_path(name).ok_or_else(|| anyhow::anyhow!("{name} not found on PATH"))
 }
 
-async fn wait_for_ready(client: &Client, port: u16) -> anyhow::Result<()> {
+/// Polls `process`'s `/health` endpoint until it reports ready, bailing
+/// out immediately — instead of only after the full 600s deadline below —
+/// the moment `process` itself has already exited. Without this check, a
+/// backend that crashes on startup (a missing shared library, a bad
+/// model, an out-of-memory abort, ...) left `llmman launch`/any HTTP
+/// client hanging for up to 10 minutes on a port nothing was ever going
+/// to answer on again, with the real reason sitting only in `serve.log`
+/// (see `ModelProcess::is_alive`'s doc comment on the same non-blocking
+/// `try_wait` this reuses). `stderr_tail`, when given (currently only for
+/// a local llama-server child — see `spawn_llama_server`), lets that
+/// reason be included right in the error instead of just "the process
+/// exited", so it reaches whatever's actually waiting on this (a chat UI
+/// via the HTTP response), not only the log file.
+async fn wait_for_ready(
+    client: &Client,
+    port: u16,
+    process: &mut ModelProcess,
+    stderr_tail: Option<&OutputTail>,
+) -> anyhow::Result<()> {
     let url = format!("http://127.0.0.1:{port}/health");
     // vllm can take several minutes to load large models.
     let deadline = Instant::now() + Duration::from_secs(600);
     loop {
         if Instant::now() > deadline {
             return Err(anyhow!("inference server on port {port} did not become ready within 600s"));
+        }
+        if !process.is_alive() {
+            let detail = stderr_tail.and_then(|t| {
+                let lines = t.lock().ok()?;
+                (!lines.is_empty()).then(|| lines.iter().cloned().collect::<Vec<_>>().join(" | "))
+            });
+            return Err(match detail {
+                Some(detail) => anyhow!("inference server on port {port} exited before becoming ready: {detail}"),
+                None => anyhow!("inference server on port {port} exited before becoming ready"),
+            });
         }
         if let Ok(resp) = client.get(&url).send().await {
             // llama-server: 200 + {"status":"ok"}   vllm: 200 + {}
@@ -1006,7 +1092,13 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         .unwrap_or_default();
     let port = find_free_port()?;
     eprintln!("[llmman] loading {model_ref} on port {port}");
-    let process = match (&model_path, state.0.ociman) {
+    // Only a local llama-server child gets a captured stderr tail today
+    // (see spawn_llama_server) — container/vllm startup failures still
+    // fail fast via ModelProcess::is_alive below, just without an inline
+    // "here's why" (their own stdio is still inherited straight into
+    // serve.log, same as before).
+    let mut stderr_tail: Option<OutputTail> = None;
+    let mut process = match (&model_path, state.0.ociman) {
         (ModelPath::Gguf(path), Some(ociman)) => {
             ModelProcess::Container(
                 ociman,
@@ -1021,16 +1113,15 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         }
         (ModelPath::Gguf(path), None) => {
             let bin = local_llama_server_bin(state).await?;
-            ModelProcess::Local(
-                Engine::LlamaServer,
-                spawn_llama_server(&bin, path, port, state.0.ctx_size).await?,
-            )
+            let (child, tail) = spawn_llama_server(&bin, path, port, state.0.ctx_size).await?;
+            stderr_tail = Some(tail);
+            ModelProcess::Local(Engine::LlamaServer, child)
         }
         (ModelPath::SafeTensors(dir), _) => {
             ModelProcess::Local(Engine::Vllm, spawn_vllm_server(dir, port, model_ref).await?)
         }
     };
-    wait_for_ready(&state.0.client, port).await?;
+    wait_for_ready(&state.0.client, port, &mut process, stderr_tail.as_ref()).await?;
     eprintln!("[llmman] {model_ref} ready on port {port}");
     mgr.running.insert(
         model_ref.to_string(),
