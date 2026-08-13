@@ -130,8 +130,18 @@ struct AppState(Arc<Inner>);
 struct Inner {
     manager: Mutex<ModelManager>,
     // None when --ociman is set: llama-server then runs in a container, so
-    // no local binary is resolved (or required on PATH) at all.
-    llama_server_bin: Option<PathBuf>,
+    // no local binary is resolved (or required on PATH) at all. Behind a
+    // mutex because the path resolved at startup can be deleted while this
+    // daemon keeps running (an upgrade/uninstall of whatever install
+    // provided it) — see local_llama_server_bin, which re-resolves and
+    // stores a replacement in that case.
+    llama_server_bin: StdMutex<Option<PathBuf>>,
+    // This daemon's own executable path, canonicalized at startup (while
+    // it still exists on disk). Reported by /api/version so clients — the
+    // CLI's daemon::ensure_server, sbx — can detect a daemon left running
+    // after the install that provided its binary was deleted, instead of
+    // blindly reusing it.
+    exe: Option<PathBuf>,
     ociman: Option<crate::container::ContainerManager>,
     llama_cpp_version: Option<String>,
     // See ServeArgs::ctx_size's doc comment — forwarded verbatim to every
@@ -1102,12 +1112,10 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
             )
         }
         (ModelPath::Gguf(path), None) => {
-            let bin = state.0.llama_server_bin.as_deref().ok_or_else(|| {
-                anyhow!("no local llama-server binary resolved and --ociman was not set")
-            })?;
+            let bin = local_llama_server_bin(state).await?;
             ModelProcess::Local(
                 Engine::LlamaServer,
-                spawn_llama_server(bin, path, port, state.0.ctx_size, ctx_override_kv.as_deref()).await?,
+                spawn_llama_server(&bin, path, port, state.0.ctx_size, ctx_override_kv.as_deref()).await?,
             )
         }
         (ModelPath::SafeTensors(dir), _) => {
@@ -1127,6 +1135,42 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         },
     );
     Ok(port)
+}
+
+/// Returns the local llama-server binary to spawn: the one resolved at
+/// startup, unless that file has since disappeared from disk (the install
+/// that provided it was upgraded or removed while this daemon kept
+/// running), in which case it is re-resolved from the current PATH (or
+/// re-downloaded) and the replacement remembered for subsequent loads —
+/// instead of failing every model load forever with a spawn error against
+/// a path that no longer exists.
+async fn local_llama_server_bin(state: &AppState) -> anyhow::Result<PathBuf> {
+    let current = state
+        .0
+        .llama_server_bin
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some(bin) = current else {
+        anyhow::bail!("no local llama-server binary resolved and --ociman was not set")
+    };
+    if bin.exists() {
+        return Ok(bin);
+    }
+    eprintln!(
+        "[llmman] llama-server at {} no longer exists; re-resolving",
+        bin.display()
+    );
+    let pinned = state.0.llama_cpp_version.clone();
+    let resolved = tokio::task::spawn_blocking(move || resolve_llama_server(pinned.as_deref()))
+        .await
+        .context("resolve llama-server task panicked")??;
+    *state
+        .0
+        .llama_server_bin
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(resolved.clone());
+    Ok(resolved)
 }
 
 // ---------------------------------------------------------------------------
@@ -1457,7 +1501,7 @@ async fn handle_props() -> impl IntoResponse {
         "chat_template": "",
         "bos_token": "",
         "eos_token": "",
-        "build_info": env!("CARGO_PKG_VERSION"),
+        "build_info": env!("LLMMAN_VERSION"),
         "modalities": { "vision": false, "audio": false },
         "default_generation_settings": {
             "id": 0,
@@ -1528,9 +1572,16 @@ async fn handle_props() -> impl IntoResponse {
     }))
 }
 
-async fn handle_version() -> impl IntoResponse {
+/// Ollama's GET /api/version, extended with this daemon's own identity —
+/// executable path (canonicalized at startup) and pid — so a client can
+/// tell whether a daemon it found listening still belongs to a live
+/// install (the exe still exists, and is the binary the client would
+/// launch) and stop/replace it if not. See daemon::ensure_server.
+async fn handle_version(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": env!("LLMMAN_VERSION"),
+        "exe": state.0.exe.as_ref().map(|p| p.to_string_lossy()),
+        "pid": std::process::id(),
     }))
 }
 
@@ -2381,7 +2432,11 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         manager: Mutex::new(ModelManager {
             running: HashMap::new(),
         }),
-        llama_server_bin,
+        llama_server_bin: StdMutex::new(llama_server_bin),
+        // Canonicalized now, while the file certainly still exists —
+        // resolving later (in the handler) could fail once the install is
+        // deleted, exactly the situation /api/version exists to expose.
+        exe: std::env::current_exe().ok().map(|p| p.canonicalize().unwrap_or(p)),
         ociman: _args.ociman,
         llama_cpp_version: _args.llama_cpp_version.clone(),
         ctx_size: _args.ctx_size,
