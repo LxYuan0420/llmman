@@ -9,8 +9,11 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 | Command | Description |
 |---------|-------------|
 | `serve`   | Start an inference server (Ollama / OpenAI / Anthropic APIs) |
+| `launch`  | Launch an integration (Claude Code, OpenCode, …) |
+| `run`     | Run a model interactively or with a one-shot prompt |
 | `pull`    | Pull a model from a registry or HuggingFace |
 | `list`    | List locally stored models |
+| `ps`      | List models currently loaded |
 | `build`   | Package model files into a local OCI image |
 | `push`    | Push a local image to a registry |
 | `transfer` | Transfer an image directly from one location to another (e.g. HuggingFace to an OCI registry) |
@@ -84,6 +87,16 @@ OLLAMA_HOST=127.0.0.1:17434 ollama run unsloth/Qwen3.5-0.8B-GGUF
 Or with any Ollama, Anthropic or OpenAI-compatible client.
 
 Models are loaded on demand. Each model gets its own `llama-server` subprocess on a random loopback port; subsequent requests reuse the running process.
+
+### Launch an integration
+
+Point an integration at a model in one step. `llmman launch` starts `serve` in the background if it isn't already running (preloading the requested model), then sets the right environment variables and execs the integration:
+
+```
+llmman launch claude --model gemma4
+```
+
+Run `llmman launch` with no arguments to list the supported integrations (Claude Code, OpenCode) and whether each is installed. Any extra arguments after `--` are forwarded to the integration's own CLI.
 
 Short names work with all commands: `pull`, `push`, `transfer`, `rm`, `tag`, `inspect`, and `serve`.
 
