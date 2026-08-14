@@ -71,6 +71,7 @@
 //!     ggml-org/llama.cpp#20733/#23423) — fixed in
 //!     `cmd::serve::consolidate_responses_instructions`.
 
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -173,11 +174,14 @@ fn fresh_home(label: &str) -> PathBuf {
 /// ellipsis marker when truncated — used by spawn_with_timeout's
 /// heartbeat to show recent output without the printed heartbeat itself
 /// growing unboundedly as a slow child produces more and more of it.
-fn tail_str(buf: &[u8], n: usize) -> String {
+/// (The "bytes total" in that marker is really "bytes retained": the
+/// buffer itself is capped — see [`READER_BUF_CAP`].)
+fn tail_str(buf: &VecDeque<u8>, n: usize) -> String {
+    let tail: Vec<u8> = buf.iter().skip(buf.len().saturating_sub(n)).copied().collect();
     if buf.len() > n {
-        format!("...<{} bytes total>...{}", buf.len(), String::from_utf8_lossy(&buf[buf.len() - n..]))
+        format!("...<{} bytes total>...{}", buf.len(), String::from_utf8_lossy(&tail))
     } else {
-        String::from_utf8_lossy(buf).into_owned()
+        String::from_utf8_lossy(&tail).into_owned()
     }
 }
 
@@ -249,13 +253,22 @@ const READER_BUF_CAP: usize = 4 * 1024 * 1024;
 /// [`READER_BUF_CAP`] — the newest output is what every consumer here
 /// wants: the heartbeat and the timeout diagnostics print tails, and the
 /// "pong" assertion looks for the model's final answer.
-fn append_capped(buf: &Mutex<Vec<u8>>, chunk: &[u8]) {
+///
+/// `buf` is a `VecDeque` precisely so this stays cheap once the cap is
+/// hit: dropping bytes off a `VecDeque`'s front just advances its head
+/// index (it's a ring buffer), where the equivalent `Vec::drain(..n)`
+/// would memmove the entire ~4 MiB retained tail down on *every* append
+/// — per 4 KiB read, a ~1000x write amplification handed to exactly the
+/// endlessly-writing zombie descendant this cap exists to contain,
+/// converting the unbounded-memory problem into a busy-CPU one.
+fn append_capped(buf: &Mutex<VecDeque<u8>>, chunk: &[u8]) {
     let mut buf = buf.lock().unwrap();
-    buf.extend_from_slice(chunk);
-    if buf.len() > READER_BUF_CAP {
-        let excess = buf.len() - READER_BUF_CAP;
-        buf.drain(..excess);
-    }
+    // A single chunk larger than the whole cap can't happen with the 4 KiB
+    // reads below, but don't rely on that from here.
+    let chunk = &chunk[chunk.len().saturating_sub(READER_BUF_CAP)..];
+    let excess = (buf.len() + chunk.len()).saturating_sub(READER_BUF_CAP);
+    buf.drain(..excess);
+    buf.extend(chunk);
 }
 
 /// Spawns the background thread that drains one of the child's output
@@ -265,7 +278,7 @@ fn append_capped(buf: &Mutex<Vec<u8>>, chunk: &[u8]) {
 /// thread rather than after the child exits.
 fn spawn_reader(
     mut pipe: impl Read + Send + 'static,
-    buf: Arc<Mutex<Vec<u8>>>,
+    buf: Arc<Mutex<VecDeque<u8>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut chunk = [0u8; 4096];
@@ -292,7 +305,7 @@ fn spawn_reader(
 /// losing the timeout panic (and the whole job) to an unkillable wait.
 fn collect_reader(
     thread: std::thread::JoinHandle<()>,
-    buf: &Arc<Mutex<Vec<u8>>>,
+    buf: &Arc<Mutex<VecDeque<u8>>>,
     grace: Duration,
 ) -> Vec<u8> {
     let deadline = Instant::now() + grace;
@@ -303,12 +316,12 @@ fn collect_reader(
                  a killed process's descendant is likely still holding the pipe's \
                  write end; proceeding with the output captured so far"
             );
-            return buf.lock().unwrap().clone();
+            return buf.lock().unwrap().iter().copied().collect();
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     thread.join().expect("join reader thread");
-    std::mem::take(&mut *buf.lock().unwrap())
+    Vec::from(std::mem::take(&mut *buf.lock().unwrap()))
 }
 
 /// A launch attempt that hit its deadline and was killed — carries the
@@ -371,8 +384,8 @@ fn try_spawn_with_timeout(
     eprintln!("[spawn_with_timeout] pid={} spawned: {description}", child.id());
     let stdout_pipe = child.stdout.take().expect("child stdout");
     let stderr_pipe = child.stderr.take().expect("child stderr");
-    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
-    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+    let stdout_buf = Arc::new(Mutex::new(VecDeque::new()));
+    let stderr_buf = Arc::new(Mutex::new(VecDeque::new()));
     let stdout_thread = spawn_reader(stdout_pipe, Arc::clone(&stdout_buf));
     let stderr_thread = spawn_reader(stderr_pipe, Arc::clone(&stderr_buf));
 
