@@ -363,6 +363,23 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 				delete(openArtifacts, key)
 				mu.Unlock()
 
+				// p.OffsetUpdate here is whatever portion of this
+				// artifact's bytes hadn't yet been reported by a Read
+				// event above (see progressReader.reportDone in
+				// go.podman.io/image's copy/progress_channel.go: Offset
+				// is the cumulative total, OffsetUpdate is the remainder
+				// since the last update) — the same field, same meaning,
+				// as ProgressEventRead's own OffsetUpdate just above.
+				// Without this, any transfer that finishes inside a
+				// single 200ms ProgressInterval tick (small blobs
+				// routinely do) never fires a single Read event at all —
+				// only NewArtifact (sets total) then straight to Done —
+				// so completed silently stayed at 0 for that artifact
+				// forever, however long the rest of the pull took: a
+				// correctly-sized, permanently-empty-looking bar, not
+				// merely a delayed one.
+				progressAddCompleted(progressKey, int64(p.OffsetUpdate))
+
 				if changed != nil {
 					*changed = true
 				}
@@ -378,10 +395,47 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 				mu.Unlock()
 
 				// This artifact turned out to already exist at the
-				// destination — no bytes will ever flow for it via
-				// ProgressEventRead, so undo the provisional total
-				// ProgressEventNewArtifact already added above.
-				progressAddTotal(progressKey, -p.Artifact.Size)
+				// destination, so go.podman.io/image never routed it
+				// through copyBlobFromStream/newProgressReader at all —
+				// see copy/single.go: the "reused" short-circuit fires
+				// ProgressEventSkipped directly and returns *before* ever
+				// reaching the code that fires ProgressEventNewArtifact.
+				// So, unlike every other case in this switch, total was
+				// *never* incremented for this artifact — there is no
+				// earlier addition to undo (an older version of this got
+				// that backwards and subtracted the size back out here,
+				// which could only ever under- or, worse, over-correct
+				// total for whatever this pull's other artifacts had
+				// already added it to) — both total and completed need
+				// to be credited with the full size right here, together,
+				// as the only place this artifact's size is ever
+				// accounted for at all.
+				//
+				// Why this matters in practice: llmman's local store is
+				// content-addressed, so the very same model blob is
+				// frequently already present under a *different*
+				// reference (e.g. the same GGUF re-pulled as
+				// `docker.io/ai/qwen3.5:0.8b` after already having it as
+				// `hf.co/unsloth/Qwen3.5-0.8B-GGUF`) — a routine case for
+				// llmman, not a rare edge case, and exactly what a fresh
+				// `llmman pull qwen3.5:0.8b` hits every single blob of.
+				// Without crediting total here, a pull whose only
+				// non-skipped artifact was the tiny manifest/config blob
+				// (a few hundred bytes) left total pinned at that few
+				// hundred bytes for the *entire* operation while gigabytes
+				// of skipped weights were credited only to completed —
+				// which cmd::serve's relay (stream_ffi_progress) then
+				// clamps back down to that same tiny total before it ever
+				// reaches the Rust CLI, so `llmman pull`/`run`/`launch`
+				// showed a bar frozen at "327 B / 327 B" for however long
+				// the skip/verification took, with no sign the real,
+				// much larger transfer (or non-transfer) was happening at
+				// all. Crediting both here keeps total an accurate
+				// picture of the whole pull's bytes while marking this
+				// artifact's share instantly done, exactly like a real
+				// transfer that finished the moment it started.
+				progressAddTotal(progressKey, p.Artifact.Size)
+				progressAddCompleted(progressKey, p.Artifact.Size)
 				if bar, ok := bars[key]; ok {
 					bar.Abort(true)
 					delete(bars, key)
@@ -436,6 +490,27 @@ func copyImageAttempt(ctx context.Context, pctx *signature.PolicyContext, dst, s
 	_, err := copy.Image(ctx, pctx, dst, src, opts)
 	close(ch)
 	<-progDone
+
+	// Stop the watchdog goroutine now that the real work is done, instead
+	// of leaving it running: its own select loop only ever exits via
+	// <-ctx.Done() or by detecting genuine staleness itself (which takes
+	// the *full* dlStallTimeout, however fast copy.Image above actually
+	// returned) — and until this explicit cancel, nothing ever fired
+	// ctx.Done() this early: the `defer cancel()` at the top of this
+	// function only runs once copyImageAttempt itself returns, which is
+	// blocked right here on <-watchdogDone. Without this line, *every*
+	// pull — even one that copy.Image finishes in well under a second,
+	// e.g. because every blob was already on disk under a different
+	// reference (llmman's local store is content-addressed, so this is
+	// routine, not rare) — unconditionally blocked for a further
+	// dlStallTimeout (60s) after the real work was already done, waiting
+	// for the watchdog's own periodic staleness check to eventually
+	// notice "no artifacts open, unclear why" and cancel itself. That
+	// full 60s (near enough to the ~60-65s delays seen end-to-end,
+	// however the pull's actual bytes played out) was pure dead time:
+	// `llmman pull qwen3.5:0.8b` looked "stuck" at a 100%-complete
+	// progress bar for about a minute before ever printing "success".
+	cancel()
 	<-watchdogDone
 
 	// The real root cause of a hang that was chased through several
