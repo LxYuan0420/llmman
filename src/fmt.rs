@@ -99,4 +99,80 @@ mod tests {
         assert_eq!(relative_time_rfc3339(&now), "just now");
         assert_eq!(relative_time_rfc3339("not a timestamp"), "unknown");
     }
+
+    /// Ported from ollama's format/bytes_test.go (TestHumanBytes), adapted
+    /// to this module's own decimal conventions: units are kB/MB/GB with no
+    /// TB tier, and every unit above bytes always renders one decimal place
+    /// ("1.0 kB" where ollama prints "1 KB"), so values that sit just under
+    /// a unit boundary render as e.g. "1000.0 kB" rather than ollama's
+    /// truncated "999 KB".
+    #[test]
+    fn human_size_ported_ollama_humanbytes_boundaries() {
+        // Bytes.
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1), "1 B");
+        assert_eq!(human_size(999), "999 B");
+
+        // Kilobytes.
+        assert_eq!(human_size(1_000), "1.0 kB");
+        assert_eq!(human_size(1_234), "1.2 kB");
+        assert_eq!(human_size(999_999), "1000.0 kB");
+
+        // Megabytes.
+        assert_eq!(human_size(1_000_000), "1.0 MB");
+        assert_eq!(human_size(1_234_567), "1.2 MB");
+
+        // Gigabytes.
+        assert_eq!(human_size(1_000_000_000), "1.0 GB");
+        assert_eq!(human_size(1_234_567_890), "1.2 GB");
+
+        // No TB tier: terabyte-scale sizes keep counting in GB.
+        assert_eq!(human_size(1_000_000_000_000), "1000.0 GB");
+        assert_eq!(human_size(1_500_000_000_000), "1500.0 GB");
+    }
+
+    /// Ported from ollama's format/time_test.go (TestHumanTime) plus its
+    /// humanDuration unit ladder, adapted to this module's own phrasing
+    /// ("just now"/"yesterday"/"N weeks ago" instead of ollama's
+    /// "Less than a second"/"2 days"). Walks every unit boundary in
+    /// relative_time_secs.
+    #[test]
+    fn relative_time_secs_ported_ollama_humantime_unit_ladder() {
+        const DAY: u64 = 86_400;
+        assert_eq!(relative_time_secs(0), "just now");
+        assert_eq!(relative_time_secs(59), "just now");
+        assert_eq!(relative_time_secs(60), "1 minutes ago");
+        assert_eq!(relative_time_secs(120), "2 minutes ago");
+        assert_eq!(relative_time_secs(3_600), "1 hours ago");
+        assert_eq!(relative_time_secs(7_200), "2 hours ago");
+        assert_eq!(relative_time_secs(DAY), "yesterday");
+        assert_eq!(relative_time_secs(2 * DAY - 1), "yesterday");
+        // ollama's "time in the past" case: now - 48h -> "2 days ago".
+        assert_eq!(relative_time_secs(2 * DAY), "2 days ago");
+        assert_eq!(relative_time_secs(6 * DAY), "6 days ago");
+        assert_eq!(relative_time_secs(7 * DAY), "1 week ago");
+        assert_eq!(relative_time_secs(14 * DAY), "2 weeks ago");
+        assert_eq!(relative_time_secs(30 * DAY), "1 month ago");
+        assert_eq!(relative_time_secs(60 * DAY), "2 months ago");
+        assert_eq!(relative_time_secs(365 * DAY), "1 year ago");
+        assert_eq!(relative_time_secs(730 * DAY), "2 years ago");
+        // ollama's "time way in the future" renders "Forever"; this module
+        // has no such cap and just keeps counting years.
+        assert_eq!(relative_time_secs(200 * 365 * DAY), "200 years ago");
+    }
+
+    /// Ported from ollama's format/time_test.go: the zero value renders the
+    /// caller's fallback ("never" there, "unknown" here), and a timestamp
+    /// in the future clamps rather than panicking (ollama phrases it as
+    /// "N days from now"; this module clamps to "just now" since nothing
+    /// it formats — mtimes, daemon start times — can legitimately be in
+    /// the future).
+    #[test]
+    fn relative_time_ported_ollama_humantime_edge_cases() {
+        assert_eq!(relative_time(None), "unknown");
+        let future = SystemTime::now() + std::time::Duration::from_secs(2 * 86_400);
+        assert_eq!(relative_time(Some(future)), "just now");
+        let past = SystemTime::now() - std::time::Duration::from_secs(2 * 86_400);
+        assert_eq!(relative_time(Some(past)), "2 days ago");
+    }
 }

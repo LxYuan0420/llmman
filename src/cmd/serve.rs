@@ -2674,4 +2674,208 @@ mod tests {
         consolidate_responses_instructions(&mut req);
         assert_eq!(req, before);
     }
+
+    // -- Tests ported from ollama ---------------------------------------------
+    //
+    // The tests below are ported from ollama's own unit-test suites for the
+    // equivalent conversion logic — file references point at ollama/ollama's
+    // test files — adapted to llmman's own (narrower) semantics where the two
+    // differ; each test's doc comment calls out any such adaptation.
+
+    /// Ported from ollama's openai/openai_test.go
+    /// (TestFromChatRequest_ReasoningEffort), adapted to llmman's narrower
+    /// mapping: only the plain-boolean `think` forms have an equivalent in
+    /// llama-server's `chat_template_kwargs.enable_thinking`; ollama's
+    /// string thinking levels ("low"/"medium"/"high"/"max") have no
+    /// counterpart there and are deliberately a no-op (None), as is an
+    /// absent `think` — the template's own default then applies.
+    #[test]
+    fn think_to_chat_template_kwargs_maps_booleans_and_ignores_levels() {
+        assert_eq!(
+            think_to_chat_template_kwargs(&Some(serde_json::json!(true))),
+            Some(serde_json::json!({ "enable_thinking": true }))
+        );
+        assert_eq!(
+            think_to_chat_template_kwargs(&Some(serde_json::json!(false))),
+            Some(serde_json::json!({ "enable_thinking": false }))
+        );
+        for level in ["low", "medium", "high", "max", "minimal", "none"] {
+            assert_eq!(
+                think_to_chat_template_kwargs(&Some(serde_json::json!(level))),
+                None,
+                "string level {level:?} must be a no-op"
+            );
+        }
+        assert_eq!(think_to_chat_template_kwargs(&None), None);
+    }
+
+    /// Ported from ollama's api/client_test.go (TestClientStream /
+    /// TestClientDo malformed-payload cases) and openai streaming-chunk
+    /// tests: each SSE payload either yields (content, thinking, done) or
+    /// is skipped entirely (None) when malformed — a bad chunk must never
+    /// abort the whole stream.
+    #[test]
+    fn oai_chunk_to_content_ported_ollama_stream_decoding_cases() {
+        // Plain content token, stream not finished.
+        assert_eq!(
+            oai_chunk_to_content(r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#),
+            Some(("hi".into(), None, false))
+        );
+        // finish_reason "stop" marks the stream done.
+        assert_eq!(
+            oai_chunk_to_content(r#"{"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}"#),
+            Some((String::new(), None, true))
+        );
+        // The [DONE] sentinel also marks the stream done.
+        assert_eq!(oai_chunk_to_content("[DONE]"), Some((String::new(), None, true)));
+        // llama-server's two reasoning field spellings both surface as
+        // thinking: "reasoning_content" (Homebrew builds) and "thinking"
+        // (git builds).
+        assert_eq!(
+            oai_chunk_to_content(
+                r#"{"choices":[{"delta":{"reasoning_content":"hmm"},"finish_reason":null}]}"#
+            ),
+            Some((String::new(), Some("hmm".into()), false))
+        );
+        assert_eq!(
+            oai_chunk_to_content(r#"{"choices":[{"delta":{"thinking":"hmm"},"finish_reason":null}]}"#),
+            Some((String::new(), Some("hmm".into()), false))
+        );
+        // An empty reasoning string is filtered out rather than surfaced.
+        assert_eq!(
+            oai_chunk_to_content(
+                r#"{"choices":[{"delta":{"content":"x","reasoning_content":""},"finish_reason":null}]}"#
+            ),
+            Some(("x".into(), None, false))
+        );
+        // Malformed JSON and an empty choices array are skipped, not fatal.
+        assert_eq!(oai_chunk_to_content("not json"), None);
+        assert_eq!(oai_chunk_to_content(r#"{"choices":[]}"#), None);
+    }
+
+    /// Ported from ollama's api/client_test.go (TestClientStream): SSE
+    /// lines split across arbitrary TCP chunk boundaries must be
+    /// reassembled, CRLF line endings trimmed, and a trailing
+    /// unterminated line flushed when the stream ends.
+    #[test]
+    fn bytes_to_lines_ported_ollama_client_stream_chunking() {
+        let chunks: Vec<reqwest::Result<Bytes>> = vec![
+            // One logical line split across two chunks.
+            Ok(Bytes::from("data: {\"a\":")),
+            // ...ending CRLF, plus a complete LF-terminated line.
+            Ok(Bytes::from("1}\r\ndata: {\"b\":2}\n")),
+            // A trailing line with no terminator at all.
+            Ok(Bytes::from("data: tail")),
+        ];
+        let stream = bytes_to_lines(futures::stream::iter(chunks));
+        let lines: Vec<String> = futures::executor::block_on(StreamExt::collect::<Vec<_>>(stream));
+        assert_eq!(
+            lines,
+            vec![
+                "data: {\"a\":1}".to_string(),
+                "data: {\"b\":2}".to_string(),
+                "data: tail".to_string(),
+            ]
+        );
+    }
+
+    /// Ported from ollama's middleware/anthropic_test.go
+    /// (TestAnthropicMessagesMiddleware's plain-string `system` case):
+    /// Anthropic's `system` field is accepted as either a bare string or
+    /// an array of content blocks, and both forms end up as the single
+    /// leading system message.
+    #[test]
+    fn build_anthropic_messages_accepts_a_plain_string_system_field() {
+        let req: AnthropicRequest = serde_json::from_value(serde_json::json!({
+            "model": "docker.io/ai/qwen3.5:0.8b",
+            "system": "you are a helpful assistant",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+
+        let messages = build_anthropic_messages(&req);
+
+        assert_eq!(
+            messages,
+            vec![
+                OAIMessage { role: "system".into(), content: "you are a helpful assistant".into() },
+                OAIMessage { role: "user".into(), content: "hi".into() },
+            ]
+        );
+    }
+
+    /// Ported from ollama's middleware/anthropic_test.go content-block
+    /// conversion cases: block-array content joins its text blocks in
+    /// order and ignores non-text block types entirely.
+    #[test]
+    fn anthropic_content_as_text_joins_text_blocks_and_ignores_other_types() {
+        let plain: AnthropicContent = serde_json::from_value(serde_json::json!("plain")).unwrap();
+        assert_eq!(plain.as_text(), "plain");
+
+        let blocks: AnthropicContent = serde_json::from_value(serde_json::json!([
+            {"type": "text", "text": "a"},
+            {"type": "image", "source": {"type": "base64", "data": "zzzz"}},
+            {"type": "text", "text": "b"}
+        ]))
+        .unwrap();
+        assert_eq!(blocks.as_text(), "ab");
+
+        let empty: AnthropicContent = serde_json::from_value(serde_json::json!([])).unwrap();
+        assert_eq!(empty.as_text(), "");
+    }
+
+    /// Ported from ollama's openai/responses_test.go polymorphic-input
+    /// cases: a Responses-API input item's `content` is either a bare
+    /// string or an array of text-bearing blocks (`input_text` /
+    /// `output_text`), and anything else (a function_call item with no
+    /// content, a non-string/array content) yields no text.
+    #[test]
+    fn responses_input_item_text_ported_ollama_polymorphic_input_cases() {
+        assert_eq!(
+            responses_input_item_text(&serde_json::json!({"role": "user", "content": "plain"})),
+            Some("plain".into())
+        );
+        assert_eq!(
+            responses_input_item_text(&serde_json::json!({"role": "user", "content": [
+                {"type": "input_text", "text": "a"},
+                {"type": "output_text", "text": "b"}
+            ]})),
+            Some("ab".into())
+        );
+        // Blocks without a text field contribute nothing.
+        assert_eq!(
+            responses_input_item_text(&serde_json::json!({"content": [{"type": "input_image"}]})),
+            Some(String::new())
+        );
+        assert_eq!(
+            responses_input_item_text(&serde_json::json!({"type": "function_call", "name": "f"})),
+            None
+        );
+        assert_eq!(responses_input_item_text(&serde_json::json!({"content": 42})), None);
+    }
+
+    /// Ported from ollama's server/routes_options_test.go concept
+    /// (api.Options blob -> typed option values): numeric options are
+    /// pulled out of the Ollama `options` blob by key, and missing keys,
+    /// wrong-typed values, or an absent blob all yield None instead of
+    /// erroring.
+    #[test]
+    fn option_extractors_ported_ollama_options_blob_cases() {
+        let opts = Some(serde_json::json!({
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "num_predict": 128,
+            "stop": ["### User:"]
+        }));
+        assert_eq!(opt_f64(&opts, "temperature"), Some(0.5));
+        assert_eq!(opt_f64(&opts, "top_p"), Some(0.9));
+        assert_eq!(opt_u32(&opts, "num_predict"), Some(128));
+        // Missing key.
+        assert_eq!(opt_f64(&opts, "repeat_penalty"), None);
+        // Wrong type for the extractor.
+        assert_eq!(opt_u32(&opts, "stop"), None);
+        // No options blob at all.
+        assert_eq!(opt_f64(&None, "temperature"), None);
+        assert_eq!(opt_u32(&None, "num_predict"), None);
+    }
 }

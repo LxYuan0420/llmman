@@ -244,6 +244,45 @@ mod tests {
         assert!(!is_bare("hf.co/gemma4"));
     }
 
+    /// Ported from ollama's types/model/name_test.go (TestParseNameParts /
+    /// TestNameparseNameDefault): ollama fills an unqualified name out to
+    /// registry.ollama.ai/library/<model>:latest; llmman's equivalents are
+    /// resolve_ollama_api's docker.io/ai/<name> default for bare names and
+    /// resolve's hf.co/<owner>/<repo> default for host-less paths, while
+    /// anything already carrying a host passes through untouched.
+    #[test]
+    fn resolve_fills_in_default_registry_like_ollama_parse_name() {
+        // Bare model name (ollama: "model" -> registry.ollama.ai/library/model:latest).
+        assert_eq!(resolve_ollama_api("mistral"), "docker.io/ai/mistral");
+        assert_eq!(resolve_ollama_api("mistral:7b"), "docker.io/ai/mistral:7b");
+        // namespace/model (ollama: -> registry.ollama.ai/namespace/model).
+        assert_eq!(resolve("namespace/model"), "hf.co/namespace/model");
+        // Fully-qualified references pass through untouched...
+        assert_eq!(resolve("example.com/ns/model:tag"), "example.com/ns/model:tag");
+        // ...including a host:port first component (ollama's
+        // "host:port/namespace/model:tag" case) and localhost.
+        assert_eq!(resolve("example.com:5000/ns/model:tag"), "example.com:5000/ns/model:tag");
+        assert_eq!(resolve("localhost/ns/model"), "localhost/ns/model");
+    }
+
+    /// Ported from ollama's types/model/name_test.go scheme cases
+    /// ("scheme://host/namespace/model:tag" parses with the scheme split
+    /// off): llmman likewise never treats a URI scheme as part of the
+    /// reference — hf:// and huggingface:// are stripped before the normal
+    /// defaulting rules run, modelscope:// is normalised to ms://, and
+    /// object-store schemes pass through verbatim.
+    #[test]
+    fn resolve_splits_uri_schemes_like_ollama_parse_name() {
+        assert_eq!(resolve("hf://owner/repo"), "hf.co/owner/repo");
+        assert_eq!(resolve("huggingface://owner/repo"), "hf.co/owner/repo");
+        assert_eq!(resolve("hf://hf.co/owner/repo"), "hf.co/owner/repo");
+        assert_eq!(resolve("modelscope://owner/repo"), "ms://owner/repo");
+        assert_eq!(resolve("ms://owner/repo"), "ms://owner/repo");
+        assert_eq!(resolve("s3://bucket/key"), "s3://bucket/key");
+        assert_eq!(resolve("gs://bucket/key"), "gs://bucket/key");
+        assert_eq!(resolve("ngc://org/model"), "ngc://org/model");
+    }
+
     #[test]
     fn has_host_requires_a_slash() {
         // No "/" at all: a dotted version number must not be mistaken for
