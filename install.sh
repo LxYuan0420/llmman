@@ -3,7 +3,7 @@
 # this host's OS/arch from GitHub Releases and installs it to
 # ~/.local/bin. For Windows, use install.ps1 instead.
 #
-#   curl -fsSL https://raw.githubusercontent.com/ericcurtin/llmman/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/llmmanorg/llmman/main/install.sh | sh
 #
 # GPU/backend detection happens at runtime inside the llmman binary
 # itself, the first time `llmman serve` needs a `llama-server` (see
@@ -16,10 +16,10 @@
 #
 # Env overrides:
 #   LLMMAN_VERSION   pin an exact release tag (e.g. "v0.2.0"); default: latest
-#   LLMMAN_REPO      "owner/repo" to fetch from; default: ericcurtin/llmman
+#   LLMMAN_REPO      "owner/repo" to fetch from; default: llmmanorg/llmman
 #   SKIP_INSTALL     download and verify only, don't install to ~/.local/bin
 
-: "${LLMMAN_REPO:=ericcurtin/llmman}"
+: "${LLMMAN_REPO:=llmmanorg/llmman}"
 
 die() {
 	printf "%s\n" "$@" >&2

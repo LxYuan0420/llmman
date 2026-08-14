@@ -25,13 +25,13 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 **Linux, macOS:**
 
 ```
-curl -fsSL https://raw.githubusercontent.com/ericcurtin/llmman/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/llmmanorg/llmman/main/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```
-irm https://raw.githubusercontent.com/ericcurtin/llmman/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
 ```
 
 ## Quick start

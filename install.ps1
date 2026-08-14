@@ -4,7 +4,7 @@
 # user account by default on Windows 10/11. For Linux/macOS, use
 # install.sh instead.
 #
-#   irm https://raw.githubusercontent.com/ericcurtin/llmman/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/llmmanorg/llmman/main/install.ps1 | iex
 #
 # GPU/backend detection happens at runtime inside the llmman binary
 # itself, the first time `llmman serve` needs a `llama-server` (see
@@ -16,7 +16,7 @@
 #
 # Env overrides:
 #   LLMMAN_VERSION   pin an exact release tag (e.g. "v0.2.0"); default: latest
-#   LLMMAN_REPO      "owner/repo" to fetch from; default: ericcurtin/llmman
+#   LLMMAN_REPO      "owner/repo" to fetch from; default: llmmanorg/llmman
 #   SKIP_INSTALL     download and verify only, don't install
 
 function Die {
@@ -27,7 +27,7 @@ function Die {
 
 function Main {
     $Repo = $env:LLMMAN_REPO
-    if (!$Repo) { $Repo = "ericcurtin/llmman" }
+    if (!$Repo) { $Repo = "llmmanorg/llmman" }
 
     switch ($env:PROCESSOR_ARCHITECTURE) {
         "ARM64" { $Target = "aarch64-pc-windows-msvc" }
