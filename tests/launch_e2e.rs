@@ -260,13 +260,37 @@ fn collect_reader(
     std::mem::take(&mut *buf.lock().unwrap())
 }
 
+/// A launch attempt that hit its deadline and was killed — carries the
+/// fully formatted diagnostics (description, timeout, and both output
+/// tails) so the caller can either panic with them verbatim
+/// ([`spawn_with_timeout`]) or print them and retry
+/// ([`launch_and_assert`]).
+struct TimedOut {
+    message: String,
+}
+
 /// Runs `cmd`, waiting up to `timeout` and killing (then panicking with
 /// `description` in the message) it — *and its entire process tree*, see
-/// `kill_process_tree` — if it hasn't exited by then. stdout/stderr are
-/// drained on background threads while polling for exit, rather than
-/// read only after the child finishes, so a chatty child can't deadlock
-/// on a full pipe buffer before the timeout ever gets a chance to fire.
-fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) -> std::process::Output {
+/// `kill_process_tree` — if it hasn't exited by then. Thin panicking
+/// wrapper over [`try_spawn_with_timeout`], for callers (`warm_model`)
+/// for which a timeout is immediately fatal rather than retryable.
+fn spawn_with_timeout(cmd: Command, timeout: Duration, description: &str) -> std::process::Output {
+    try_spawn_with_timeout(cmd, timeout, description)
+        .unwrap_or_else(|timed_out| panic!("{}", timed_out.message))
+}
+
+/// Runs `cmd`, waiting up to `timeout` and killing it — *and its entire
+/// process tree*, see `kill_process_tree` — if it hasn't exited by then,
+/// returning `Err(TimedOut)` instead of panicking so the caller decides
+/// whether a timeout is fatal or retryable. stdout/stderr are drained on
+/// background threads while polling for exit, rather than read only
+/// after the child finishes, so a chatty child can't deadlock on a full
+/// pipe buffer before the timeout ever gets a chance to fire.
+fn try_spawn_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    description: &str,
+) -> Result<std::process::Output, TimedOut> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -362,10 +386,12 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
                 String::from_utf8_lossy(&collect_reader(stdout_thread, &stdout_buf, Duration::from_secs(5))).into_owned();
             let stderr =
                 String::from_utf8_lossy(&collect_reader(stderr_thread, &stderr_buf, Duration::from_secs(5))).into_owned();
-            panic!(
-                "{description} did not finish within {timeout:?} — likely a hang\n\
-                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-            );
+            return Err(TimedOut {
+                message: format!(
+                    "{description} did not finish within {timeout:?} — likely a hang\n\
+                     --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+                ),
+            });
         }
         std::thread::sleep(Duration::from_millis(200));
     };
@@ -376,7 +402,7 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
     // grandchild must not be able to wedge a *successful* run either.
     let stdout = collect_reader(stdout_thread, &stdout_buf, Duration::from_secs(30));
     let stderr = collect_reader(stderr_thread, &stderr_buf, Duration::from_secs(30));
-    std::process::Output { status, stdout, stderr }
+    Ok(std::process::Output { status, stdout, stderr })
 }
 
 /// Forces `MODEL` to be pulled and fully loaded — via `llmman run`, our
@@ -434,8 +460,15 @@ fn warm_model() {
 }
 
 /// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
-/// with `home` as its `HOME`. See `warm_model` and `spawn_with_timeout`.
-fn run_launch(home: &Path, integration: &str, extra_args: &[&str]) -> std::process::Output {
+/// with `home` as its `HOME`, returning `Err(TimedOut)` (rather than
+/// panicking) if it had to be killed at `TIMEOUT` — see `warm_model`,
+/// `try_spawn_with_timeout`, and `launch_and_assert` for who retries
+/// that and why.
+fn run_launch(
+    home: &Path,
+    integration: &str,
+    extra_args: &[&str],
+) -> Result<std::process::Output, TimedOut> {
     eprintln!("[run_launch] {integration}: calling warm_model()");
     warm_model();
     eprintln!("[run_launch] {integration}: warm_model() returned, spawning launch");
@@ -450,7 +483,7 @@ fn run_launch(home: &Path, integration: &str, extra_args: &[&str]) -> std::proce
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"));
 
-    spawn_with_timeout(
+    try_spawn_with_timeout(
         cmd,
         TIMEOUT,
         &format!("`llmman launch {integration} --model {MODEL} -- {extra_args:?}`"),
@@ -466,34 +499,58 @@ const MAX_ATTEMPTS: u32 = 3;
 /// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
 /// (via [`run_launch`], against a fresh temp `HOME` each attempt) and
 /// asserts it succeeded and that the model's real answer shows up in
-/// stdout — retrying up to [`MAX_ATTEMPTS`] times, but *only* when the
-/// launch itself exited successfully and merely didn't happen to answer
-/// with "pong" this particular time.
+/// stdout — retrying up to [`MAX_ATTEMPTS`] times, but *only* for the
+/// two failure shapes small-model sampling variance alone can produce:
 ///
-/// That retry exists because real batched inference through llama-server
-/// (`n_slots` continuous batching serving whatever concurrent requests
-/// each of these real, un-mocked third-party CLIs' own startup traffic —
-/// title generation, memory/skill checks, etc. — happens to send
-/// alongside the actual prompt) is not bit-for-bit deterministic run to
-/// run even for identical input text: a small quantized model's sampling
-/// can tip a different way depending on exactly how those concurrent
-/// requests happen to batch together. Directly observed in practice
-/// (not hypothetical): real `qwen3.5:0.8b` runs through a real `claude
-/// --model ... -p ...` occasionally answer with a nonsensical safety
-/// refusal, or attempt a spurious tool call, instead of the one literal
-/// word asked for — see this file's module doc comment's own catalogue of
-/// similar small-model degeneracy already fought here (`warm_model`'s
-/// `--think false --num-predict 64`). A *real* regression (a non-zero
-/// exit status: an actual crash, a rejected request, a 500) is never
-/// retried — only "the process exited 0 but the live model's one-shot
-/// answer this time didn't include the word" is, so this can't mask the
-/// actual API-compat bugs this suite exists to catch (see that same doc
-/// comment).
+///   - the launch exited successfully and merely didn't happen to answer
+///     with "pong" this particular time, or
+///   - the launch had to be killed at `TIMEOUT` because the model's
+///     sampling degenerated into an endless agent loop that never
+///     finished at all. Directly observed in CI (x86_64 linux/podman,
+///     run 31782553115): a real `opencode run` session's agent kept
+///     decoding thousands of tokens across task after task at ~14 t/s on
+///     a CPU-only runner, blowing the whole 600s budget — the same
+///     failure class `warm_model`'s `--num-predict 64` caps for our own
+///     client, which these real third-party CLIs expose no flag for.
+///
+/// Those retries exist because real batched inference through
+/// llama-server (`n_slots` continuous batching serving whatever
+/// concurrent requests each of these real, un-mocked third-party CLIs'
+/// own startup traffic — title generation, memory/skill checks, etc. —
+/// happens to send alongside the actual prompt) is not bit-for-bit
+/// deterministic run to run even for identical input text: a small
+/// quantized model's sampling can tip a different way depending on
+/// exactly how those concurrent requests happen to batch together.
+/// Directly observed in practice (not hypothetical): real `qwen3.5:0.8b`
+/// runs through a real `claude --model ... -p ...` occasionally answer
+/// with a nonsensical safety refusal, or attempt a spurious tool call,
+/// instead of the one literal word asked for — see this file's module
+/// doc comment's own catalogue of similar small-model degeneracy already
+/// fought here (`warm_model`'s `--think false --num-predict 64`). A
+/// *real* regression (a non-zero exit status: an actual crash, a
+/// rejected request, a 500) is never retried — a deterministic bug fails
+/// deterministically and fast, so retrying it would only triple the time
+/// to the same red result while masking nothing — which keeps this from
+/// hiding the actual API-compat bugs this suite exists to catch (see
+/// that same doc comment).
 fn launch_and_assert(integration: &str, extra_args: &[&str]) {
-    let mut last_output = None;
+    let mut last_failure = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let home = fresh_home(integration);
-        let output = run_launch(&home, integration, extra_args);
+        let output = match run_launch(&home, integration, extra_args) {
+            Ok(output) => output,
+            Err(timed_out) => {
+                eprintln!(
+                    "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} timed out \
+                     (small-model sampling variance can degenerate into an endless agent \
+                     loop — see launch_and_assert's own doc comment); {}\n{}",
+                    if attempt < MAX_ATTEMPTS { "retrying with a fresh HOME" } else { "giving up" },
+                    timed_out.message
+                );
+                last_failure = Some(timed_out.message);
+                continue;
+            }
+        };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -511,15 +568,13 @@ fn launch_and_assert(integration: &str, extra_args: &[&str]) {
              own doc comment); {}",
             if attempt < MAX_ATTEMPTS { "retrying with a fresh HOME" } else { "giving up" }
         );
-        last_output = Some(output);
+        last_failure = Some(format!(
+            "expected {integration}'s reply to contain \"pong\"\n\
+             --- stdout (last attempt) ---\n{stdout}\n--- stderr (last attempt) ---\n{stderr}"
+        ));
     }
-    let output = last_output.expect("loop runs at least once, so this is always set");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    panic!(
-        "expected {integration}'s reply to contain \"pong\" after {MAX_ATTEMPTS} attempts\n\
-         --- stdout (last attempt) ---\n{stdout}\n--- stderr (last attempt) ---\n{stderr}"
-    );
+    let last_failure = last_failure.expect("loop runs at least once, so this is always set");
+    panic!("{integration} failed all {MAX_ATTEMPTS} attempts; last failure:\n{last_failure}");
 }
 
 #[test]
