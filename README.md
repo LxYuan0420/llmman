@@ -34,14 +34,6 @@ curl -fsSL https://raw.githubusercontent.com/ericcurtin/llmman/main/install.sh |
 irm https://raw.githubusercontent.com/ericcurtin/llmman/main/install.ps1 | iex
 ```
 
-Both scripts download the `llmman` binary matching your OS/arch from this
-repo's [GitHub Releases](https://github.com/ericcurtin/llmman/releases) and
-put it on `PATH` — see `install.sh`/`install.ps1` for supported
-architectures and environment overrides (`LLMMAN_VERSION`, `SKIP_INSTALL`).
-GPU acceleration is detected separately and automatically the first time
-`llmman serve` runs (see the "Serve" section below) — no GPU-specific
-install step is needed.
-
 ## Quick start
 
 ### Pull a model
