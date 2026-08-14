@@ -47,7 +47,7 @@ install step is needed.
 ### Pull a model
 
 ```
-llmman pull unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M
+llmman pull gemma4
 ```
 
 ### Transfer a model between locations
@@ -56,12 +56,10 @@ Transfer an image directly from a source to a destination without storing
 it locally first — e.g. HuggingFace straight to an OCI registry:
 
 ```
-llmman transfer hf.co/unsloth/Qwen3.5-0.8B-GGUF registry.example.com/owner/model:latest
+llmman transfer hf.co/unsloth/Qwen3.5-0.8B-GGUF docker.io/owner/model:latest
 ```
 
-Any source `llmman pull` understands (an OCI registry, `hf://`, `ms://`,
-`ngc://`, `s3://`, `gs://`, ...) can be paired with any OCI registry
-destination.
+Any source `llmman pull` understands (an OCI registry, `hf://`, `ms://`, ...) can be paired with any OCI registry destination.
 
 ### Serve
 
@@ -69,12 +67,6 @@ Start the inference server. Uses `llama-server` from [llama.cpp](https://github.
 
 ```
 llmman serve
-```
-
-Optionally pass a model to pre-load on startup:
-
-```
-llmman serve unsloth/Qwen3.5-0.8B-GGUF:latest
 ```
 
 The server listens on `127.0.0.1:17434` and exposes:
