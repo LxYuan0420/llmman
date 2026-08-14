@@ -71,6 +71,7 @@
 //!     ggml-org/llama.cpp#20733/#23423) — fixed in
 //!     `cmd::serve::consolidate_responses_instructions`.
 
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -173,11 +174,14 @@ fn fresh_home(label: &str) -> PathBuf {
 /// ellipsis marker when truncated — used by spawn_with_timeout's
 /// heartbeat to show recent output without the printed heartbeat itself
 /// growing unboundedly as a slow child produces more and more of it.
-fn tail_str(buf: &[u8], n: usize) -> String {
+/// (The "bytes total" in that marker is really "bytes retained": the
+/// buffer itself is capped — see [`READER_BUF_CAP`].)
+fn tail_str(buf: &VecDeque<u8>, n: usize) -> String {
+    let tail: Vec<u8> = buf.iter().skip(buf.len().saturating_sub(n)).copied().collect();
     if buf.len() > n {
-        format!("...<{} bytes total>...{}", buf.len(), String::from_utf8_lossy(&buf[buf.len() - n..]))
+        format!("...<{} bytes total>...{}", buf.len(), String::from_utf8_lossy(&tail))
     } else {
-        String::from_utf8_lossy(buf).into_owned()
+        String::from_utf8_lossy(&tail).into_owned()
     }
 }
 
@@ -227,6 +231,79 @@ fn kill_process_tree(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// Upper bound on how many bytes of one stream's output a reader thread
+/// retains — generous (a passing run of anything in this file produces
+/// kilobytes, even with opencode's `--log-level DEBUG` on), but *finite*,
+/// because a reader thread's lifetime isn't reliably bounded: when
+/// `collect_reader` gives up on a thread still blocked in `read()`, that
+/// thread is detached, not terminated (safe Rust has no way to kill it),
+/// and it keeps appending for as long as some descendant that escaped
+/// `kill_process_tree` keeps the pipe's write end open and keeps
+/// writing. That was always true, but it used to not matter: a timeout
+/// panicked, the test process died, and any detached reader died with
+/// it. Now that `launch_and_assert` *retries* a timed-out attempt, a
+/// detached reader from a previous attempt can outlive it (each attempt
+/// gets fresh pipes/buffers/threads, so its output can never leak into a
+/// later attempt's assertions — only this cap's worth of memory), so an
+/// endlessly-writing zombie must be able to cost at most this much, not
+/// grow without bound for the rest of the test binary's life.
+const READER_BUF_CAP: usize = 4 * 1024 * 1024;
+
+/// Appends `chunk` to `buf`, discarding the *oldest* bytes to stay under
+/// [`READER_BUF_CAP`] — the newest output is what every consumer here
+/// wants: the heartbeat and the timeout diagnostics print tails, and the
+/// "pong" assertion looks for the model's final answer.
+///
+/// `buf` is a `VecDeque` precisely so this stays cheap once the cap is
+/// hit: dropping bytes off a `VecDeque`'s front just advances its head
+/// index (it's a ring buffer), where the equivalent `Vec::drain(..n)`
+/// would memmove the entire ~4 MiB retained tail down on *every* append
+/// — per 4 KiB read, a ~1000x write amplification handed to exactly the
+/// endlessly-writing zombie descendant this cap exists to contain,
+/// converting the unbounded-memory problem into a busy-CPU one.
+fn append_capped(buf: &Mutex<VecDeque<u8>>, chunk: &[u8]) {
+    let mut buf = buf.lock().unwrap();
+    // A single chunk larger than the whole cap can't happen with the 4 KiB
+    // reads below, but don't rely on that from here.
+    let chunk = &chunk[chunk.len().saturating_sub(READER_BUF_CAP)..];
+    let excess = (buf.len() + chunk.len()).saturating_sub(READER_BUF_CAP);
+    buf.drain(..excess);
+    buf.extend(chunk);
+}
+
+/// Spawns the background thread that drains one of the child's output
+/// pipes into a shared (capped — see [`append_capped`]) buffer until EOF
+/// or a read error. See the comment above the call sites in
+/// `try_spawn_with_timeout` for why draining must happen live on a
+/// thread rather than after the child exits.
+fn spawn_reader(
+    mut pipe: impl Read + Send + 'static,
+    buf: Arc<Mutex<VecDeque<u8>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => append_capped(&buf, &chunk[..n]),
+                // A signal landing mid-read isn't EOF — retry, per the
+                // standard EINTR contract.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // Any other error still ends draining (there's nothing
+                // useful to do with a broken pipe from here, and the
+                // output captured so far is worth returning either way),
+                // but say so: a truncated capture that *looked* like a
+                // clean EOF would send whoever reads the resulting
+                // diagnostics down the wrong path.
+                Err(e) => {
+                    eprintln!("[spawn_reader] pipe read failed (treating as EOF): {e}");
+                    break;
+                }
+            }
+        }
+    })
+}
+
 /// Collects one reader thread's buffer, waiting at most `grace` for the
 /// thread to see EOF — never unboundedly, because EOF is only guaranteed
 /// if *every* process holding the pipe's write end has exited, which is
@@ -241,7 +318,7 @@ fn kill_process_tree(child: &mut std::process::Child) {
 /// losing the timeout panic (and the whole job) to an unkillable wait.
 fn collect_reader(
     thread: std::thread::JoinHandle<()>,
-    buf: &Arc<Mutex<Vec<u8>>>,
+    buf: &Arc<Mutex<VecDeque<u8>>>,
     grace: Duration,
 ) -> Vec<u8> {
     let deadline = Instant::now() + grace;
@@ -252,21 +329,45 @@ fn collect_reader(
                  a killed process's descendant is likely still holding the pipe's \
                  write end; proceeding with the output captured so far"
             );
-            return buf.lock().unwrap().clone();
+            return buf.lock().unwrap().iter().copied().collect();
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     thread.join().expect("join reader thread");
-    std::mem::take(&mut *buf.lock().unwrap())
+    Vec::from(std::mem::take(&mut *buf.lock().unwrap()))
+}
+
+/// A launch attempt that hit its deadline and was killed — carries the
+/// fully formatted diagnostics (description, timeout, and both output
+/// tails) so the caller can either panic with them verbatim
+/// ([`spawn_with_timeout`]) or print them and retry
+/// ([`launch_and_assert`]).
+struct TimedOut {
+    message: String,
 }
 
 /// Runs `cmd`, waiting up to `timeout` and killing (then panicking with
 /// `description` in the message) it — *and its entire process tree*, see
-/// `kill_process_tree` — if it hasn't exited by then. stdout/stderr are
-/// drained on background threads while polling for exit, rather than
-/// read only after the child finishes, so a chatty child can't deadlock
-/// on a full pipe buffer before the timeout ever gets a chance to fire.
-fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) -> std::process::Output {
+/// `kill_process_tree` — if it hasn't exited by then. Thin panicking
+/// wrapper over [`try_spawn_with_timeout`], for callers (`warm_model`)
+/// for which a timeout is immediately fatal rather than retryable.
+fn spawn_with_timeout(cmd: Command, timeout: Duration, description: &str) -> std::process::Output {
+    try_spawn_with_timeout(cmd, timeout, description)
+        .unwrap_or_else(|timed_out| panic!("{}", timed_out.message))
+}
+
+/// Runs `cmd`, waiting up to `timeout` and killing it — *and its entire
+/// process tree*, see `kill_process_tree` — if it hasn't exited by then,
+/// returning `Err(TimedOut)` instead of panicking so the caller decides
+/// whether a timeout is fatal or retryable. stdout/stderr are drained on
+/// background threads while polling for exit, rather than read only
+/// after the child finishes, so a chatty child can't deadlock on a full
+/// pipe buffer before the timeout ever gets a chance to fire.
+fn try_spawn_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    description: &str,
+) -> Result<std::process::Output, TimedOut> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -294,34 +395,12 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
     // even if everything after it is lost — useful for whatever the next
     // one of these turns out to be, not just the one this was built for.
     eprintln!("[spawn_with_timeout] pid={} spawned: {description}", child.id());
-    let mut stdout_pipe = child.stdout.take().expect("child stdout");
-    let mut stderr_pipe = child.stderr.take().expect("child stderr");
-    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
-    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
-    let stdout_thread = {
-        let buf = Arc::clone(&stdout_buf);
-        std::thread::spawn(move || {
-            let mut chunk = [0u8; 4096];
-            loop {
-                match stdout_pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
-                }
-            }
-        })
-    };
-    let stderr_thread = {
-        let buf = Arc::clone(&stderr_buf);
-        std::thread::spawn(move || {
-            let mut chunk = [0u8; 4096];
-            loop {
-                match stderr_pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
-                }
-            }
-        })
-    };
+    let stdout_pipe = child.stdout.take().expect("child stdout");
+    let stderr_pipe = child.stderr.take().expect("child stderr");
+    let stdout_buf = Arc::new(Mutex::new(VecDeque::new()));
+    let stderr_buf = Arc::new(Mutex::new(VecDeque::new()));
+    let stdout_thread = spawn_reader(stdout_pipe, Arc::clone(&stdout_buf));
+    let stderr_thread = spawn_reader(stderr_pipe, Arc::clone(&stderr_buf));
 
     let start = Instant::now();
     let mut last_heartbeat = start;
@@ -362,10 +441,12 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
                 String::from_utf8_lossy(&collect_reader(stdout_thread, &stdout_buf, Duration::from_secs(5))).into_owned();
             let stderr =
                 String::from_utf8_lossy(&collect_reader(stderr_thread, &stderr_buf, Duration::from_secs(5))).into_owned();
-            panic!(
-                "{description} did not finish within {timeout:?} — likely a hang\n\
-                 --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
-            );
+            return Err(TimedOut {
+                message: format!(
+                    "{description} did not finish within {timeout:?} — likely a hang\n\
+                     --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+                ),
+            });
         }
         std::thread::sleep(Duration::from_millis(200));
     };
@@ -376,7 +457,7 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
     // grandchild must not be able to wedge a *successful* run either.
     let stdout = collect_reader(stdout_thread, &stdout_buf, Duration::from_secs(30));
     let stderr = collect_reader(stderr_thread, &stderr_buf, Duration::from_secs(30));
-    std::process::Output { status, stdout, stderr }
+    Ok(std::process::Output { status, stdout, stderr })
 }
 
 /// Forces `MODEL` to be pulled and fully loaded — via `llmman run`, our
@@ -434,8 +515,15 @@ fn warm_model() {
 }
 
 /// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
-/// with `home` as its `HOME`. See `warm_model` and `spawn_with_timeout`.
-fn run_launch(home: &Path, integration: &str, extra_args: &[&str]) -> std::process::Output {
+/// with `home` as its `HOME`, returning `Err(TimedOut)` (rather than
+/// panicking) if it had to be killed at `TIMEOUT` — see `warm_model`,
+/// `try_spawn_with_timeout`, and `launch_and_assert` for who retries
+/// that and why.
+fn run_launch(
+    home: &Path,
+    integration: &str,
+    extra_args: &[&str],
+) -> Result<std::process::Output, TimedOut> {
     eprintln!("[run_launch] {integration}: calling warm_model()");
     warm_model();
     eprintln!("[run_launch] {integration}: warm_model() returned, spawning launch");
@@ -450,7 +538,7 @@ fn run_launch(home: &Path, integration: &str, extra_args: &[&str]) -> std::proce
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"));
 
-    spawn_with_timeout(
+    try_spawn_with_timeout(
         cmd,
         TIMEOUT,
         &format!("`llmman launch {integration} --model {MODEL} -- {extra_args:?}`"),
@@ -466,34 +554,58 @@ const MAX_ATTEMPTS: u32 = 3;
 /// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
 /// (via [`run_launch`], against a fresh temp `HOME` each attempt) and
 /// asserts it succeeded and that the model's real answer shows up in
-/// stdout — retrying up to [`MAX_ATTEMPTS`] times, but *only* when the
-/// launch itself exited successfully and merely didn't happen to answer
-/// with "pong" this particular time.
+/// stdout — retrying up to [`MAX_ATTEMPTS`] times, but *only* for the
+/// two failure shapes small-model sampling variance alone can produce:
 ///
-/// That retry exists because real batched inference through llama-server
-/// (`n_slots` continuous batching serving whatever concurrent requests
-/// each of these real, un-mocked third-party CLIs' own startup traffic —
-/// title generation, memory/skill checks, etc. — happens to send
-/// alongside the actual prompt) is not bit-for-bit deterministic run to
-/// run even for identical input text: a small quantized model's sampling
-/// can tip a different way depending on exactly how those concurrent
-/// requests happen to batch together. Directly observed in practice
-/// (not hypothetical): real `qwen3.5:0.8b` runs through a real `claude
-/// --model ... -p ...` occasionally answer with a nonsensical safety
-/// refusal, or attempt a spurious tool call, instead of the one literal
-/// word asked for — see this file's module doc comment's own catalogue of
-/// similar small-model degeneracy already fought here (`warm_model`'s
-/// `--think false --num-predict 64`). A *real* regression (a non-zero
-/// exit status: an actual crash, a rejected request, a 500) is never
-/// retried — only "the process exited 0 but the live model's one-shot
-/// answer this time didn't include the word" is, so this can't mask the
-/// actual API-compat bugs this suite exists to catch (see that same doc
-/// comment).
+///   - the launch exited successfully and merely didn't happen to answer
+///     with "pong" this particular time, or
+///   - the launch had to be killed at `TIMEOUT` because the model's
+///     sampling degenerated into an endless agent loop that never
+///     finished at all. Directly observed in CI (x86_64 linux/podman,
+///     run 31782553115): a real `opencode run` session's agent kept
+///     decoding thousands of tokens across task after task at ~14 t/s on
+///     a CPU-only runner, blowing the whole 600s budget — the same
+///     failure class `warm_model`'s `--num-predict 64` caps for our own
+///     client, which these real third-party CLIs expose no flag for.
+///
+/// Those retries exist because real batched inference through
+/// llama-server (`n_slots` continuous batching serving whatever
+/// concurrent requests each of these real, un-mocked third-party CLIs'
+/// own startup traffic — title generation, memory/skill checks, etc. —
+/// happens to send alongside the actual prompt) is not bit-for-bit
+/// deterministic run to run even for identical input text: a small
+/// quantized model's sampling can tip a different way depending on
+/// exactly how those concurrent requests happen to batch together.
+/// Directly observed in practice (not hypothetical): real `qwen3.5:0.8b`
+/// runs through a real `claude --model ... -p ...` occasionally answer
+/// with a nonsensical safety refusal, or attempt a spurious tool call,
+/// instead of the one literal word asked for — see this file's module
+/// doc comment's own catalogue of similar small-model degeneracy already
+/// fought here (`warm_model`'s `--think false --num-predict 64`). A
+/// *real* regression (a non-zero exit status: an actual crash, a
+/// rejected request, a 500) is never retried — a deterministic bug fails
+/// deterministically and fast, so retrying it would only triple the time
+/// to the same red result while masking nothing — which keeps this from
+/// hiding the actual API-compat bugs this suite exists to catch (see
+/// that same doc comment).
 fn launch_and_assert(integration: &str, extra_args: &[&str]) {
-    let mut last_output = None;
+    let mut last_failure = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let home = fresh_home(integration);
-        let output = run_launch(&home, integration, extra_args);
+        let output = match run_launch(&home, integration, extra_args) {
+            Ok(output) => output,
+            Err(timed_out) => {
+                eprintln!(
+                    "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} timed out \
+                     (small-model sampling variance can degenerate into an endless agent \
+                     loop — see launch_and_assert's own doc comment); {}\n{}",
+                    if attempt < MAX_ATTEMPTS { "retrying with a fresh HOME" } else { "giving up" },
+                    timed_out.message
+                );
+                last_failure = Some(timed_out.message);
+                continue;
+            }
+        };
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -511,15 +623,13 @@ fn launch_and_assert(integration: &str, extra_args: &[&str]) {
              own doc comment); {}",
             if attempt < MAX_ATTEMPTS { "retrying with a fresh HOME" } else { "giving up" }
         );
-        last_output = Some(output);
+        last_failure = Some(format!(
+            "expected {integration}'s reply to contain \"pong\"\n\
+             --- stdout (last attempt) ---\n{stdout}\n--- stderr (last attempt) ---\n{stderr}"
+        ));
     }
-    let output = last_output.expect("loop runs at least once, so this is always set");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    panic!(
-        "expected {integration}'s reply to contain \"pong\" after {MAX_ATTEMPTS} attempts\n\
-         --- stdout (last attempt) ---\n{stdout}\n--- stderr (last attempt) ---\n{stderr}"
-    );
+    let last_failure = last_failure.expect("loop runs at least once, so this is always set");
+    panic!("{integration} failed all {MAX_ATTEMPTS} attempts; last failure:\n{last_failure}");
 }
 
 #[test]
