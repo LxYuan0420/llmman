@@ -425,6 +425,13 @@ struct ProgressLine {
 /// byte-level bar — deliberately similar in shape to `llmman transfer`'s
 /// own mpb bars (go-shim/shared_oci.go's addLayerBar) so both commands'
 /// output looks like the same family of progress bar.
+///
+/// The leading `{msg}` is the *reference* being pulled/pushed, not the
+/// generic status word ("pulling"/"pushing") — that word was already
+/// printed as its own plain line the moment byte-level reporting hadn't
+/// started yet (see stream_progress), so repeating it here as the bar's
+/// own label just showed "pulling" twice in a row, stacked directly on
+/// top of each other, for no added information.
 fn progress_bar_style() -> ProgressStyle {
     ProgressStyle::with_template(
         "{msg:<20} [{bar:32.cyan/blue}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec:>12}",
@@ -438,6 +445,27 @@ fn progress_bar_style() -> ProgressStyle {
 /// arrives: a real byte-level progress bar for any line carrying a nonzero
 /// `total` (see ProgressLine), or a plain status line otherwise — matching
 /// how `llmman transfer`'s own mpb bars render foreground FFI progress.
+///
+/// One case gets special-cased rather than handed to the animated bar:
+/// llmman's local store is content-addressed, so a very common pull is
+/// one where every blob is already on disk under a *different* reference
+/// (see go-shim/backend_podman.go's ProgressEventSkipped handling) —
+/// go.podman.io/image credits that instantly, so the very first
+/// byte-count line this function ever sees already has completed==total.
+/// Handing that straight to indicatif produced a bar that renders
+/// "already 100% full" from its first frame (never visibly animating at
+/// all — indistinguishable, at a glance, from a bar that's stuck) with a
+/// `bytes_per_sec` figure computed as total/elapsed since the bar was
+/// just created a moment ago — a wildly inflated number (multiple GiB/s
+/// or even TiB/s) that then decays back down over the next several
+/// polling ticks purely because the (fixed) numerator is being divided by
+/// a (growing) denominator, not because anything is actually slowing
+/// down. Nothing about that display was wrong, exactly, but it looked
+/// exactly like a hang to a real reader, however briefly. Detecting that
+/// exact shape up front and printing one plain "already have it" line
+/// instead is both more honest (no bytes are moving) and reads instantly
+/// as "done", not "stuck".
+///
 /// Returns an error if the stream reports one, or if it ends without ever
 /// reporting "success".
 pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
@@ -460,6 +488,11 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
     let mut saw_success = false;
     let mut last_status = String::new();
     let mut bar: Option<ProgressBar> = None;
+    // Set once we've printed the "already have it" shortcut line (see this
+    // function's own doc comment), so a pull whose bytes were all
+    // instant-credited doesn't print that line again on every further
+    // completed==total poll before "success" finally arrives.
+    let mut printed_instant_complete = false;
     for line in std::io::BufReader::new(resp).lines() {
         let line = line.context("read response stream")?;
         let line = line.trim();
@@ -485,18 +518,49 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
         }
 
         if let Some(total) = msg.total.filter(|&t| t > 0) {
+            let completed = msg.completed.unwrap_or(0).min(total);
+
+            // Instant-credit shortcut (see this function's own doc
+            // comment): the *first* poll this function ever sees a
+            // nonzero total on is already ≥99% complete, so whatever
+            // sliver (if any) is still outstanding isn't a real,
+            // animatable transfer — it's noise from total/completed being
+            // credited by two separate calls a poll interval apart on the
+            // Go side (go-shim/progress_state.go's progressAddTotal/
+            // progressAddCompleted), not a meaningful amount of remaining
+            // work. A genuine transfer's first-ever byte line is nowhere
+            // near this close to done (that's what makes the animated
+            // bar below worth showing at all). Checked only while
+            // bar.is_none(): once a real bar has been created because an
+            // earlier poll didn't clear this bar, later polls update it
+            // normally even if they happen to also reach ≥99%.
+            //
+            // 99%, not 100% exactly: an earlier version of this required
+            // completed==total on the nose and missed a real case where
+            // two multi-hundred-MB blobs were skip-credited instantly but
+            // a trailing few-hundred-byte config blob's own (separate,
+            // genuinely tiny) transfer hadn't landed yet on that same
+            // poll — 99.99996% done, not 100.000% done, but just as
+            // clearly "nothing left worth animating" either way.
+            if bar.is_none() && completed * 100 >= total * 99 {
+                if !printed_instant_complete {
+                    println!("Already have {reference} ({})", crate::fmt::human_size(total));
+                    printed_instant_complete = true;
+                }
+                last_status = "pulling".to_string(); // suppress a redundant plain "pulling" line below
+                continue;
+            }
+
             // A byte-level progress line: render/update the bar instead of
             // printing a new line for every update.
             let pb = bar.get_or_insert_with(|| {
                 let pb = ProgressBar::new(total);
                 pb.set_style(progress_bar_style());
+                pb.set_message(reference.to_string());
                 pb
             });
             pb.set_length(total);
-            pb.set_position(msg.completed.unwrap_or(0).min(total));
-            if let Some(status) = &msg.status {
-                pb.set_message(status.clone());
-            }
+            pb.set_position(completed);
             continue;
         }
         // No byte counts on this line: finish/clear any bar in progress
