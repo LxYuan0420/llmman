@@ -181,16 +181,102 @@ fn tail_str(buf: &[u8], n: usize) -> String {
     }
 }
 
+/// Kills `child` *and every descendant it spawned*, not just the direct
+/// child process itself. `Child::kill` alone is not enough for any
+/// command in this file: `llmman launch <integration>` execs a real
+/// third-party CLI (which itself spawns more — codex runs a `node`
+/// child), and `llmman run` auto-starts a daemon. Killing only the
+/// direct child leaves those descendants running — and, worse, still
+/// holding inherited handles to the stdout/stderr pipes this harness
+/// reads, so the pipes never reach EOF (see `collect_reader`).
+///
+/// Directly observed in CI (x86_64 linux/docker, run 31772215140): a
+/// `codex exec` whose small model degenerated into an endless agent loop
+/// survived `child.kill()` of its `llmman launch` parent at the 600s
+/// timeout, kept the pipe open, and the old unconditional
+/// `stdout_thread.join()` then blocked forever — so the timeout panic
+/// (and all its diagnostics) never fired and the whole job ran into the
+/// workflow's 45-minute kill instead. Same failure class as the Windows
+/// handle-inheritance hang documented at length in `src/daemon.rs`
+/// (`disable_std_handle_inheritance`), new vector.
+///
+/// Unix: the child is spawned into its own process group (see
+/// `spawn_with_timeout`), so one `kill(-pgid, SIGKILL)` takes out the
+/// entire tree atomically — every descendant is in that group unless it
+/// deliberately escaped (llmman's own daemon does, by design; it doesn't
+/// inherit these pipes on any platform, so it can't wedge the readers).
+/// Windows: `taskkill /T /F` walks and kills the tree by parent PID.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // The child was put in its own process group via
+        // `process_group(0)`, so its pgid == its pid.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Collects one reader thread's buffer, waiting at most `grace` for the
+/// thread to see EOF — never unboundedly, because EOF is only guaranteed
+/// if *every* process holding the pipe's write end has exited, which is
+/// exactly the invariant that has now failed twice in this suite's
+/// history (the Windows daemon handle-inheritance leak in
+/// `src/daemon.rs`, and the surviving-`codex`-descendant hang this
+/// bounded wait was added for — see `kill_process_tree`). If the thread
+/// hasn't finished within `grace`, it's left detached (it parks in a
+/// blocking `read()` costing nothing) and whatever output made it into
+/// the shared buffer so far is returned — losing at most the final
+/// unflushed chunk from a process that's being killed anyway, instead of
+/// losing the timeout panic (and the whole job) to an unkillable wait.
+fn collect_reader(
+    thread: std::thread::JoinHandle<()>,
+    buf: &Arc<Mutex<Vec<u8>>>,
+    grace: Duration,
+) -> Vec<u8> {
+    let deadline = Instant::now() + grace;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "[collect_reader] reader thread still blocked after {grace:?} — \
+                 a killed process's descendant is likely still holding the pipe's \
+                 write end; proceeding with the output captured so far"
+            );
+            return buf.lock().unwrap().clone();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    thread.join().expect("join reader thread");
+    std::mem::take(&mut *buf.lock().unwrap())
+}
+
 /// Runs `cmd`, waiting up to `timeout` and killing (then panicking with
-/// `description` in the message) it if it hasn't exited by then.
-/// stdout/stderr are drained on background threads while polling for
-/// exit, rather than read only after the child finishes, so a chatty
-/// child can't deadlock on a full pipe buffer before the timeout ever
-/// gets a chance to fire.
+/// `description` in the message) it — *and its entire process tree*, see
+/// `kill_process_tree` — if it hasn't exited by then. stdout/stderr are
+/// drained on background threads while polling for exit, rather than
+/// read only after the child finishes, so a chatty child can't deadlock
+/// on a full pipe buffer before the timeout ever gets a chance to fire.
 fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) -> std::process::Output {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Own process group (Unix): makes the whole descendant tree killable
+    // as one unit at the timeout — see kill_process_tree.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {description}: {e}"));
     // Kept permanently (not removed once the investigation that added it
@@ -259,20 +345,23 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
             );
         }
         if start.elapsed() > timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            // Join the reader threads (rather than just discarding them)
-            // before panicking: killing the child closes its end of both
-            // pipes, so each thread's blocking read should return promptly
-            // — and whatever the process printed before it got stuck is
+            // Kill the *whole tree*, then collect (bounded — see
+            // collect_reader) whatever both readers captured before
+            // panicking: what the process printed before it got stuck is
             // exactly what's needed to tell "genuinely still downloading/
             // loading a large model" apart from "stuck in a real hang"
             // from the outside, instead of a bare timeout message that
-            // can't distinguish either.
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
-            let stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap()).into_owned();
-            let stderr = String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned();
+            // can't distinguish either. Neither step here may block
+            // unboundedly: this panic *is* the test's failure report, and
+            // anything that can postpone it indefinitely turns a 10-minute
+            // failure into a diagnostics-free 45-minute job cancellation
+            // (which is precisely what the old unconditional join did —
+            // see kill_process_tree).
+            kill_process_tree(&mut child);
+            let stdout =
+                String::from_utf8_lossy(&collect_reader(stdout_thread, &stdout_buf, Duration::from_secs(5))).into_owned();
+            let stderr =
+                String::from_utf8_lossy(&collect_reader(stderr_thread, &stderr_buf, Duration::from_secs(5))).into_owned();
             panic!(
                 "{description} did not finish within {timeout:?} — likely a hang\n\
                  --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
@@ -281,13 +370,13 @@ fn spawn_with_timeout(mut cmd: Command, timeout: Duration, description: &str) ->
         std::thread::sleep(Duration::from_millis(200));
     };
 
-    stdout_thread.join().expect("join stdout reader thread");
-    stderr_thread.join().expect("join stderr reader thread");
-    std::process::Output {
-        status,
-        stdout: Arc::try_unwrap(stdout_buf).expect("stdout_buf uniquely owned after join").into_inner().unwrap(),
-        stderr: Arc::try_unwrap(stderr_buf).expect("stderr_buf uniquely owned after join").into_inner().unwrap(),
-    }
+    // Bounded here too (generously — the child has already *exited*, so
+    // EOF is normally immediate): a well-behaved run must not lose output
+    // to a tight grace period, but a leaked write end from some surviving
+    // grandchild must not be able to wedge a *successful* run either.
+    let stdout = collect_reader(stdout_thread, &stdout_buf, Duration::from_secs(30));
+    let stderr = collect_reader(stderr_thread, &stderr_buf, Duration::from_secs(30));
+    std::process::Output { status, stdout, stderr }
 }
 
 /// Forces `MODEL` to be pulled and fully loaded — via `llmman run`, our
