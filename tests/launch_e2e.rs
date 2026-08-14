@@ -227,6 +227,57 @@ fn kill_process_tree(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// Upper bound on how many bytes of one stream's output a reader thread
+/// retains — generous (a passing run of anything in this file produces
+/// kilobytes, even with opencode's `--log-level DEBUG` on), but *finite*,
+/// because a reader thread's lifetime isn't reliably bounded: when
+/// `collect_reader` gives up on a thread still blocked in `read()`, that
+/// thread is detached, not terminated (safe Rust has no way to kill it),
+/// and it keeps appending for as long as some descendant that escaped
+/// `kill_process_tree` keeps the pipe's write end open and keeps
+/// writing. That was always true, but it used to not matter: a timeout
+/// panicked, the test process died, and any detached reader died with
+/// it. Now that `launch_and_assert` *retries* a timed-out attempt, a
+/// detached reader from a previous attempt can outlive it (each attempt
+/// gets fresh pipes/buffers/threads, so its output can never leak into a
+/// later attempt's assertions — only this cap's worth of memory), so an
+/// endlessly-writing zombie must be able to cost at most this much, not
+/// grow without bound for the rest of the test binary's life.
+const READER_BUF_CAP: usize = 4 * 1024 * 1024;
+
+/// Appends `chunk` to `buf`, discarding the *oldest* bytes to stay under
+/// [`READER_BUF_CAP`] — the newest output is what every consumer here
+/// wants: the heartbeat and the timeout diagnostics print tails, and the
+/// "pong" assertion looks for the model's final answer.
+fn append_capped(buf: &Mutex<Vec<u8>>, chunk: &[u8]) {
+    let mut buf = buf.lock().unwrap();
+    buf.extend_from_slice(chunk);
+    if buf.len() > READER_BUF_CAP {
+        let excess = buf.len() - READER_BUF_CAP;
+        buf.drain(..excess);
+    }
+}
+
+/// Spawns the background thread that drains one of the child's output
+/// pipes into a shared (capped — see [`append_capped`]) buffer until EOF
+/// or a read error. See the comment above the call sites in
+/// `try_spawn_with_timeout` for why draining must happen live on a
+/// thread rather than after the child exits.
+fn spawn_reader(
+    mut pipe: impl Read + Send + 'static,
+    buf: Arc<Mutex<Vec<u8>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => append_capped(&buf, &chunk[..n]),
+            }
+        }
+    })
+}
+
 /// Collects one reader thread's buffer, waiting at most `grace` for the
 /// thread to see EOF — never unboundedly, because EOF is only guaranteed
 /// if *every* process holding the pipe's write end has exited, which is
@@ -318,34 +369,12 @@ fn try_spawn_with_timeout(
     // even if everything after it is lost — useful for whatever the next
     // one of these turns out to be, not just the one this was built for.
     eprintln!("[spawn_with_timeout] pid={} spawned: {description}", child.id());
-    let mut stdout_pipe = child.stdout.take().expect("child stdout");
-    let mut stderr_pipe = child.stderr.take().expect("child stderr");
+    let stdout_pipe = child.stdout.take().expect("child stdout");
+    let stderr_pipe = child.stderr.take().expect("child stderr");
     let stdout_buf = Arc::new(Mutex::new(Vec::new()));
     let stderr_buf = Arc::new(Mutex::new(Vec::new()));
-    let stdout_thread = {
-        let buf = Arc::clone(&stdout_buf);
-        std::thread::spawn(move || {
-            let mut chunk = [0u8; 4096];
-            loop {
-                match stdout_pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
-                }
-            }
-        })
-    };
-    let stderr_thread = {
-        let buf = Arc::clone(&stderr_buf);
-        std::thread::spawn(move || {
-            let mut chunk = [0u8; 4096];
-            loop {
-                match stderr_pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
-                }
-            }
-        })
-    };
+    let stdout_thread = spawn_reader(stdout_pipe, Arc::clone(&stdout_buf));
+    let stderr_thread = spawn_reader(stderr_pipe, Arc::clone(&stderr_buf));
 
     let start = Instant::now();
     let mut last_heartbeat = start;
