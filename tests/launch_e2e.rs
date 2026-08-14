@@ -284,8 +284,21 @@ fn spawn_reader(
         let mut chunk = [0u8; 4096];
         loop {
             match pipe.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => append_capped(&buf, &chunk[..n]),
+                // A signal landing mid-read isn't EOF — retry, per the
+                // standard EINTR contract.
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // Any other error still ends draining (there's nothing
+                // useful to do with a broken pipe from here, and the
+                // output captured so far is worth returning either way),
+                // but say so: a truncated capture that *looked* like a
+                // clean EOF would send whoever reads the resulting
+                // diagnostics down the wrong path.
+                Err(e) => {
+                    eprintln!("[spawn_reader] pipe read failed (treating as EOF): {e}");
+                    break;
+                }
             }
         }
     })
