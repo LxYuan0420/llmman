@@ -657,4 +657,15 @@ mod tests {
         // check above rather than reusing this for both directions.
         assert_eq!(tag_from_ref("0.8b"), "latest");
     }
+
+    /// Ported from ollama's types/model/name_test.go
+    /// ("host:port/namespace/model:tag" and the tagless default): a colon
+    /// inside the host component must never be mistaken for a tag
+    /// separator, and a reference without a tag defaults to "latest".
+    #[test]
+    fn tag_from_ref_ignores_a_port_in_the_host_component() {
+        assert_eq!(tag_from_ref("example.com:5000/ns/model"), "latest");
+        assert_eq!(tag_from_ref("example.com:5000/ns/model:tag"), "tag");
+        assert_eq!(tag_from_ref("localhost:11434/library/mistral:7b"), "7b");
+    }
 }
