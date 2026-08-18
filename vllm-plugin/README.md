@@ -7,13 +7,7 @@ instead of only a HuggingFace Hub repo id.
 
 ```
 pip install vllm-llmman
-vllm serve modelpack://ghcr.io/org/model:tag
-```
-
-or, equivalently:
-
-```
-vllm serve oci://docker.io/owner/model:latest
+vllm serve oci://ghcr.io/org/model:tag
 ```
 
 ## Requirements
@@ -37,8 +31,8 @@ directory and rewriting `self.model`/`self.tokenizer` to point at it).
 This plugin registers itself via vLLM's `vllm.general_plugins` entry
 point (loaded once per process, before any `ModelConfig` is built — see
 `docs/design/plugin_system.md` in the vLLM repo) and wraps that same
-hook: when `model=`/`tokenizer=` starts with `modelpack://` or `oci://`,
-it shells out to `llmman resolve <reference>` (see llmman's
+hook: when `model=`/`tokenizer=` starts with `oci://`, it shells out to
+`llmman resolve <reference>` (see llmman's
 `src/cmd/resolve.rs`), which pulls the image into llmman's local OCI
 store if it isn't already there, extracts it, and returns the local
 path as JSON. That path is what vLLM's default HuggingFace-format
@@ -53,8 +47,8 @@ point plus a narrowly scoped runtime monkeypatch (see
 a monkeypatch was necessary here, unlike e.g. a custom `--load-format`,
 which vLLM *does* let plugins register without any monkeypatching).
 
-An explicit scheme (`modelpack://`/`oci://`) is required rather than
-guessing from a bare `registry/name:tag` string, since that shape is
+An explicit `oci://` scheme is required rather than guessing from a
+bare `registry/name:tag` string, since that shape is
 indistinguishable from a HuggingFace repo id (`org/model`) — guessing
 would risk hijacking existing HF-backed `vllm serve org/model` calls the
 moment this plugin is installed.

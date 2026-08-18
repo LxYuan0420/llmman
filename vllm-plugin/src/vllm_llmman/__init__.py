@@ -1,13 +1,12 @@
-"""vllm-llmman — a vLLM plugin that lets `--model modelpack://...` /
-`--model oci://...` pull a CNCF ModelPack (https://github.com/modelpack/
-model-spec) OCI image via `llmman` instead of vLLM's usual HuggingFace
-Hub download.
+"""vllm-llmman — a vLLM plugin that lets `--model oci://...` pull a CNCF
+ModelPack (https://github.com/modelpack/model-spec) OCI image via
+`llmman` instead of vLLM's usual HuggingFace Hub download.
 
 Usage::
 
     pip install vllm-llmman
     # llmman itself must also be on PATH — see llmman's own install.sh
-    vllm serve modelpack://ghcr.io/org/model:tag
+    vllm serve oci://ghcr.io/org/model:tag
 
 No vLLM core files are modified: this package only uses vLLM's existing
 `vllm.general_plugins` entry-point mechanism (see

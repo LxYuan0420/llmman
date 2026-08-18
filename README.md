@@ -108,7 +108,7 @@ models. `llmman resolve` is the inverse: it pulls and extracts a model
 without starting any server, printing the resulting local path so another
 tool can load it instead. This is what the
 [`vllm-llmman`](https://pypi.org/project/vllm-llmman/) vLLM plugin uses so
-`vllm serve modelpack://<reference>` can pull a CNCF ModelPack image
+`vllm serve oci://<reference>` can pull a CNCF ModelPack image
 directly, instead of a HuggingFace repo:
 
 ```

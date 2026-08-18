@@ -14,14 +14,14 @@ def test_delegates_to_original_when_model_weights_already_set():
     original = lambda self, model, tokenizer: calls.append((model, tokenizer))
     patched = _patch._make_patched(original)
 
-    cfg = _stub("modelpack://ghcr.io/org/model:tag", "modelpack://ghcr.io/org/model:tag", model_weights="already-pulled")
+    cfg = _stub("oci://ghcr.io/org/model:tag", "oci://ghcr.io/org/model:tag", model_weights="already-pulled")
     patched(cfg, cfg.model, cfg.tokenizer)
 
     assert calls == [(cfg.model, cfg.tokenizer)]
-    assert cfg.model == "modelpack://ghcr.io/org/model:tag"  # untouched
+    assert cfg.model == "oci://ghcr.io/org/model:tag"  # untouched
 
 
-def test_delegates_to_original_for_non_modelpack_refs():
+def test_delegates_to_original_for_non_oci_refs():
     calls = []
     original = lambda self, model, tokenizer: calls.append((model, tokenizer))
     patched = _patch._make_patched(original)
@@ -42,7 +42,7 @@ def test_resolves_model_and_shared_tokenizer(monkeypatch):
     monkeypatch.setattr(_patch, "resolve", fake_resolve)
     patched = _patch._make_patched(original=lambda *a: pytest.fail("must not delegate"))
 
-    ref = "modelpack://ghcr.io/org/model:tag"
+    ref = "oci://ghcr.io/org/model:tag"
     cfg = _stub(ref, ref)
     patched(cfg, cfg.model, cfg.tokenizer)
 
@@ -62,7 +62,7 @@ def test_resolves_model_and_distinct_tokenizer_separately(monkeypatch):
     monkeypatch.setattr(_patch, "resolve", fake_resolve)
     patched = _patch._make_patched(original=lambda *a: pytest.fail("must not delegate"))
 
-    model_ref = "modelpack://ghcr.io/org/model:tag"
+    model_ref = "oci://ghcr.io/org/model:tag"
     tok_ref = "oci://ghcr.io/org/tokenizer:tag"
     cfg = _stub(model_ref, tok_ref)
     patched(cfg, cfg.model, cfg.tokenizer)
@@ -73,16 +73,16 @@ def test_resolves_model_and_distinct_tokenizer_separately(monkeypatch):
     assert cfg.model_weights == model_ref
 
 
-def test_resolves_tokenizer_only_when_model_is_not_modelpack(monkeypatch):
+def test_resolves_tokenizer_only_when_model_is_not_oci(monkeypatch):
     def fake_resolve(ref, **kwargs):
         return {"reference": ref, "path": "/cache/tok", "format": "safetensors"}
 
     monkeypatch.setattr(_patch, "resolve", fake_resolve)
     patched = _patch._make_patched(original=lambda *a: pytest.fail("must not delegate"))
 
-    cfg = _stub("meta-llama/Llama-3-8B", "modelpack://ghcr.io/org/tok:tag")
+    cfg = _stub("meta-llama/Llama-3-8B", "oci://ghcr.io/org/tok:tag")
     patched(cfg, cfg.model, cfg.tokenizer)
 
-    assert cfg.model == "meta-llama/Llama-3-8B"  # untouched, not a modelpack ref
+    assert cfg.model == "meta-llama/Llama-3-8B"  # untouched, not an oci:// ref
     assert cfg.tokenizer == "/cache/tok"
     assert cfg.model_weights is None

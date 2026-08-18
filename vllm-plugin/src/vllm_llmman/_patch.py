@@ -1,6 +1,6 @@
-"""Hooks `model=modelpack://...` / `oci://...` into vLLM's model
-resolution *before* vLLM's own HuggingFace-oriented config/tokenizer
-loading ever runs — without editing any vLLM core file.
+"""Hooks `model=oci://...` into vLLM's model resolution *before* vLLM's
+own HuggingFace-oriented config/tokenizer loading ever runs — without
+editing any vLLM core file.
 
 vLLM already has exactly one hook that does "rewrite `self.model`/`self.
 tokenizer` from a remote reference to a local directory, early in
@@ -25,7 +25,7 @@ import logging
 from typing import Any, Callable, Protocol
 
 from ._llmman_cli import resolve
-from ._scheme import is_modelpack_ref, strip_scheme
+from ._scheme import is_oci_ref, strip_scheme
 
 logger = logging.getLogger("vllm_llmman")
 
@@ -53,12 +53,12 @@ def _make_patched(original: OriginalHook) -> OriginalHook:
         if self.model_weights:
             return original(self, model, tokenizer)
 
-        model_is_modelpack = is_modelpack_ref(model)
-        tokenizer_is_modelpack = is_modelpack_ref(tokenizer)
-        if not (model_is_modelpack or tokenizer_is_modelpack):
+        model_is_oci = is_oci_ref(model)
+        tokenizer_is_oci = is_oci_ref(tokenizer)
+        if not (model_is_oci or tokenizer_is_oci):
             return original(self, model, tokenizer)
 
-        if model_is_modelpack:
+        if model_is_oci:
             ref = strip_scheme(model)
             logger.info("llmman: resolving model %s", ref)
             result = resolve(ref)
@@ -69,7 +69,7 @@ def _make_patched(original: OriginalHook) -> OriginalHook:
                 self.tokenizer = result["path"]
                 return
 
-        if tokenizer_is_modelpack and tokenizer != model:
+        if tokenizer_is_oci and tokenizer != model:
             ref = strip_scheme(tokenizer)
             logger.info("llmman: resolving tokenizer %s", ref)
             result = resolve(ref)

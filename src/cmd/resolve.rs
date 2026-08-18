@@ -6,7 +6,7 @@
 //! backend of its own — it exists for external tools that want to load
 //! the model themselves. The motivating consumer is a vLLM plugin
 //! (see `vllm-llmman` in the llmman project) that shells out to this
-//! subcommand so `vllm serve modelpack://<ref>` can pull a CNCF ModelPack
+//! subcommand so `vllm serve oci://<ref>` can pull a CNCF ModelPack
 //! image instead of a HuggingFace repo, then hand the extracted directory
 //! (or `.gguf` file) to vLLM exactly as if it had been a local path all
 //! along.
