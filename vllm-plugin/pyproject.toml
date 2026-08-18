@@ -1,0 +1,29 @@
+[project]
+name = "vllm-llmman"
+version = "0.1.0"
+description = "vLLM plugin that pulls CNCF ModelPack OCI images via llmman instead of only HuggingFace"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "llmman contributors" }]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/llmmanorg/llmman"
+
+# Discovered by `vllm.plugins.load_general_plugins()` — see
+# `vllm/plugins/__init__.py` and `docs/design/plugin_system.md` in the vLLM
+# repo. Loaded once per process, in every vLLM process (API server, engine
+# core, and each worker), before any `ModelConfig` is constructed.
+[project.entry-points."vllm.general_plugins"]
+llmman = "vllm_llmman:register"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

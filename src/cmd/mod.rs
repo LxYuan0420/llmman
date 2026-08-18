@@ -8,6 +8,7 @@ pub mod logout;
 pub mod ps;
 pub mod pull;
 pub mod push;
+pub mod resolve;
 pub mod rm;
 pub mod serve;
 pub mod tag;

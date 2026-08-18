@@ -20,6 +20,15 @@ go-shim/go-shim
 # Contains mutation testing data
 **/mutants.out*/
 
+# vllm-plugin/ (Python) build/test artifacts
+vllm-plugin/.venv
+vllm-plugin/.pytest_cache
+vllm-plugin/.ruff_cache
+vllm-plugin/**/__pycache__
+vllm-plugin/**/*.egg-info
+vllm-plugin/dist
+vllm-plugin/build
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

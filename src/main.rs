@@ -8,6 +8,7 @@ mod fmt;
 mod hf;
 mod hostgpu;
 mod llama_release;
+mod modelpack;
 mod oauth;
 mod shortnames;
 mod storage;
@@ -49,6 +50,10 @@ enum Commands {
     Push(cmd::push::PushArgs),
     /// Pull an image from a registry to the local store
     Pull(cmd::pull::PullArgs),
+    /// Pull (if needed) and extract a model to a local path, printing its
+    /// location as JSON — for external tools (e.g. a vLLM plugin) that want
+    /// to load the model themselves rather than through `llmman serve`.
+    Resolve(cmd::resolve::ResolveArgs),
     /// Transfer an image directly from one location to another (e.g. HuggingFace to an OCI registry)
     Transfer(cmd::transfer::TransferArgs),
     /// List locally stored images
@@ -108,6 +113,7 @@ fn main() {
         Commands::Logout(a)   => cmd::logout::run(a),
         Commands::Push(a)     => cmd::push::run(a),
         Commands::Pull(a)     => cmd::pull::run(a),
+        Commands::Resolve(a)  => cmd::resolve::run(a),
         Commands::Transfer(a) => cmd::transfer::run(a),
         Commands::List(a)     => cmd::list::run(a),
         Commands::Ps(a)       => cmd::ps::run(a),
