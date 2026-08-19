@@ -949,6 +949,18 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         let model_ref = canonical_ref(&state.0.store_path, model_ref);
         let model_ref = model_ref.as_str();
 
+        // Double-check again, under the (possibly different, now-resolved)
+        // post-pull name: another task may have raced us here under a
+        // different pre-pull alias for what turns out to be the same
+        // model (e.g. a bare shortname vs. its fully-qualified form, both
+        // resolving to one canonical ref only once it's actually in the
+        // store) and already started serving it while we were pulling.
+        // Without this, that would spawn a second, redundant backend for
+        // the same model instead of reusing the one already loading/loaded.
+        if let Some(port) = check_running(state, model_ref).await {
+            return Ok(port);
+        }
+
         let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
             .with_context(|| format!("resolve model {model_ref}"))?;
         // Best-effort — used only to populate `llmman ps`'s ID/SIZE columns;
@@ -1825,7 +1837,19 @@ async fn handle_ollama_generate(
     if is_unload {
         let resolved = crate::shortnames::resolve_ollama_api(&req.model);
         let canonical = canonical_ref(&state.0.store_path, &resolved);
+        // Wait for any in-flight load of this exact model to finish
+        // publishing itself before removing it — otherwise an unload
+        // landing in the (now unlocked, see `load_lock`) gap between a
+        // concurrent ensure_model's own checks and its final insert would
+        // find nothing to remove, report success, and then have the model
+        // come up running anyway right after. Never blocks on a different
+        // model's own load/unload.
+        let lock = load_lock(&canonical);
+        let _guard = lock.lock().await;
         state.0.manager.lock().await.running.remove(&canonical);
+        drop(_guard);
+        drop(lock);
+        release_load_lock(&canonical);
         return Ok(Json(OllamaGenerateChunk {
             model: req.model,
             created_at: now_rfc3339(),
@@ -2827,5 +2851,27 @@ mod tests {
 
         release_load_lock("test-load-lock-slow-model");
         release_load_lock("test-load-lock-other-model");
+    }
+
+    /// Regression test for a bug caught in review: a call site that drops
+    /// its `MutexGuard` but forgets to also drop its own `Arc` clone before
+    /// calling `release_load_lock` leaves that clone's reference alive, so
+    /// `release_load_lock`'s strong-count check never sees the registry as
+    /// the sole owner — the entry then never gets cleaned up and
+    /// `LOAD_LOCKS` grows one permanent, unused entry per model ref ever
+    /// locked this way. Exercises the exact guard-then-arc drop order the
+    /// real call sites (`ensure_model`, the Ollama unload handler) use.
+    #[tokio::test]
+    async fn load_lock_release_actually_removes_the_entry_once_unused() {
+        let key = "test-load-lock-release-cleanup";
+        let lock = load_lock(key);
+        let guard = lock.lock().await;
+        drop(guard);
+        drop(lock);
+        release_load_lock(key);
+        assert!(
+            !LOAD_LOCKS.lock().unwrap().contains_key(key),
+            "release_load_lock must drop the registry entry once nothing else references it"
+        );
     }
 }
