@@ -770,19 +770,12 @@ async fn wait_for_ready(
 static MODEL_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-/// Same shape as `MODEL_LOCKS`, but a separate registry serializing
-/// `ensure_model`'s own load phase (spawn + wait-until-ready) per model —
-/// see `load_lock`'s doc comment. Kept as a distinct map (not reusing
-/// `MODEL_LOCKS`) because `ensure_model` holds a load lock across a call
-/// that itself takes a *model* lock internally (via `pull_serialized`);
-/// sharing one map would mean re-entering the same non-reentrant tokio
-/// mutex from within the task already holding it, which deadlocks.
+/// Separate from `MODEL_LOCKS`: `ensure_model` holds a load lock across a
+/// call that itself takes a `MODEL_LOCKS` lock (`pull_serialized`), so
+/// sharing one map would re-enter the same non-reentrant mutex and deadlock.
 static LOAD_LOCKS: LazyLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-/// Returns (creating if absent) the lock for `key` in `registry`. Cheap and
-/// non-blocking: it only ever holds `registry`'s own short-lived std mutex
-/// to look up or insert the entry, never the per-key tokio mutex itself.
 fn keyed_lock(
     registry: &StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     key: &str,
@@ -794,17 +787,8 @@ fn keyed_lock(
         .clone()
 }
 
-/// Drops `key`'s entry from `registry` once nobody else appears to be
-/// waiting on it, so a long-running daemon doesn't accumulate one entry per
-/// distinct key it has ever locked. Called after releasing our own clone of
-/// the lock: at that point a strong count of 1 means only `registry` itself
-/// still references it (safe to remove), while a higher count means another
-/// caller is already holding or waiting on this same Arc and should keep
-/// using it — removing the map entry in that case wouldn't break anything
-/// (that caller's clone stays valid independent of the map), it would just
-/// mean the *next* new caller for this key gets handed a fresh, unrelated
-/// lock instead of piggybacking on the map's copy of this one, so it's
-/// simplest to just leave it.
+/// Removes `key` once nothing but `registry` itself still holds a clone —
+/// call after dropping your own clone.
 fn release_keyed_lock(registry: &StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>, key: &str) {
     let mut locks = registry.lock().unwrap();
     if let Some(arc) = locks.get(key) {
@@ -825,13 +809,8 @@ fn release_model_lock(model: &str) {
     release_keyed_lock(&MODEL_LOCKS, model)
 }
 
-/// Returns (creating if absent) the lock serializing `ensure_model`'s load
-/// phase for `model`: pull-if-missing, spawn, and wait-until-ready. Held
-/// only around that phase, never around the (separately, briefly locked)
-/// `state.0.manager` map — so a model that's slow to cold-start never
-/// blocks a fast-path lookup or another model's own load. Two concurrent
-/// requests for the *same* not-yet-loaded model still serialize here rather
-/// than each spawning a redundant backend process.
+/// Serializes `ensure_model`'s load phase (pull-if-missing, spawn,
+/// wait-until-ready) per model, instead of `state.0.manager`.
 fn load_lock(model: &str) -> Arc<tokio::sync::Mutex<()>> {
     keyed_lock(&LOAD_LOCKS, model)
 }
@@ -881,12 +860,7 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
         .unwrap_or_else(|| model_ref.to_owned())
 }
 
-/// Fast-path lookup: is `model_ref` already running and alive? Used both by
-/// `ensure_model`'s own entry, and — after taking `load_lock` — to check
-/// whether another task already finished loading it while this one waited
-/// on that lock. See `ModelProcess::is_alive`'s own doc comment on why this
-/// checks the actual process, not just presence in the map. Only ever holds
-/// `state.0.manager` briefly, never across any I/O.
+/// Is `model_ref` already running and alive? See `ModelProcess::is_alive`.
 async fn check_running(state: &AppState, model_ref: &str) -> Option<u16> {
     let mut mgr = state.0.manager.lock().await;
     if let Some(m) = mgr.running.get_mut(model_ref) {
@@ -911,14 +885,6 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         return Ok(port);
     }
 
-    // Serialize the rest of this function (pull-if-missing, spawn,
-    // wait-until-ready) per model, via `load_lock` rather than
-    // `state.0.manager` — which is only ever taken briefly, in
-    // `check_running` above and to publish the result below. That's what
-    // lets an unrelated model's fast-path lookup, or its own load, proceed
-    // without ever waiting on this model's cold start; two concurrent
-    // requests for *this* not-yet-loaded model still serialize below rather
-    // than each spawning a redundant backend process.
     let lock = load_lock(model_ref);
     let result: Result<u16, AppError> = async {
         let _guard = lock.lock().await;
@@ -930,8 +896,6 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         }
 
         // If the model is not in the local store, pull it now.
-        // Runs outside the manager mutex so multi-GB downloads don't block
-        // other requests' lookups.
         if crate::storage::OciStore::open(&state.0.store_path)
             .and_then(|s| s.find(model_ref))
             .is_err()
@@ -949,14 +913,8 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         let model_ref = canonical_ref(&state.0.store_path, model_ref);
         let model_ref = model_ref.as_str();
 
-        // Double-check again, under the (possibly different, now-resolved)
-        // post-pull name: another task may have raced us here under a
-        // different pre-pull alias for what turns out to be the same
-        // model (e.g. a bare shortname vs. its fully-qualified form, both
-        // resolving to one canonical ref only once it's actually in the
-        // store) and already started serving it while we were pulling.
-        // Without this, that would spawn a second, redundant backend for
-        // the same model instead of reusing the one already loading/loaded.
+        // Re-check under the post-pull name too: a different pre-pull alias
+        // of this same model may have raced us and started it already.
         if let Some(port) = check_running(state, model_ref).await {
             return Ok(port);
         }
@@ -1007,10 +965,6 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         wait_for_ready(&state.0.client, port, &mut process, stderr_tail.as_ref()).await?;
         eprintln!("[llmman] {model_ref} ready on port {port}");
 
-        // Only now, with the backend confirmed ready, briefly take the
-        // manager mutex to publish it — never held across the spawn/ready
-        // wait above, which is exactly what used to let a slow cold start
-        // freeze every other model's fast-path lookup.
         state.0.manager.lock().await.running.insert(
             model_ref.to_string(),
             RunningModel {
@@ -1837,13 +1791,8 @@ async fn handle_ollama_generate(
     if is_unload {
         let resolved = crate::shortnames::resolve_ollama_api(&req.model);
         let canonical = canonical_ref(&state.0.store_path, &resolved);
-        // Wait for any in-flight load of this exact model to finish
-        // publishing itself before removing it — otherwise an unload
-        // landing in the (now unlocked, see `load_lock`) gap between a
-        // concurrent ensure_model's own checks and its final insert would
-        // find nothing to remove, report success, and then have the model
-        // come up running anyway right after. Never blocks on a different
-        // model's own load/unload.
+        // Wait for an in-flight load of this model to publish itself first,
+        // so it can't race ahead of this remove.
         let lock = load_lock(&canonical);
         let _guard = lock.lock().await;
         state.0.manager.lock().await.running.remove(&canonical);
@@ -2784,13 +2733,6 @@ mod tests {
         assert_eq!(opt_u32(&None, "num_predict"), None);
     }
 
-    /// `keyed_lock` must hand back the *same* `Arc` for repeat calls with
-    /// the same key (so holding one clone's guard blocks another caller for
-    /// that key), a *different* `Arc` for a different key, and
-    /// `release_keyed_lock` must only drop an entry once nothing besides
-    /// the registry itself still references it — never while some other
-    /// caller's clone (and thus a lock a waiter may still be blocked on) is
-    /// alive.
     #[test]
     fn keyed_lock_is_per_key_and_release_only_drops_unreferenced_entries() {
         let registry: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> =
@@ -2818,12 +2760,6 @@ mod tests {
         drop(b);
     }
 
-    /// The whole point of `load_lock`: two callers loading two *different*
-    /// models must never block on each other, even while one of them is
-    /// mid-load — this is the exact contention `ensure_model` used to have
-    /// via `state.0.manager` before this fix (see `load_lock`'s doc
-    /// comment). A second caller for the *same* model, though, must block
-    /// until the first one releases it.
     #[tokio::test(flavor = "multi_thread")]
     async fn load_lock_serializes_same_model_but_not_different_models() {
         let slow = load_lock("test-load-lock-slow-model");
@@ -2853,14 +2789,8 @@ mod tests {
         release_load_lock("test-load-lock-other-model");
     }
 
-    /// Regression test for a bug caught in review: a call site that drops
-    /// its `MutexGuard` but forgets to also drop its own `Arc` clone before
-    /// calling `release_load_lock` leaves that clone's reference alive, so
-    /// `release_load_lock`'s strong-count check never sees the registry as
-    /// the sole owner — the entry then never gets cleaned up and
-    /// `LOAD_LOCKS` grows one permanent, unused entry per model ref ever
-    /// locked this way. Exercises the exact guard-then-arc drop order the
-    /// real call sites (`ensure_model`, the Ollama unload handler) use.
+    /// Regression: a call site that drops its guard but not its own `Arc`
+    /// clone before calling `release_load_lock` leaves the entry stuck.
     #[tokio::test]
     async fn load_lock_release_actually_removes_the_entry_once_unused() {
         let key = "test-load-lock-release-cleanup";
