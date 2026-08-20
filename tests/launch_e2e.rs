@@ -549,7 +549,14 @@ fn run_launch(
 /// `llmman launch <integration> ...` invocation, against a fresh `HOME`
 /// each time, before giving up — see that function's own doc comment for
 /// why this exists at all.
-const MAX_ATTEMPTS: u32 = 3;
+///
+/// Was 3 until CI run 32376290299 (PR #256) hit the endless-agent-loop
+/// failure mode (see `launch_and_assert`'s doc comment) on two independent
+/// platforms (Windows/docker, Linux/podman) in the very same run — for
+/// `opencode` specifically, 3 attempts isn't reliably enough headroom.
+/// Bumped to 4; see ci.yml's `timeout-minutes` comment on the E2E job,
+/// which this changes the worst-case budget for.
+const MAX_ATTEMPTS: u32 = 4;
 
 /// Runs `llmman launch <integration> --model qwen3.5:0.8b -- <extra_args>`
 /// (via [`run_launch`], against a fresh temp `HOME` each attempt) and
