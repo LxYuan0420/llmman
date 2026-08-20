@@ -820,6 +820,28 @@ fn release_load_lock(model: &str) {
     release_keyed_lock(&LOAD_LOCKS, model)
 }
 
+/// RAII handle for `load_lock`: releases the mutex and the registry entry
+/// in `Drop`, so cleanup still runs if the holding task is cancelled
+/// (e.g. an axum request future dropped mid-`.await`) rather than only on
+/// a normal return — code placed after an `.await` doesn't run when the
+/// future holding it is dropped instead of polled to completion.
+struct LoadLockGuard {
+    model: String,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for LoadLockGuard {
+    fn drop(&mut self) {
+        self.guard.take(); // drop the Mutex guard (and its Arc clone) first
+        release_load_lock(&self.model);
+    }
+}
+
+async fn acquire_load_lock(model: &str) -> LoadLockGuard {
+    let guard = load_lock(model).lock_owned().await;
+    LoadLockGuard { model: model.to_owned(), guard: Some(guard) }
+}
+
 /// Pulls `model` into `layout_dir` if (still, after acquiring model's own
 /// lock) missing from the local store — shared by `ensure_model`'s
 /// fallback and `handle_pull` so both funnel through the same
@@ -885,102 +907,95 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
         return Ok(port);
     }
 
-    let lock = load_lock(model_ref);
-    let result: Result<u16, AppError> = async {
-        let _guard = lock.lock().await;
+    let _guard = acquire_load_lock(model_ref).await;
 
-        // Someone else may have finished loading this model while we
-        // waited for the lock above.
-        if let Some(port) = check_running(state, model_ref).await {
-            return Ok(port);
-        }
-
-        // If the model is not in the local store, pull it now.
-        if crate::storage::OciStore::open(&state.0.store_path)
-            .and_then(|s| s.find(model_ref))
-            .is_err()
-        {
-            eprintln!("[llmman] {model_ref} not in store — pulling");
-            let store_path = state.0.store_path.clone();
-            let model_ref_owned = model_ref.to_owned();
-            tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_ref_owned))
-                .await
-                .context("pull task panicked")?
-                .context("pull failed")?;
-        }
-
-        // Re-canonicalise after the pull (tag may now be resolvable).
-        let model_ref = canonical_ref(&state.0.store_path, model_ref);
-        let model_ref = model_ref.as_str();
-
-        // Re-check under the post-pull name too: a different pre-pull alias
-        // of this same model may have raced us and started it already.
-        if let Some(port) = check_running(state, model_ref).await {
-            return Ok(port);
-        }
-
-        let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
-            .with_context(|| format!("resolve model {model_ref}"))?;
-        // Best-effort — used only to populate `llmman ps`'s ID/SIZE columns;
-        // resolve_model above already established the model exists, so a
-        // failure here (e.g. a race with a concurrent `rm`) just means those
-        // columns show as empty/zero rather than failing the whole request.
-        let (digest, size) = OciStore::open(&state.0.store_path)
-            .and_then(|s| s.find(model_ref).map(|d| {
-                let size = s.total_size(&d);
-                (d.digest, size)
-            }))
-            .unwrap_or_default();
-        let port = find_free_port()?;
-        eprintln!("[llmman] loading {model_ref} on port {port}");
-        // Only a local llama-server child gets a captured stderr tail today
-        // (see spawn_llama_server) — container/vllm startup failures still
-        // fail fast via ModelProcess::is_alive below, just without an inline
-        // "here's why" (their own stdio is still inherited straight into
-        // serve.log, same as before).
-        let mut stderr_tail: Option<OutputTail> = None;
-        let mut process = match (&model_path, state.0.ociman) {
-            (ModelPath::Gguf(path), Some(ociman)) => {
-                ModelProcess::Container(
-                    ociman,
-                    crate::container::spawn(
-                        ociman,
-                        path,
-                        port,
-                        state.0.llama_cpp_version.as_deref(),
-                        state.0.ctx_size,
-                    )?,
-                )
-            }
-            (ModelPath::Gguf(path), None) => {
-                let bin = local_llama_server_bin(state).await?;
-                let (child, tail) = spawn_llama_server(&bin, path, port, state.0.ctx_size).await?;
-                stderr_tail = Some(tail);
-                ModelProcess::Local(Engine::LlamaServer, child)
-            }
-            (ModelPath::SafeTensors(dir), _) => {
-                ModelProcess::Local(Engine::Vllm, spawn_vllm_server(dir, port, model_ref).await?)
-            }
-        };
-        wait_for_ready(&state.0.client, port, &mut process, stderr_tail.as_ref()).await?;
-        eprintln!("[llmman] {model_ref} ready on port {port}");
-
-        state.0.manager.lock().await.running.insert(
-            model_ref.to_string(),
-            RunningModel {
-                process,
-                port,
-                digest,
-                size,
-                started_at: now_rfc3339(),
-            },
-        );
-        Ok(port)
+    // Someone else may have finished loading this model while we
+    // waited for the lock above.
+    if let Some(port) = check_running(state, model_ref).await {
+        return Ok(port);
     }
-    .await;
-    drop(lock);
-    release_load_lock(model_ref);
-    result
+
+    // If the model is not in the local store, pull it now.
+    if crate::storage::OciStore::open(&state.0.store_path)
+        .and_then(|s| s.find(model_ref))
+        .is_err()
+    {
+        eprintln!("[llmman] {model_ref} not in store — pulling");
+        let store_path = state.0.store_path.clone();
+        let model_ref_owned = model_ref.to_owned();
+        tokio::task::spawn_blocking(move || pull_serialized(&store_path, &model_ref_owned))
+            .await
+            .context("pull task panicked")?
+            .context("pull failed")?;
+    }
+
+    // Re-canonicalise after the pull (tag may now be resolvable).
+    let model_ref = canonical_ref(&state.0.store_path, model_ref);
+    let model_ref = model_ref.as_str();
+
+    // Re-check under the post-pull name too: a different pre-pull alias
+    // of this same model may have raced us and started it already.
+    if let Some(port) = check_running(state, model_ref).await {
+        return Ok(port);
+    }
+
+    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
+        .with_context(|| format!("resolve model {model_ref}"))?;
+    // Best-effort — used only to populate `llmman ps`'s ID/SIZE columns;
+    // resolve_model above already established the model exists, so a
+    // failure here (e.g. a race with a concurrent `rm`) just means those
+    // columns show as empty/zero rather than failing the whole request.
+    let (digest, size) = OciStore::open(&state.0.store_path)
+        .and_then(|s| s.find(model_ref).map(|d| {
+            let size = s.total_size(&d);
+            (d.digest, size)
+        }))
+        .unwrap_or_default();
+    let port = find_free_port()?;
+    eprintln!("[llmman] loading {model_ref} on port {port}");
+    // Only a local llama-server child gets a captured stderr tail today
+    // (see spawn_llama_server) — container/vllm startup failures still
+    // fail fast via ModelProcess::is_alive below, just without an inline
+    // "here's why" (their own stdio is still inherited straight into
+    // serve.log, same as before).
+    let mut stderr_tail: Option<OutputTail> = None;
+    let mut process = match (&model_path, state.0.ociman) {
+        (ModelPath::Gguf(path), Some(ociman)) => {
+            ModelProcess::Container(
+                ociman,
+                crate::container::spawn(
+                    ociman,
+                    path,
+                    port,
+                    state.0.llama_cpp_version.as_deref(),
+                    state.0.ctx_size,
+                )?,
+            )
+        }
+        (ModelPath::Gguf(path), None) => {
+            let bin = local_llama_server_bin(state).await?;
+            let (child, tail) = spawn_llama_server(&bin, path, port, state.0.ctx_size).await?;
+            stderr_tail = Some(tail);
+            ModelProcess::Local(Engine::LlamaServer, child)
+        }
+        (ModelPath::SafeTensors(dir), _) => {
+            ModelProcess::Local(Engine::Vllm, spawn_vllm_server(dir, port, model_ref).await?)
+        }
+    };
+    wait_for_ready(&state.0.client, port, &mut process, stderr_tail.as_ref()).await?;
+    eprintln!("[llmman] {model_ref} ready on port {port}");
+
+    state.0.manager.lock().await.running.insert(
+        model_ref.to_string(),
+        RunningModel {
+            process,
+            port,
+            digest,
+            size,
+            started_at: now_rfc3339(),
+        },
+    );
+    Ok(port)
 }
 
 /// Returns the local llama-server binary to spawn: the one resolved at
@@ -1793,12 +1808,8 @@ async fn handle_ollama_generate(
         let canonical = canonical_ref(&state.0.store_path, &resolved);
         // Wait for an in-flight load of this model to publish itself first,
         // so it can't race ahead of this remove.
-        let lock = load_lock(&canonical);
-        let _guard = lock.lock().await;
+        let _guard = acquire_load_lock(&canonical).await;
         state.0.manager.lock().await.running.remove(&canonical);
-        drop(_guard);
-        drop(lock);
-        release_load_lock(&canonical);
         return Ok(Json(OllamaGenerateChunk {
             model: req.model,
             created_at: now_rfc3339(),
@@ -2781,10 +2792,15 @@ mod tests {
         );
 
         drop(guard);
-        let _same_guard = tokio::time::timeout(std::time::Duration::from_millis(200), same.lock())
+        let same_guard = tokio::time::timeout(std::time::Duration::from_millis(200), same.lock())
             .await
             .expect("must acquire promptly once the first load releases");
 
+        drop(same_guard);
+        drop(_other_guard);
+        drop(same);
+        drop(other);
+        drop(slow);
         release_load_lock("test-load-lock-slow-model");
         release_load_lock("test-load-lock-other-model");
     }
@@ -2802,6 +2818,31 @@ mod tests {
         assert!(
             !LOAD_LOCKS.lock().unwrap().contains_key(key),
             "release_load_lock must drop the registry entry once nothing else references it"
+        );
+    }
+
+    /// Regression: aborting a task while it holds a `LoadLockGuard` must
+    /// still release the registry entry. `acquire_load_lock`'s caller
+    /// (`ensure_model`, the unload handler) can itself be cancelled by axum
+    /// mid-`.await` (a dropped client connection) — code placed after an
+    /// `.await` doesn't run in that case, so cleanup must live in `Drop`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_lock_guard_releases_on_task_cancellation() {
+        let key = "test-load-lock-guard-cancel";
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_tx = started.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = acquire_load_lock("test-load-lock-guard-cancel").await;
+            started_tx.notify_one();
+            std::future::pending::<()>().await;
+        });
+        started.notified().await;
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            !LOAD_LOCKS.lock().unwrap().contains_key(key),
+            "aborting a task holding LoadLockGuard must still release the registry entry"
         );
     }
 }
