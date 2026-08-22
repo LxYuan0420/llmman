@@ -99,7 +99,7 @@ llmman launch claude --model gemma4
 
 Run `llmman launch` with no arguments to list the supported integrations (Claude Code, OpenCode) and whether each is installed. Any extra arguments after `--` are forwarded to the integration's own CLI.
 
-Short names work with all commands: `pull`, `push`, `transfer`, `rm`, `tag`, `inspect`, and `serve`.
+Short names work wherever a model reference is accepted.
 
 ### Use with vLLM directly
 
@@ -122,12 +122,14 @@ local store; `--store`/`--cache` override the default locations below.
 
 ## Store location
 
-Default locations (override with `--store <DIR>`):
+Default locations:
 
 | OS | Path |
 |----|------|
 | Linux, macOS | `~/.local/share/llmman/store` |
 | Windows | `%LOCALAPPDATA%\llmman\store` |
+
+Commands that read or write the local store directly (`list`, `rm`, `tag`, `inspect`, `build`, `resolve`, `serve`) accept `--store <DIR>` to override it. Commands that go through the background daemon instead (`pull`, `push`, `run`, `launch`, `ps`) always use whichever store that daemon was started with — pass `--store` to `llmman serve` to change it for all of them. `transfer`, `login`, and `logout` never touch a local store at all.
 
 The store uses [OCI Image Layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), readable by `docker` and `podman`.
 
