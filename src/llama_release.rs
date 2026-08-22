@@ -467,27 +467,33 @@ fn mark_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Extracts llama.cpp's numeric build counter from a `b<N>` release tag.
+/// Tags don't sort lexically the same as chronologically once the counter
+/// crosses a power of ten (`"b9999" > "b10000"` as strings, even though
+/// b10000 shipped later), so callers comparing two tags need this instead
+/// of a plain string comparison.
+fn build_number(tag: &str) -> Option<u64> {
+    tag.strip_prefix('b')?.parse().ok()
+}
+
 /// Finds the most recently downloaded `<tag>/<label>` install under
-/// [`install_root`] that already has `bin_name` extracted into it —
-/// released tags sort lexically the same as chronologically for
-/// llama.cpp's own `b<N>` tag scheme, so a plain string-max over
-/// directory names is enough, with no need to parse or compare `bN`
-/// numerically.
+/// [`install_root`] that already has `bin_name` extracted into it.
 fn newest_cached(label: &str, bin_name: &str) -> Result<Option<PathBuf>> {
     let root = install_root()?;
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Ok(None);
     };
-    let mut best: Option<(String, PathBuf)> = None;
+    let mut best: Option<(u64, PathBuf)> = None;
     for entry in entries.flatten() {
         if !entry.path().is_dir() {
             continue;
         }
         let tag = entry.file_name().to_string_lossy().into_owned();
+        let Some(build) = build_number(&tag) else { continue };
         let dest = entry.path().join(label);
         let Some(bin) = find_binary(&dest, bin_name) else { continue };
-        if best.as_ref().map(|(t, _)| tag > *t).unwrap_or(true) {
-            best = Some((tag, bin));
+        if best.as_ref().map(|(b, _)| build > *b).unwrap_or(true) {
+            best = Some((build, bin));
         }
     }
     Ok(best.map(|(_, bin)| bin))
@@ -527,6 +533,16 @@ mod tests {
         // Just exercises the mapping logic directly since
         // std::env::consts::ARCH is fixed per test-binary target.
         assert!(!host_arch_token().is_empty());
+    }
+
+    /// Regression test: `newest_cached` used to pick the string-max of two
+    /// cached tags, which silently regresses once the build counter crosses
+    /// a power of ten (`"b9999" > "b10000"` lexically).
+    #[test]
+    fn build_number_compares_correctly_across_a_digit_count_boundary() {
+        assert!(build_number("b10000") > build_number("b9999"));
+        assert_eq!(build_number("b10360"), Some(10360));
+        assert_eq!(build_number("not-a-tag"), None);
     }
 
     /// Real end-to-end check against the actual GitHub API and a real
