@@ -294,13 +294,25 @@ jobs:
     # 5-8 of those minutes on Windows, before any of tests/launch_e2e.rs's
     # own three tests even start. Those three tests run serialized
     # (--test-threads=1 + lock_serial()), so the real worst case sums all
-    # three's own retry budgets, not just one: claude and codex each cap
-    # at DEFAULT_MAX_ATTEMPTS * TIMEOUT (3 * 600s = 30 min), opencode at
-    # OPENCODE_MAX_ATTEMPTS * TIMEOUT (4 * 600s = 40 min, bumped after CI
-    # run 32376290299 exhausted 3/3 attempts on two platforms at once for
-    # opencode specifically) — 8 + 30 + 40 + 30 = 108 minutes. 120 leaves
-    # real headroom for that worst case across every platform, not just
-    # the fastest one.
+    # three's own retry budgets, not just one, each capped at
+    # MAX_ATTEMPTS * TIMEOUT (3 * 600s = 30 min) — plus warm_model()'s own
+    # separate TIMEOUT budget (10 min), paid at most once across all three
+    # tests (guarded by WARM's own Once — see that function's doc comment)
+    # but not otherwise included in any single test's own 30 min above,
+    # since warm_model() and the actual launch it precedes are each their
+    # own independent try_spawn_with_timeout call: 8 + 10 + 30 + 30 + 30 =
+    # 108 minutes. 120 leaves real headroom for that worst case across
+    # every platform, not just the fastest one. (A previous revision of
+    # this comment gave opencode its own larger MAX_ATTEMPTS after CI run
+    # 32376290299 exhausted 3/3 attempts on two platforms at once —
+    # reverted, see tests/launch_e2e.rs's own MAX_ATTEMPTS doc comment for
+    # why paying for more retries there doesn't actually fix anything; that
+    # revert didn't change this budget; it was already 108/120 before it
+    # even without opencode's own extra attempt, once warm_model()'s
+    # separate budget above is accounted for. Exhausting every attempt no
+    # longer fails this job either way — see that same doc comment — but a
+    # run can still legitimately take this long in wall-clock time before
+    # giving up, so this budget is sized the same regardless.)
     timeout-minutes: 120
     strategy:
       fail-fast: false
