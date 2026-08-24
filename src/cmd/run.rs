@@ -1,8 +1,8 @@
 //! `llmman run` — interactive chat or one-shot prompt.
 //!
 //! Interactive mode uses a raw-mode readline ported directly from ollama's
-//! readline package (readline/readline.go, readline/term.go).  The key
-//! mechanism for paste detection mirrors ollama exactly:
+//! readline package (readline/readline.go, readline/term.go). Paste
+//! detection mirrors ollama exactly:
 //!
 //!   // ollama (Go)
 //!   if i.Terminal.reader.Buffered() > 0 { draining = true }
@@ -10,18 +10,31 @@
 //!   // llmman (Rust)
 //!   if !reader.buffer().is_empty() { draining = true; }
 //!
-//! When the user pastes, the terminal sends all characters to the PTY buffer
-//! at once.  BufReader fills its internal buffer in one syscall.  After
-//! read()ing one byte, buffer() is non-empty ↔ we are draining a paste.
-//! While draining, a '\n' (CharCtrlJ) submits the line like Enter does
-//! (same as ollama).  When not draining, '\n' is Ctrl-J multiline.
+//! While draining a paste, '\n' submits the line like Enter; otherwise
+//! it's Ctrl-J multiline, same as ollama.
+//!
+//! Streamed responses are ported from ollama's `cmd/cmd.go`
+//! (`generate`/`chat`, `displayResponse`, `thinkingOutputOpeningText`/
+//! `...ClosingText`): word-wrapped at the terminal width, "Thinking..."
+//! in dim grey/bold ANSI, sent over an async reqwest client racing
+//! `tokio::signal::ctrl_c()` so Ctrl-C cancels only the in-flight turn
+//! (mirrors ollama's `context.WithCancel` + `signal.Notify`) instead of
+//! killing the process. In the interactive REPL, raw mode is released
+//! for the duration of each response and re-entered before the next
+//! prompt — mirrors `readline.Instance.Readline()`'s own enter/`defer`
+//! restore — which is why Ctrl-C while typing is read as byte 3 (ISIG
+//! off) but Ctrl-C during a response is a real SIGINT (ISIG back on).
 
 use std::io::{self, IsTerminal, Write};
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Args;
-use reqwest::blocking::Client;
+use futures::TryStreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncBufReadExt;
 
 use crate::daemon::SERVER;
 
@@ -52,6 +65,10 @@ pub struct RunArgs {
     /// passed.
     #[arg(long)]
     pub num_predict: Option<u32>,
+    /// Mirrors ollama's own `run --nowordwrap` — opts out of the
+    /// terminal-width word wrap in `wrap_write` below.
+    #[arg(long)]
+    pub nowordwrap: bool,
     #[arg(
         value_name = "PROMPT",
         trailing_var_arg = true,
@@ -60,12 +77,24 @@ pub struct RunArgs {
     pub prompt: Vec<String>,
 }
 
-/// Per-request knobs `chat_submit`'s every caller in this file threads
-/// through unchanged from `RunArgs` — see `RunArgs::think`/`num_predict`.
-#[derive(Debug, Clone, Copy, Default)]
+/// Per-request knobs threaded through unchanged from `RunArgs`.
+#[derive(Debug, Clone, Copy)]
 struct ChatOptions {
     think: Option<bool>,
     num_predict: Option<u32>,
+    /// Inverse of `RunArgs::nowordwrap`, matching ollama's
+    /// `runOptions.WordWrap` (defaults `true`).
+    word_wrap: bool,
+}
+
+impl Default for ChatOptions {
+    fn default() -> Self {
+        Self {
+            think: None,
+            num_predict: None,
+            word_wrap: true,
+        }
+    }
 }
 
 pub fn run(args: &RunArgs) -> anyhow::Result<()> {
@@ -101,16 +130,18 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     // prompt had already been shown and read from.
     crate::daemon::ensure_model_pulled(&model)?;
 
-    let interactive = prompt.is_empty() && io::stdin().is_terminal();
+    // Mirrors ollama's RunHandler: interactive needs *both* ends of the
+    // terminal, not just stdin — otherwise a redirected stdout still gets
+    // raw-moded and starts emitting ANSI escapes into it.
+    let interactive = prompt.is_empty() && io::stdin().is_terminal() && io::stdout().is_terminal();
+    let opts = ChatOptions {
+        think: args.think,
+        num_predict: args.num_predict,
+        word_wrap: !args.nowordwrap,
+    };
 
     if interactive {
-        run_interactive_tty(
-            &model,
-            ChatOptions {
-                think: args.think,
-                num_predict: args.num_predict,
-            },
-        )
+        run_interactive_tty(&model, opts)
     } else {
         let p = if prompt.is_empty() {
             let mut s = String::new();
@@ -120,25 +151,13 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
             prompt
         };
         if !p.is_empty() {
-            // A single-turn "conversation" over /api/chat — the same
-            // endpoint, and the same chat_submit helper, interactive mode
-            // uses below. Ollama's own CLI uses /api/generate for one-shot
-            // prompts and /api/chat for its interactive REPL, but keeping
-            // every mode in this file on one endpoint means there's a
-            // single wire-format implementation to maintain here, and it
-            // works identically against llmman or a real Ollama install
-            // either way (both expose /api/chat).
+            // One-shot "conversation" over /api/chat, same helper as
+            // interactive mode. A fresh tokio runtime, not
+            // reqwest::blocking, so Ctrl-C can race the response via
+            // `tokio::select!` in `chat_submit` — see that fn's doc comment.
+            let rt = tokio::runtime::Runtime::new().context("start tokio runtime")?;
             let client = chat_client()?;
-            chat_submit(
-                &client,
-                &model,
-                &mut Vec::new(),
-                p,
-                ChatOptions {
-                    think: args.think,
-                    num_predict: args.num_predict,
-                },
-            )?;
+            chat_submit(&rt, &client, &model, &mut Vec::new(), p, opts)?;
         }
         Ok(())
     }
@@ -156,21 +175,11 @@ struct Msg {
     thinking: Option<String>,
 }
 
-/// Builds the `reqwest::blocking::Client` every chat-submitting caller in
-/// this file shares. `reqwest::blocking::Client::new()` carries a 30s
-/// default request timeout (unlike the async `Client`, which has none) —
-/// fine for quick calls, but loading a model into `llama-server`/vllm for
-/// the first time (or the daemon's own up-to-600s wait_for_ready health
-/// poll, see cmd::serve::wait_for_ready) routinely takes longer than
-/// that, so `Client::new()` here would abort an otherwise-succeeding
-/// request with a misleading "operation timed out" long before the model
-/// actually finished loading. Mirrors daemon::stream_progress's own
-/// `.timeout(None)` for the same reason on the pull/push side.
+/// Async, not `reqwest::blocking`, so a chat turn's response can be raced
+/// against `tokio::signal::ctrl_c()` in `chat_submit` — no `.timeout()`
+/// needed either, unlike the blocking client's own 30s default.
 fn chat_client() -> anyhow::Result<Client> {
-    Client::builder()
-        .timeout(None)
-        .build()
-        .context("build http client")
+    Client::builder().build().context("build http client")
 }
 
 #[derive(Serialize)]
@@ -199,6 +208,153 @@ struct ChatChunk {
 }
 
 // ---------------------------------------------------------------------------
+// Terminal rendering — ported from ollama's cmd.go (displayResponse,
+// thinkingOutputOpeningText/ClosingText): the "Thinking..." block is the
+// one place `ollama run` colors anything.
+// ---------------------------------------------------------------------------
+
+/// ollama's readline.ColorGrey/ColorBold/ColorDefault (readline/types.go).
+const COLOR_GREY: &str = "\x1b[38;5;245m";
+const COLOR_BOLD: &str = "\x1b[1m";
+const COLOR_DEFAULT: &str = "\x1b[0m";
+
+/// Mirrors ollama's `thinkingOutputOpeningText`. Ends re-applying grey
+/// (not a full reset) so the streamed thinking text after it can rely on
+/// that still-active SGR state instead of coloring itself.
+fn thinking_opening_text(plain: bool) -> String {
+    let text = "Thinking...\n";
+    if plain {
+        text.to_string()
+    } else {
+        format!("{COLOR_GREY}{COLOR_BOLD}{text}{COLOR_DEFAULT}{COLOR_GREY}")
+    }
+}
+
+/// Mirrors ollama's `thinkingOutputClosingText` — a full reset this time.
+fn thinking_closing_text(plain: bool) -> String {
+    let text = "...done thinking.\n\n";
+    if plain {
+        text.to_string()
+    } else {
+        format!("{COLOR_GREY}{COLOR_BOLD}{text}{COLOR_DEFAULT}")
+    }
+}
+
+/// Mirrors ollama's `displayResponseState`.
+#[derive(Default)]
+struct WrapState {
+    line_length: usize,
+    word_buffer: String,
+}
+
+/// Terminal width, falling back to 80 like ollama's `displayResponse`
+/// does when `term.GetSize` fails (e.g. not a real terminal).
+fn term_width() -> usize {
+    #[cfg(unix)]
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
+        }
+    }
+    80
+}
+
+/// Pure computation half of `wrap_write`, split out so it's testable
+/// without a real terminal. Direct port of ollama's `displayResponse`:
+/// track the current word, and once a line would overflow, backtrack to
+/// its start, clear to end of line, and continue on the next one. Every
+/// char counts as one column (no `runewidth`-style CJK width handling).
+fn wrap_chunk(content: &str, wrap: bool, width: usize, state: &mut WrapState) -> String {
+    let mut out = String::new();
+    if wrap && width >= 10 {
+        for ch in content.chars() {
+            if state.line_length + 1 > width - 5 {
+                if state.word_buffer.chars().count() > width - 10 {
+                    out.push_str(&state.word_buffer);
+                    out.push(ch);
+                    state.word_buffer.clear();
+                    state.line_length = 0;
+                    continue;
+                }
+                let a = state.word_buffer.chars().count();
+                if a > 0 {
+                    out.push_str(&format!("\x1b[{a}D"));
+                }
+                out.push_str("\x1b[K\n");
+                out.push_str(&state.word_buffer);
+                out.push(ch);
+                state.line_length = state.word_buffer.chars().count() + 1;
+            } else {
+                out.push(ch);
+                state.line_length += 1;
+                match ch {
+                    ' ' | '\t' => state.word_buffer.clear(),
+                    '\n' | '\r' => {
+                        state.line_length = 0;
+                        state.word_buffer.clear();
+                    }
+                    _ => state.word_buffer.push(ch),
+                }
+            }
+        }
+    } else {
+        out.push_str(&state.word_buffer);
+        out.push_str(content);
+        state.word_buffer.clear();
+    }
+    out
+}
+
+/// Streams `content` to stdout, word-wrapped via `wrap_chunk` above.
+fn wrap_write(content: &str, wrap: bool, state: &mut WrapState) {
+    let out = wrap_chunk(content, wrap, term_width(), state);
+    print!("{out}");
+    io::stdout().flush().ok();
+}
+
+/// Mirrors ollama's `progress.NewSpinner("")` (`chat`/`generate` in
+/// cmd.go): a braille spinner shown until the first streamed response
+/// object arrives, same glyphs and 100ms tick. Unlike ollama, only shown
+/// when stderr is a real terminal, so a piped stderr doesn't get raw
+/// escape sequences dumped into it.
+fn start_spinner() -> Option<ProgressBar> {
+    if !io::stderr().is_terminal() {
+        return None;
+    }
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner} ")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner())
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.enable_steady_tick(Duration::from_millis(100));
+    Some(pb)
+}
+
+/// RAII wrapper around `start_spinner`'s result — mirrors ollama's own
+/// `defer p.StopAndClear()`: whichever of `chat_submit_async`'s
+/// early-return paths fires, this clears any still-running spinner
+/// exactly once.
+struct SpinnerGuard(Option<ProgressBar>);
+
+impl SpinnerGuard {
+    /// Called on Ctrl-C or once the first response object is decoded —
+    /// a no-op after the first call, like ollama's own `Spinner.Stop`.
+    fn stop(&mut self) {
+        if let Some(sp) = self.0.take() {
+            sp.finish_and_clear();
+        }
+    }
+}
+
+impl Drop for SpinnerGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Interactive — TTY path
 // ---------------------------------------------------------------------------
 
@@ -222,12 +378,14 @@ fn run_interactive_tty(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
 fn run_interactive_unix(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
     use unix_readline::Readline;
 
+    // One tokio runtime, reused across every turn's `block_on` — see
+    // `chat_submit`'s doc comment for why this needs async reqwest.
+    let rt = tokio::runtime::Runtime::new().context("start tokio runtime")?;
     let client = chat_client()?;
     let mut messages: Vec<Msg> = Vec::new();
     let mut rl = Readline::new()?;
     let mut multiline: Option<String> = None; // Some while inside """
-                                              // paste_sb accumulates lines while rl.pasting — mirrors ollama's `sb` +
-                                              // `case scanner.Pasting: fmt.Fprintln(&sb, line); continue`
+                                              // Accumulates lines while rl.pasting, mirrors ollama's `sb`.
     let mut paste_sb = String::new();
 
     loop {
@@ -278,7 +436,7 @@ fn run_interactive_unix(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
                 let full = std::mem::take(buf).trim_end_matches('\n').to_string();
                 multiline = None;
                 if !full.trim().is_empty() {
-                    chat_submit(&client, model, &mut messages, full, opts)?;
+                    submit_turn(&rt, &client, model, &mut rl, &mut messages, full, opts)?;
                 }
             } else {
                 buf.push_str(&line);
@@ -309,7 +467,7 @@ fn run_interactive_unix(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
             if let Some(closed) = inner.strip_suffix("\"\"\"") {
                 let content = closed.to_string();
                 if !content.trim().is_empty() {
-                    chat_submit(&client, model, &mut messages, content, opts)?;
+                    submit_turn(&rt, &client, model, &mut rl, &mut messages, content, opts)?;
                 }
             } else {
                 multiline = Some(inner.to_string() + "\n");
@@ -318,18 +476,57 @@ fn run_interactive_unix(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
         }
 
         if !line.trim().is_empty() {
-            chat_submit(&client, model, &mut messages, line, opts)?;
+            submit_turn(&rt, &client, model, &mut rl, &mut messages, line, opts)?;
         }
     }
 
     Ok(())
 }
 
-/// Send one chat turn using the blocking reqwest client and stream the
-/// response. Platform-agnostic (used by one-shot mode, the Unix
-/// raw-mode REPL, and the Windows/non-TTY cooked-mode fallback below).
+/// Wraps `chat_submit` with the raw-mode toggle that lets Ctrl-C actually
+/// interrupt a streaming response — mirrors ollama's
+/// `readline.Instance.Readline()`, which holds raw mode only around
+/// reading one line. Without this, raw mode (ISIG off) would stay active
+/// through the response too, so Ctrl-C would just sit as an unread byte 3
+/// until the next `rl.readline()` call instead of interrupting now.
+#[cfg(unix)]
+fn submit_turn(
+    rt: &tokio::runtime::Runtime,
+    client: &Client,
+    model: &str,
+    rl: &mut unix_readline::Readline,
+    messages: &mut Vec<Msg>,
+    content: String,
+    opts: ChatOptions,
+) -> anyhow::Result<()> {
+    rl.leave_raw();
+    let result = chat_submit(rt, client, model, messages, content, opts);
+    rl.enter_raw();
+    result
+}
+
+/// Sends one chat turn and streams the response, racing it against
+/// Ctrl-C — mirrors ollama's per-turn `context.WithCancel` +
+/// `signal.Notify(SIGINT)`: Ctrl-C stops just this turn's response
+/// without killing the process. An interrupted turn's partial reply is
+/// *not* added to `messages`, matching cmd.go's `chat` returning `nil`
+/// on `context.Canceled`.
+///
+/// Async, not `reqwest::blocking`, so the stream can be raced against
+/// `tokio::signal::ctrl_c()` via `tokio::select!` below.
 fn chat_submit(
-    client: &reqwest::blocking::Client,
+    rt: &tokio::runtime::Runtime,
+    client: &Client,
+    model: &str,
+    messages: &mut Vec<Msg>,
+    content: String,
+    opts: ChatOptions,
+) -> anyhow::Result<()> {
+    rt.block_on(chat_submit_async(client, model, messages, content, opts))
+}
+
+async fn chat_submit_async(
+    client: &Client,
     model: &str,
     messages: &mut Vec<Msg>,
     content: String,
@@ -341,8 +538,23 @@ fn chat_submit(
         thinking: None,
     });
 
-    let resp = client
-        .post(&format!("{SERVER}/api/chat"))
+    // Mirrors ollama's `progress.NewSpinner("")`: ticks on stderr until
+    // the first token/thinking chunk arrives, so `llmman run` doesn't sit
+    // silently while a cold model loads server-side.
+    let mut spinner = SpinnerGuard(start_spinner());
+
+    // One listener for this whole turn, mirroring ollama's own
+    // `signal.Notify(sigChan, syscall.SIGINT)` called once per turn (not
+    // per streamed chunk). Recreating `tokio::signal::ctrl_c()` on every
+    // loop iteration would subscribe a fresh listener each time, and a
+    // SIGINT delivered in the gap between the old one dropping and the
+    // new one subscribing could be missed — pinning it once and reusing
+    // it via `&mut` closes that gap.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
+    let send = client
+        .post(format!("{SERVER}/api/chat"))
         .json(&ChatReq {
             model,
             messages,
@@ -352,45 +564,74 @@ fn chat_submit(
                 num_predict: Some(n),
             }),
         })
-        .send()
-        .context("connect to llmman serve")?;
+        .send();
+
+    let resp = tokio::select! {
+        r = send => r.context("connect to llmman serve")?,
+        // Nothing printed yet, so just stop — `spinner`'s Drop clears it.
+        _ = &mut ctrl_c => return Ok(()),
+    };
 
     if !resp.status().is_success() {
-        let e = resp.text().unwrap_or_default();
+        spinner.stop();
+        let e = resp.text().await.unwrap_or_default();
         anyhow::bail!("{e}");
     }
 
-    // Stream NDJSON lines from the response body.
-    // reqwest::blocking::Response implements Read, so BufReader gives us lines
-    // as they arrive — each line appears when the next token is generated.
-    use std::io::BufRead;
+    // Stream NDJSON lines as they arrive, async so each read can be
+    // `tokio::select!`ed against Ctrl-C below.
+    let byte_stream = resp.bytes_stream().map_err(io::Error::other);
+    let mut lines =
+        tokio::io::BufReader::new(tokio_util::io::StreamReader::new(byte_stream)).lines();
+
+    // Mirrors ollama's `plainText`: no ANSI codes when stdout is redirected.
+    let plain_text = !io::stdout().is_terminal();
     let mut full = String::new();
+    let mut thinking_content = String::new();
     let mut thinking_open = false;
-    for line in std::io::BufReader::new(resp).lines() {
-        let line = line?;
+    let mut thinking_closed = false;
+    let mut wrap = WrapState::default();
+    let mut interrupted = false;
+
+    loop {
+        let line = tokio::select! {
+            l = lines.next_line() => l.context("read response stream")?,
+            // Same pinned listener as above, see its comment for why.
+            _ = &mut ctrl_c => { interrupted = true; break; }
+        };
+        let Some(line) = line else { break };
         if line.is_empty() {
             continue;
         }
         let Ok(chunk) = serde_json::from_str::<ChatChunk>(&line) else {
             continue;
         };
+        // Cleared on the first decoded response object, like ollama's
+        // own `fn` callback.
+        spinner.stop();
         if let Some(ref msg) = chunk.message {
             if let Some(ref t) = msg.thinking {
                 if !t.is_empty() {
                     if !thinking_open {
-                        eprint!("Thinking: ");
+                        print!("{}", thinking_opening_text(plain_text));
                         thinking_open = true;
+                        thinking_closed = false;
                     }
-                    eprint!("{t}");
+                    thinking_content.push_str(t);
+                    wrap_write(t, opts.word_wrap, &mut wrap);
                 }
             }
-            if !msg.content.is_empty() && thinking_open {
-                eprintln!();
+            if thinking_open && !thinking_closed && !msg.content.is_empty() {
+                if !thinking_content.ends_with('\n') {
+                    println!();
+                }
+                print!("{}", thinking_closing_text(plain_text));
                 thinking_open = false;
+                thinking_closed = true;
+                wrap = WrapState::default();
             }
             if !msg.content.is_empty() {
-                print!("{}", msg.content);
-                io::stdout().flush().ok();
+                wrap_write(&msg.content, opts.word_wrap, &mut wrap);
                 full.push_str(&msg.content);
             }
         }
@@ -398,6 +639,11 @@ fn chat_submit(
             break;
         }
     }
+
+    if interrupted {
+        return Ok(());
+    }
+
     println!("\n");
     messages.push(Msg {
         role: "assistant".into(),
@@ -413,7 +659,7 @@ fn chat_submit(
 
 #[cfg(unix)]
 mod unix_readline {
-    use std::io::{BufRead, BufReader, Read, Stdin, Write};
+    use std::io::{BufReader, Read, Stdin, Write};
     use std::os::unix::io::AsRawFd;
 
     // Character codes — identical to ollama readline/types.go
@@ -457,37 +703,59 @@ mod unix_readline {
                 t
             };
 
-            let mut raw = orig;
-            unsafe {
-                raw.c_iflag &= !(libc::IGNBRK
-                    | libc::BRKINT
-                    | libc::PARMRK
-                    | libc::ISTRIP
-                    | libc::INLCR
-                    | libc::IGNCR
-                    | libc::ICRNL
-                    | libc::IXON);
-                raw.c_lflag &=
-                    !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
-                raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
-                raw.c_cflag |= libc::CS8;
-                raw.c_cc[libc::VMIN as usize] = 1;
-                raw.c_cc[libc::VTIME as usize] = 0;
-                if libc::tcsetattr(fd, libc::TCSANOW, &raw) < 0 {
-                    anyhow::bail!("tcsetattr failed");
-                }
-            }
-
-            // Enable bracketed paste mode — mirrors `fmt.Print(readline.StartBracketedPaste)`
-            print!("\x1b[?2004h");
-            std::io::stdout().flush().ok();
-
-            Ok(Self {
+            let rl = Self {
                 reader: BufReader::new(stdin),
                 orig,
                 fd,
                 pasting: false,
-            })
+            };
+            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &rl.raw_termios()) } < 0 {
+                anyhow::bail!("tcsetattr failed");
+            }
+
+            // Enable bracketed paste for the whole session (toggled off
+            // once, in Drop) — mirrors ollama's own start/end pair
+            // wrapping the entire REPL loop, not each `Readline()` call.
+            print!("\x1b[?2004h");
+            std::io::stdout().flush().ok();
+
+            Ok(rl)
+        }
+
+        /// Raw-mode termios derived from `orig`, mirrors `SetRawMode`.
+        fn raw_termios(&self) -> libc::termios {
+            let mut raw = self.orig;
+            raw.c_iflag &= !(libc::IGNBRK
+                | libc::BRKINT
+                | libc::PARMRK
+                | libc::ISTRIP
+                | libc::INLCR
+                | libc::IGNCR
+                | libc::ICRNL
+                | libc::IXON);
+            raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
+            raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
+            raw.c_cflag |= libc::CS8;
+            raw.c_cc[libc::VMIN as usize] = 1;
+            raw.c_cc[libc::VTIME as usize] = 0;
+            raw
+        }
+
+        /// (Re-)enters raw mode — used by `new()` and by `run::submit_turn`
+        /// to undo `leave_raw` before the next `readline()` call.
+        pub fn enter_raw(&self) {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, &self.raw_termios());
+            }
+        }
+
+        /// Restores cooked (ISIG-enabled) mode for the duration of a
+        /// streamed response, so a real SIGINT reaches `chat_submit`'s
+        /// `ctrl_c()` instead of raw mode swallowing it as a plain byte 3.
+        pub fn leave_raw(&self) {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
+            }
         }
 
         /// Read one logical line from the terminal.
@@ -576,7 +844,11 @@ mod unix_readline {
                         return Err(ReadlineError::Interrupted);
                     }
                     CHAR_EOF => {
-                        if buf.is_empty() && pasted_lines.is_empty() {
+                        // Mirrors ollama's `case CharDelete`: only checks
+                        // the current line's own buffer, so Ctrl-D on a
+                        // fresh empty continuation line exits the whole
+                        // REPL even mid-multiline-entry.
+                        if buf.is_empty() {
                             println!();
                             return Ok(None);
                         }
@@ -666,6 +938,7 @@ mod unix_readline {
 
 #[allow(dead_code)]
 fn run_interactive_cooked(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new().context("start tokio runtime")?;
     let client = chat_client()?;
     let mut messages: Vec<Msg> = Vec::new();
     use std::io::BufRead;
@@ -693,8 +966,111 @@ fn run_interactive_cooked(model: &str, opts: ChatOptions) -> anyhow::Result<()> 
             _ => {}
         }
         if !line.trim().is_empty() {
-            chat_submit(&client, model, &mut messages, line, opts)?;
+            chat_submit(&rt, &client, model, &mut messages, line, opts)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_options_default_matches_ollamas_own_wordwrap_true_default() {
+        let opts = ChatOptions::default();
+        assert_eq!(opts.think, None);
+        assert_eq!(opts.num_predict, None);
+        assert!(opts.word_wrap);
+    }
+
+    #[test]
+    fn thinking_opening_text_plain_has_no_ansi_codes() {
+        assert_eq!(thinking_opening_text(true), "Thinking...\n");
+    }
+
+    #[test]
+    fn thinking_opening_text_colored_wraps_in_grey_bold_then_grey_again() {
+        let text = thinking_opening_text(false);
+        assert!(text.starts_with(&format!("{COLOR_GREY}{COLOR_BOLD}")));
+        assert!(text.contains("Thinking...\n"));
+        // Re-applies grey rather than a full reset.
+        assert!(text.ends_with(&format!("{COLOR_DEFAULT}{COLOR_GREY}")));
+    }
+
+    #[test]
+    fn thinking_closing_text_plain_has_no_ansi_codes() {
+        assert_eq!(thinking_closing_text(true), "...done thinking.\n\n");
+    }
+
+    #[test]
+    fn thinking_closing_text_colored_ends_in_a_full_reset() {
+        let text = thinking_closing_text(false);
+        assert!(text.starts_with(&format!("{COLOR_GREY}{COLOR_BOLD}")));
+        assert!(text.contains("...done thinking.\n\n"));
+        assert!(text.ends_with(COLOR_DEFAULT));
+        assert!(!text.ends_with(&format!("{COLOR_DEFAULT}{COLOR_GREY}")));
+    }
+
+    #[test]
+    fn wrap_chunk_disabled_passes_content_through_unchanged() {
+        let mut state = WrapState::default();
+        let out = wrap_chunk(
+            "hello there, this line is not wrapped at all",
+            false,
+            20,
+            &mut state,
+        );
+        assert_eq!(out, "hello there, this line is not wrapped at all");
+    }
+
+    #[test]
+    fn wrap_chunk_too_narrow_terminal_passes_content_through_unchanged() {
+        // Mirrors ollama's `wordWrap && termWidth >= 10` guard.
+        let mut state = WrapState::default();
+        let out = wrap_chunk("hello there", true, 9, &mut state);
+        assert_eq!(out, "hello there");
+    }
+
+    #[test]
+    fn wrap_chunk_breaks_before_a_word_that_would_overflow_the_line() {
+        let mut state = WrapState::default();
+        // width=20: overflow threshold is line_length+1 > width-5 (>15).
+        let out = wrap_chunk("one two three four five", true, 20, &mut state);
+        // "four" gets backtracked onto a new line instead of splitting.
+        assert!(out.contains("\x1b[K\n"));
+        let after_break = out.split("\x1b[K\n").nth(1).unwrap();
+        assert!(after_break.starts_with("four"));
+    }
+
+    #[test]
+    fn wrap_chunk_state_persists_across_calls_like_a_single_stream() {
+        // Several small calls (one per streamed token) must wrap the
+        // same as one big call, carried via WrapState between them.
+        let mut state_streamed = WrapState::default();
+        let mut streamed = String::new();
+        for word in ["one ", "two ", "three ", "four ", "five"] {
+            streamed.push_str(&wrap_chunk(word, true, 20, &mut state_streamed));
+        }
+
+        let mut state_whole = WrapState::default();
+        let whole = wrap_chunk("one two three four five", true, 20, &mut state_whole);
+
+        assert_eq!(streamed, whole);
+    }
+
+    #[test]
+    fn wrap_chunk_an_unbroken_word_longer_than_the_line_flushes_without_backtracking() {
+        // A word too long to ever fit its own line skips the backtrack
+        // and just flushes the buffered prefix again — faithfully
+        // mirroring ollama's own `fmt.Printf("%s%c", wordBuffer, ch)`
+        // here, the buffered prefix really does appear twice in the
+        // output for this rare edge case.
+        let mut state = WrapState::default();
+        let out = wrap_chunk("supercalifragilisticexpialidocious", true, 20, &mut state);
+        assert_eq!(
+            out,
+            "supercalifragilsupercalifragilisticexpialidocisticexpialidocious"
+        );
+    }
 }
