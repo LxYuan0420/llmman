@@ -7,6 +7,14 @@ on:
   pull_request:
     branches: ["main"]
 
+# Workflow-wide default: read-only. Every job here only needs to check
+# out and build/test the repo except `release`, which needs to create a
+# GitHub Release — that one job overrides this with its own
+# `permissions: contents: write` (see the release job below) rather than
+# every job inheriting broad default repo permissions for no reason.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -283,6 +291,14 @@ jobs:
   e2e:
     name: E2E (launch claude/opencode/codex/hermes/openclaw) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
+    # These take a long time (see the timeout-minutes comment below), so
+    # they're skipped on pull_request entirely and only run on the two
+    # push events that can actually lead to a release: a push to main
+    # itself (the per-commit b<N> release channel) and a v* tag push (the
+    # versioned release channel) — see the `release` job's own `needs`,
+    # which now includes this job for exactly that reason, and its own
+    # identical two-channel `if:` condition below.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     # 5 tests run serialized (--test-threads=1 + lock_serial()), so the
     # worst case sums all 5's own retry budgets: MAX_ATTEMPTS * TIMEOUT
     # (3 * 600s = 30 min) each — a timeout itself never retries (see
@@ -847,7 +863,13 @@ jobs:
   # --------------------------------------------------------------------------
   release:
     name: Release
-    needs: build
+    # All of fmt/build/test/e2e must be green before a release is cut —
+    # not just build. e2e itself only runs on the same two push events
+    # this job's own `if:` below fires on (see e2e's own `if:` comment),
+    # so this `needs` entry lines up with both the main-push and v*-tag
+    # release channels without ever blocking on an e2e run that was
+    # never going to happen for some other event (e.g. a PR).
+    needs: [fmt, build, test, e2e]
     runs-on: ubuntu-24.04
     # Two release channels, both attaching one binary per matrix.target
     # (see the build job above — this is where "all the platforms
