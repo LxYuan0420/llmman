@@ -77,7 +77,32 @@ fn emit_version() {
         None => pkg,
     };
     println!("cargo:rustc-env=LLMMAN_VERSION={version}");
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    // `HEAD` only changes on a checkout/branch switch; an ordinary `git
+    // commit` on the current branch instead updates `logs/HEAD` (the
+    // reflog) — without watching that too, `--dirty`'s output (and so
+    // LLMMAN_VERSION) can go stale across a commit, defeating
+    // stale_daemon's version comparison in daemon.rs. Resolved via
+    // `git rev-parse --git-path` rather than a hardcoded `.git/...` path
+    // so this also reruns correctly from a linked worktree, where the
+    // real HEAD/logs live under `.git/worktrees/<name>/` instead.
+    for path in ["HEAD", "logs/HEAD"] {
+        if let Some(resolved) = git_path(path) {
+            println!("cargo:rerun-if-changed={}", resolved.display());
+        }
+    }
+}
+
+/// Resolves a path relative to the repo's git dir (e.g. `"HEAD"` or
+/// `"logs/HEAD"`) via `git rev-parse --git-path`, so it's correct both for
+/// a plain `.git` directory and a linked worktree's own `.git` file.
+fn git_path(path: &str) -> Option<PathBuf> {
+    Command::new("git")
+        .args(["rev-parse", "--git-path", path])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| PathBuf::from(s.trim()))
 }
 
 fn main() {

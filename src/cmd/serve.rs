@@ -186,8 +186,8 @@ struct RunningModel {
 impl RunningModel {
     fn processor(&self) -> String {
         match &self.process {
-            ModelProcess::Local(Engine::LlamaServer, _) => "llama-server (local)".into(),
-            ModelProcess::Local(Engine::Vllm, _) => "vllm (local)".into(),
+            ModelProcess::Local(Engine::LlamaServer, _, _) => "llama-server (local)".into(),
+            ModelProcess::Local(Engine::Vllm, _, _) => "vllm (local)".into(),
             ModelProcess::Container(ociman, _) => {
                 format!("llama-server (container/{})", ociman.binary())
             }
@@ -196,7 +196,7 @@ impl RunningModel {
 
     fn pid(&self) -> Option<u32> {
         match &self.process {
-            ModelProcess::Local(_, child) => child.id(),
+            ModelProcess::Local(_, child, _) => child.id(),
             ModelProcess::Container(_, child) => child.id(),
         }
     }
@@ -211,22 +211,48 @@ enum Engine {
 }
 
 /// A running inference backend: either a local `llama-server`/`vllm`
-/// process (killed via `Child::kill_on_drop`, as before, set at spawn
-/// time) or an attached `docker run --rm --init -t`/`podman run` process
-/// (see crate::container::spawn's doc comment) — gracefully stopped via
-/// SIGTERM on drop, since the default forceful kill `kill_on_drop` would
-/// use cannot be forwarded to (and so does not stop) the container.
+/// process (killed via `Child::kill_on_drop`, except `Engine::Vllm` —
+/// see this Drop impl) or an attached `docker run`/`podman run` process,
+/// gracefully stopped via SIGTERM on drop since `kill_on_drop`'s SIGKILL
+/// can't be forwarded to (and so doesn't stop) the container.
 enum ModelProcess {
-    Local(Engine, #[allow(dead_code)] tokio::process::Child),
+    // `Option<u32>` is the pid captured right after spawn, not
+    // `child.id()` at drop time: `is_alive`'s `try_wait` reaps the child
+    // once it exits, after which `child.id()` returns `None` — losing the
+    // only pid needed to SIGKILL an `Engine::Vllm` group in Drop below.
+    Local(Engine, tokio::process::Child, Option<u32>),
     Container(crate::container::ContainerManager, tokio::process::Child),
 }
 
 impl Drop for ModelProcess {
     fn drop(&mut self) {
-        if let ModelProcess::Container(_, child) = self {
-            if let Some(pid) = child.id() {
-                crate::container::stop(pid);
+        match self {
+            ModelProcess::Container(_, child) => {
+                if let Some(pid) = child.id() {
+                    crate::container::stop(pid);
+                }
             }
+            // vllm forks its own API-server/engine-core workers, which
+            // don't share a process tree `kill_on_drop`'s single-pid kill
+            // can reach — SIGKILLing just the top pid (e.g. on a
+            // cancelled load) orphans them, still holding GPU memory
+            // indefinitely. spawn_vllm_server puts this child in its own
+            // process group so the whole group can be killed here.
+            #[cfg(unix)]
+            ModelProcess::Local(Engine::Vllm, _, pid) => {
+                if let Some(pid) = pid {
+                    let result = unsafe { libc::kill(-(*pid as libc::pid_t), libc::SIGKILL) };
+                    if result != 0 {
+                        let err = std::io::Error::last_os_error();
+                        eprintln!(
+                            "[llmman] warning: SIGKILL to vllm process group {pid} failed: {err}"
+                        );
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            ModelProcess::Local(Engine::Vllm, _, _) => {}
+            ModelProcess::Local(Engine::LlamaServer, _, _) => {}
         }
     }
 }
@@ -245,7 +271,7 @@ impl ModelProcess {
     /// cheap for.
     fn is_alive(&mut self) -> bool {
         let child = match self {
-            ModelProcess::Local(_, child) => child,
+            ModelProcess::Local(_, child, _) => child,
             ModelProcess::Container(_, child) => child,
         };
         matches!(child.try_wait(), Ok(None))
@@ -674,20 +700,31 @@ async fn spawn_vllm_server(
     model_name: &str,
 ) -> anyhow::Result<tokio::process::Child> {
     let vllm = which_binary("vllm")?;
-    tokio::process::Command::new(&vllm)
-        .args([
-            "serve",
-            model_dir.to_str().context("non-UTF-8 model path")?,
-            "--port",
-            &port.to_string(),
-            "--host",
-            "127.0.0.1",
-            // Register the model under the same name used in API requests so
-            // {"model": "<ref>"} is accepted by vllm's OpenAI-compatible API.
-            "--served-model-name",
-            model_name,
-        ])
-        .kill_on_drop(true)
+    let mut cmd = tokio::process::Command::new(&vllm);
+    cmd.args([
+        "serve",
+        model_dir.to_str().context("non-UTF-8 model path")?,
+        "--port",
+        &port.to_string(),
+        "--host",
+        "127.0.0.1",
+        // Register the model under the same name used in API requests so
+        // {"model": "<ref>"} is accepted by vllm's OpenAI-compatible API.
+        "--served-model-name",
+        model_name,
+    ]);
+    // vllm's default --gpu-memory-utilization (0.9 of the *device's
+    // total* memory) routinely exceeds what's actually free on a
+    // unified-memory host or any box already running other GPU
+    // workloads, so it refuses to start. Let a user work around it.
+    if let Ok(extra) = std::env::var("LLMMAN_VLLM_ARGS") {
+        cmd.args(extra.split_whitespace());
+    }
+    // Own process group so ModelProcess's Drop impl can kill vllm's whole
+    // worker tree, not just this one pid, without also killing ourselves.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawn vllm from {}", vllm.display()))
 }
@@ -928,7 +965,14 @@ async fn check_running(state: &AppState, model_ref: &str) -> Option<u16> {
     None
 }
 
-async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError> {
+/// Ensures `model_ref` is loaded and returns `(canonical_ref, port)`. The
+/// canonical name is what it's actually registered under with its backend
+/// (`--served-model-name`), which can differ from a tagless `model_ref`
+/// (e.g. `hf.co/owner/repo` canonicalizes to `...:latest`). Callers must
+/// forward this canonical name, not their own input, as the "model" field
+/// sent to the backend — vllm validates it strictly and 404s otherwise
+/// (llama-server doesn't, so this went unnoticed for GGUF models).
+async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16), AppError> {
     let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
     // Default the tag before the lock below: otherwise two concurrent
     // first-pulls of e.g. "gemma4" and "gemma4:latest" take different
@@ -938,7 +982,7 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
     let model_ref = model_ref.as_str();
 
     if let Some(port) = check_running(state, model_ref).await {
-        return Ok(port);
+        return Ok((model_ref.to_string(), port));
     }
 
     let _guard = acquire_load_lock(model_ref).await;
@@ -946,7 +990,7 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
     // Someone else may have finished loading this model while we
     // waited for the lock above.
     if let Some(port) = check_running(state, model_ref).await {
-        return Ok(port);
+        return Ok((model_ref.to_string(), port));
     }
 
     // If the model is not in the local store, pull it now.
@@ -970,7 +1014,7 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
 
     // Re-check in case that stored form differs from the key above.
     if let Some(port) = check_running(state, model_ref).await {
-        return Ok(port);
+        return Ok((model_ref.to_string(), port));
     }
 
     let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
@@ -1010,10 +1054,12 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
             let bin = local_llama_server_bin(state).await?;
             let (child, tail) = spawn_llama_server(&bin, path, port, state.0.ctx_size).await?;
             stderr_tail = Some(tail);
-            ModelProcess::Local(Engine::LlamaServer, child)
+            ModelProcess::Local(Engine::LlamaServer, child, None)
         }
         (ModelPath::SafeTensors(dir), _) => {
-            ModelProcess::Local(Engine::Vllm, spawn_vllm_server(dir, port, model_ref).await?)
+            let child = spawn_vllm_server(dir, port, model_ref).await?;
+            let pid = child.id();
+            ModelProcess::Local(Engine::Vllm, child, pid)
         }
     };
     wait_for_ready(&state.0.client, port, &mut process, stderr_tail.as_ref()).await?;
@@ -1029,7 +1075,7 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
             started_at: now_rfc3339(),
         },
     );
-    Ok(port)
+    Ok((model_ref.to_string(), port))
 }
 
 /// Returns the local llama-server binary to spawn: the one resolved at
@@ -1635,16 +1681,31 @@ async fn handle_show(
 
 #[derive(Debug, Deserialize)]
 struct OllamaPullRequest {
+    #[serde(default)]
     model: String,
-    #[serde(alias = "name", default)]
-    _name: String,
+    // Real Ollama keeps `Name` as a deprecated fallback for `Model`
+    // (server/routes.go's `cmp.Or(req.Model, req.Name)`) — some clients
+    // only ever send `name`, which used to 422 outright since `model`
+    // was required. Falls back below like handle_show/handle_delete
+    // already do.
+    #[serde(default)]
+    name: String,
 }
 
 async fn handle_pull(
     State(state): State<AppState>,
     Json(req): Json<OllamaPullRequest>,
 ) -> impl IntoResponse {
-    let model = crate::shortnames::resolve_ollama_api(&req.model);
+    let model_ref = if req.model.is_empty() {
+        req.name.as_str()
+    } else {
+        req.model.as_str()
+    };
+    if model_ref.is_empty() {
+        let body = serde_json::json!({"error": "model is required"});
+        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    }
+    let model = crate::shortnames::resolve_ollama_api(model_ref);
     eprintln!("[llmman] /api/pull model={model:?}");
     let store_path = state.0.store_path.clone();
 
@@ -1687,16 +1748,28 @@ async fn handle_pull(
 
 #[derive(Debug, Deserialize)]
 struct OllamaPushRequest {
+    #[serde(default)]
     model: String,
-    #[serde(alias = "name", default)]
-    _name: String,
+    // See OllamaPullRequest's `name` field doc comment: same deprecated
+    // `Name`-falls-back-to-`Model` shape as real Ollama's PushRequest.
+    #[serde(default)]
+    name: String,
 }
 
 async fn handle_push(
     State(state): State<AppState>,
     Json(req): Json<OllamaPushRequest>,
 ) -> impl IntoResponse {
-    let model = crate::shortnames::resolve_ollama_api(&req.model);
+    let model_ref = if req.model.is_empty() {
+        req.name.as_str()
+    } else {
+        req.model.as_str()
+    };
+    if model_ref.is_empty() {
+        let body = serde_json::json!({"error": "model is required"});
+        return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    }
+    let model = crate::shortnames::resolve_ollama_api(model_ref);
     eprintln!("[llmman] /api/push model={model:?}");
     let store_path = state.0.store_path.clone();
 
@@ -1824,10 +1897,10 @@ async fn handle_ollama_chat(
         req.model,
         req.messages.len()
     );
-    let port = ensure_model(&state, &req.model).await?;
+    let (model, port) = ensure_model(&state, &req.model).await?;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let oai = OAIChatRequest {
-        model: req.model.clone(),
+        model: model.clone(),
         messages: req
             .messages
             .iter()
@@ -1843,7 +1916,6 @@ async fn handle_ollama_chat(
         repeat_penalty: opt_f64(&req.options, "repeat_penalty").or(Some(DEFAULT_REPEAT_PENALTY)),
         chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
     };
-    let model = req.model;
     stream_ollama(
         state.0.client.clone(),
         url,
@@ -1901,7 +1973,7 @@ async fn handle_ollama_generate(
         .into_response());
     }
 
-    let port = ensure_model(&state, &req.model).await?;
+    let (model, port) = ensure_model(&state, &req.model).await?;
     // Empty prompt = load-only request (mirrors ollama server/routes.go:429).
     if req.prompt.is_empty() {
         return Ok(Json(OllamaGenerateChunk {
@@ -1917,7 +1989,7 @@ async fn handle_ollama_generate(
 
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let oai = OAIChatRequest {
-        model: req.model.clone(),
+        model: model.clone(),
         messages: vec![OAIMessage {
             role: "user".into(),
             content: req.prompt.clone(),
@@ -1929,7 +2001,6 @@ async fn handle_ollama_generate(
         repeat_penalty: opt_f64(&req.options, "repeat_penalty").or(Some(DEFAULT_REPEAT_PENALTY)),
         chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
     };
-    let model = req.model;
     stream_ollama(
         state.0.client.clone(),
         url,
@@ -1971,21 +2042,23 @@ async fn handle_openai_models(
     Ok(Json(serde_json::json!({ "object": "list", "data": data })))
 }
 
-/// Shared body of every plain OpenAI-passthrough route: parse just enough of
-/// the request to find `model`, make sure it's loaded, then proxy the
-/// untouched request body straight through to llama-server's equivalent
-/// endpoint. `llama_path` is the only thing that differs between
-/// handle_openai_chat/completions/embeddings below.
+/// Shared body of every plain OpenAI-passthrough route: parse just enough
+/// of the request to find `model`, make sure it's loaded, rewrite `model`
+/// to its canonical name (see `ensure_model`), then proxy through to the
+/// backend's equivalent endpoint. `llama_path` is the only thing that
+/// differs between handle_openai_chat/completions/embeddings below.
 async fn proxy_openai(
     state: &AppState,
     headers: &HeaderMap,
     body: Bytes,
     llama_path: &str,
 ) -> Result<Response, AppError> {
-    let req: serde_json::Value =
+    let mut req: serde_json::Value =
         serde_json::from_slice(&body).context("parse OpenAI request body")?;
     let model = req["model"].as_str().unwrap_or("").to_string();
-    let port = ensure_model(state, &model).await?;
+    let (model, port) = ensure_model(state, &model).await?;
+    req["model"] = serde_json::Value::String(model);
+    let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
     let url = format!("http://127.0.0.1:{port}{llama_path}");
     proxy(&state.0.client, &url, headers, body).await
 }
@@ -2208,13 +2281,15 @@ async fn handle_anthropic_messages(
     State(state): State<AppState>,
     Json(req): Json<AnthropicRequest>,
 ) -> Result<Response, AppError> {
-    let port = ensure_model(&state, &req.model).await?;
+    // Backend needs its canonical name (see ensure_model); the response
+    // below still echoes req.model back, unchanged from before.
+    let (canonical_model, port) = ensure_model(&state, &req.model).await?;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
 
     let messages = build_anthropic_messages(&req);
 
     let oai = OAIChatRequest {
-        model: req.model.clone(),
+        model: canonical_model,
         messages,
         stream: req.stream,
         temperature: req.temperature,
@@ -2989,5 +3064,36 @@ mod tests {
             !LOAD_LOCKS.lock().unwrap().contains_key(key),
             "aborting a task holding LoadLockGuard must still release the registry entry"
         );
+    }
+
+    /// Regression test for `OllamaPullRequest`'s `name` field: a body
+    /// carrying only `{"name": "..."}` used to fail Axum's `Json`
+    /// extraction outright — `model` was a required, non-default field —
+    /// before this handler's own name-falls-back-to-model logic ever ran.
+    #[test]
+    fn ollama_pull_request_accepts_a_name_only_body() {
+        let req: OllamaPullRequest =
+            serde_json::from_value(serde_json::json!({"name": "docker.io/ai/gemma4:E2B"}))
+                .expect("a name-only body must still deserialize");
+        assert_eq!(req.model, "");
+        assert_eq!(req.name, "docker.io/ai/gemma4:E2B");
+    }
+
+    #[test]
+    fn ollama_pull_request_accepts_a_model_only_body() {
+        let req: OllamaPullRequest =
+            serde_json::from_value(serde_json::json!({"model": "docker.io/ai/gemma4:E2B"}))
+                .expect("a model-only body must still deserialize");
+        assert_eq!(req.model, "docker.io/ai/gemma4:E2B");
+        assert_eq!(req.name, "");
+    }
+
+    #[test]
+    fn ollama_push_request_accepts_a_name_only_body() {
+        let req: OllamaPushRequest =
+            serde_json::from_value(serde_json::json!({"name": "docker.io/ai/gemma4:E2B"}))
+                .expect("a name-only body must still deserialize");
+        assert_eq!(req.model, "");
+        assert_eq!(req.name, "docker.io/ai/gemma4:E2B");
     }
 }
