@@ -213,12 +213,19 @@ pub fn pull_image(ociman: ContainerManager, llama_cpp_version: Option<&str>) -> 
 /// containerized `llama-server` — see
 /// `cmd::serve::context_length_from_env`'s doc comment for what this
 /// does and doesn't guarantee.
+///
+/// `flash_attention` and `kv_cache_type`, when given, are forwarded the
+/// same way as `--flash-attn <mode>` and `--cache-type-k`/`--cache-type-v
+/// <type>` respectively — see `cmd::serve::flash_attention_from_env` and
+/// `cmd::serve::kv_cache_type_from_env`'s doc comments.
 pub fn spawn(
     ociman: ContainerManager,
     model_path: &Path,
     port: u16,
     llama_cpp_version: Option<&str>,
     ctx_size: Option<u32>,
+    flash_attention: Option<&str>,
+    kv_cache_type: Option<&str>,
 ) -> Result<tokio::process::Child> {
     let backend = detect_backend();
     let image = backend.image_ref(llama_cpp_version);
@@ -275,6 +282,16 @@ pub fn spawn(
     if let Some(n) = ctx_size {
         args.push("--ctx-size".into());
         args.push(n.to_string());
+    }
+    if let Some(mode) = flash_attention {
+        args.push("--flash-attn".into());
+        args.push(mode.to_string());
+    }
+    if let Some(t) = kv_cache_type {
+        args.push("--cache-type-k".into());
+        args.push(t.to_string());
+        args.push("--cache-type-v".into());
+        args.push(t.to_string());
     }
 
     tokio::process::Command::new(ociman.binary())

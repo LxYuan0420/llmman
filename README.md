@@ -11,6 +11,7 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 | `serve`   | Start an inference server (Ollama / OpenAI / Anthropic APIs) |
 | `launch`  | Launch an integration (Claude Code, OpenCode, …) |
 | `run`     | Run a model interactively or with a one-shot prompt |
+| `bench`   | Measure prefill/decode throughput for one or more served models |
 | `pull`    | Pull a model from a registry or HuggingFace |
 | `resolve` | Pull (if needed) and print the local path of a model, as JSON — for other tools to consume |
 | `list`    | List locally stored models |
@@ -98,6 +99,29 @@ An idle, unused model is automatically unloaded after `keep_alive`
 (default 5 minutes, matching Ollama — set per-request, or daemon-wide via
 `LLMMAN_KEEP_ALIVE`), and `llmman ps`/`/api/ps` reports each model's
 `expires_at`.
+
+Daemon-wide `llama-server` tuning, set before `llmman serve` starts:
+
+| Variable | Effect |
+|----------|--------|
+| `LLMMAN_CONTEXT_LENGTH` | Context size (`--ctx-size`) for every model this daemon loads. Defaults to a VRAM-tiered value when unset. |
+| `LLMMAN_FLASH_ATTENTION` | Flash Attention mode (`--flash-attn`): `on`, `off`, or `auto` (llama-server's own default). Also accepts `1`/`0`/`true`/`false`, matching Ollama's `OLLAMA_FLASH_ATTENTION`. |
+| `LLMMAN_KV_CACHE_TYPE` | KV-cache quantization (`--cache-type-k`/`--cache-type-v`), e.g. `f16` (default), `q8_0`, `q4_0` — trades output quality for memory at long context lengths, matching Ollama's `OLLAMA_KV_CACHE_TYPE`. |
+
+### Benchmark
+
+Measure prefill/decode throughput for one or more models already reachable through `llmman serve` (starting the daemon if needed, same as `run`):
+
+```
+llmman bench -m gemma4 --epochs 5
+```
+
+```
+MODEL   PREFILL tok/s  DECODE tok/s  TTFT   TOTAL  PROMPT tok  COMPLETION tok
+gemma4         1302.3         241.0  0.02s  1.26s          24             300
+```
+
+Compare multiple models in one run with a comma-separated list (`-m gemma4,qwen3`), control the generated response length with `--max-tokens`, and target a specific prompt length with `--prompt-tokens` instead of the default story prompt. `--format csv` prints machine-readable output instead of the table above.
 
 ### Launch an integration
 

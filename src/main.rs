@@ -36,6 +36,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Measure prefill/decode throughput for one or more served models
+    Bench(cmd::bench::BenchArgs),
     /// Launch an integration
     Launch(cmd::launch::LaunchArgs),
     /// Run a model interactively or with a one-shot prompt
@@ -108,6 +110,7 @@ fn main() {
 
     let cli = Cli::parse();
     let result = match &cli.command {
+        Commands::Bench(a) => cmd::bench::run(a),
         Commands::Launch(a) => cmd::launch::run(a),
         Commands::Run(a) => cmd::run::run(a),
         Commands::Build(a) => cmd::build::run(a),
