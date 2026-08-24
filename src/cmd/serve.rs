@@ -172,6 +172,28 @@ struct RunningModel {
     /// `ps` output today.
     size: u64,
     started_at: String,
+    /// Monotonic clock reading of this model's last activity (a request
+    /// completing, or the model just finishing loading) — compared
+    /// against `keep_alive` by `reap_idle_models`. A `tokio::time::Instant`
+    /// rather than a wall-clock time so a system clock change (NTP step,
+    /// suspend/resume) can't cause a premature or delayed unload.
+    last_active: Instant,
+    /// Wall-clock twin of `last_active`, kept only so `handle_ps` can
+    /// report a real `expires_at` timestamp — `Instant` has no meaningful
+    /// conversion to one.
+    last_active_wall: chrono::DateTime<chrono::Utc>,
+    /// How long after `last_active` this model should be automatically
+    /// unloaded; `None` means "never" (Ollama's `keep_alive: -1`). Updated
+    /// by `ActivityGuard` on every `/api/chat` and `/api/generate`
+    /// request, and by `refresh_activity` for a load-only request that
+    /// only wants to set/extend it.
+    keep_alive: Option<Duration>,
+    /// Count of requests currently being served by this model.
+    /// `reap_idle_models` never unloads a model with `in_flight > 0`,
+    /// however far past its `keep_alive` deadline `last_active` is — see
+    /// `ActivityGuard`'s doc comment for why a generation slower than its
+    /// own `keep_alive` must not be killed mid-stream.
+    in_flight: u32,
 }
 
 /// Which engine is actually serving requests for a [`RunningModel`] — surfaced
@@ -279,12 +301,47 @@ impl ModelProcess {
 // Ollama API types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct OllamaMessage {
     role: String,
+    #[serde(default)]
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
+    /// Base64-encoded image bytes (no `data:` prefix — matches Ollama's
+    /// own wire format), one per attached image. Only meaningful on a
+    /// request message; a response message never sets this. See
+    /// `ollama_message_to_oai` for how these become OpenAI-style
+    /// `image_url` content parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<String>>,
+    /// Set on an assistant response message that calls one or more tools
+    /// (see `handle_ollama_chat`), and accepted back on a request message
+    /// so multi-turn tool-calling history round-trips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OllamaToolCall>>,
+    /// Ollama's tool-result message (`role: "tool"`) carries the name of
+    /// the tool it's a result for, but — unlike OpenAI's `tool_call_id` —
+    /// no id linking it back to a specific call. See
+    /// `ollama_message_to_oai`'s doc comment for the limitation that
+    /// implies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+}
+
+/// Ollama's tool-call shape (`api.ToolCall` in ollama/api/types.go):
+/// `{"function": {"name": ..., "arguments": {...}}}` — unlike OpenAI's
+/// `arguments` (a JSON-encoded *string*), Ollama's is already a decoded
+/// JSON object, and there is no top-level `id`/`type`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+struct OllamaToolCall {
+    function: OllamaToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+struct OllamaToolCallFunction {
+    name: String,
+    arguments: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,6 +357,20 @@ struct OllamaChatRequest {
     /// level"). See `think_to_chat_template_kwargs`.
     #[serde(default)]
     think: Option<serde_json::Value>,
+    /// Tool/function definitions, in the same shape OpenAI's `tools`
+    /// field uses (Ollama's own tool schema is already
+    /// OpenAI-function-tool compatible) — passed straight through to
+    /// llama-server. See `handle_ollama_chat`.
+    #[serde(default)]
+    tools: Option<serde_json::Value>,
+    /// `"json"` for unconstrained-schema JSON mode, or a JSON Schema
+    /// object for constrained structured output. See
+    /// `format_to_response_format`.
+    #[serde(default)]
+    format: Option<serde_json::Value>,
+    /// See `OllamaGenerateRequest::keep_alive`.
+    #[serde(default)]
+    keep_alive: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,12 +381,40 @@ struct OllamaGenerateRequest {
     #[serde(default = "bool_true")]
     stream: bool,
     options: Option<serde_json::Value>,
-    /// keep_alive: 0 with an empty prompt is the Ollama unload signal
+    /// keep_alive: 0 with an empty prompt is the Ollama unload signal;
+    /// otherwise resolved (see `resolve_keep_alive`) into how long this
+    /// model should stay loaded once idle.
     #[serde(default)]
     keep_alive: Option<serde_json::Value>,
     /// See `OllamaChatRequest::think`.
     #[serde(default)]
     think: Option<serde_json::Value>,
+    /// See `OllamaChatRequest::format`. `/api/generate` has no `tools`
+    /// field in real Ollama either — only `/api/chat` supports tool
+    /// calling.
+    #[serde(default)]
+    format: Option<serde_json::Value>,
+}
+
+/// Maps Ollama's `format` request field to the OpenAI-style
+/// `response_format` llama-server's `/v1/chat/completions` expects:
+/// `"json"` becomes unconstrained JSON-object mode, and a JSON Schema
+/// object becomes constrained (grammar-backed) structured output. Absent
+/// or any other JSON type (Ollama documents only these two) is a no-op —
+/// exactly as if the field weren't sent at all, matching
+/// `think_to_chat_template_kwargs`'s own handling of shapes with no
+/// equivalent.
+fn format_to_response_format(format: &Option<serde_json::Value>) -> Option<serde_json::Value> {
+    match format {
+        Some(serde_json::Value::String(s)) if s == "json" => {
+            Some(serde_json::json!({ "type": "json_object" }))
+        }
+        Some(schema @ serde_json::Value::Object(_)) => Some(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": { "name": "response", "schema": schema, "strict": true }
+        })),
+        _ => None,
+    }
 }
 
 /// Translates Ollama's own `think` request field into the
@@ -393,6 +492,16 @@ struct OllamaPsResponse {
 struct OllamaRunningModelInfo {
     name: String,
     model: String,
+    /// When this model will be automatically unloaded if left idle —
+    /// `None` (serialized as JSON `null`) when its `keep_alive` is
+    /// "forever" (see `RunningModel::keep_alive`); real Ollama instead
+    /// sends the sentinel zero time `"0001-01-01T00:00:00Z"` for that
+    /// case, which every Ollama-API client already treats as "far future
+    /// timestamp, not a real deadline" rather than parsing it — `null` is
+    /// less surprising to a client not expecting Go's zero-value
+    /// convention, and is exactly how `handle_show`/etc. already spell
+    /// "not applicable" elsewhere in this module.
+    expires_at: Option<String>,
     // Real Ollama /api/ps shape ends here (see api.ProcessModelResponse in
     // ollama/api/types.go); the fields below are llmman-specific additions
     // for `llmman ps` — safe for any other Ollama-API client to ignore.
@@ -483,10 +592,133 @@ impl AnthropicContent {
 // OpenAI types (internal proxy use)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq, Default)]
 struct OAIMessage {
     role: String,
-    content: String,
+    /// A plain JSON string for an ordinary text message, or an array of
+    /// OpenAI "content part" objects (`{"type":"text",...}` /
+    /// `{"type":"image_url",...}`) for a multimodal one — see
+    /// `ollama_message_to_oai`. `serde_json::Value` rather than a typed
+    /// enum since content parts are only ever built here, never parsed
+    /// back out.
+    content: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OAIToolCall>>,
+    /// Only meaningful on a `role: "tool"` message: which tool this is a
+    /// result for. Ollama's own wire format has no `tool_call_id`
+    /// equivalent (see `OllamaMessage::tool_name`'s doc comment) — set
+    /// from that field on a best-effort basis so name-matching chat
+    /// templates still work, even though a strict id-matching one won't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+impl OAIMessage {
+    /// Build a plain text message — the common case, and the only shape
+    /// needed anywhere images/tool-calls/tool-results aren't in play
+    /// (`/api/generate`, the Anthropic Messages API).
+    fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: serde_json::Value::String(content.into()),
+            tool_calls: None,
+            name: None,
+        }
+    }
+}
+
+/// OpenAI's assistant-message tool-call shape (distinct from
+/// [`OllamaToolCall`]): a top-level `id`/`type`, and `function.arguments`
+/// as a JSON-*encoded string* rather than a decoded object.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct OAIToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    type_: &'static str,
+    function: OAIToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct OAIToolCallFunction {
+    name: String,
+    arguments: String,
+}
+
+/// Converts one incoming [`OllamaMessage`] into the OpenAI-shaped message
+/// llama-server expects, handling the three cases Ollama's own format
+/// supports that a plain `{role, content}` pair can't:
+///
+/// - `images`: turned into `image_url` content parts alongside a leading
+///   `text` part, per the OpenAI vision message convention llama-server's
+///   multimodal chat template expects. A bare base64 string (Ollama's own
+///   format — no `data:` prefix) is wrapped in a `data:image/*;base64,`
+///   URI; a value that already looks like a data URI is passed through
+///   unchanged.
+/// - `tool_calls`: carried onto an assistant message so multi-turn
+///   tool-calling history round-trips; Ollama's `arguments` (already a
+///   decoded JSON value) is re-encoded to the JSON *string* OpenAI's
+///   schema requires.
+/// - `tool_name` on a `role: "tool"` message: mapped to `name`, the
+///   closest OpenAI equivalent llama-server's chat templates read Ollama's
+///   `tool_call_id` are not surfaced to `/api/chat` callers).
+fn ollama_message_to_oai(m: &OllamaMessage) -> OAIMessage {
+    let content = match &m.images {
+        Some(images) if !images.is_empty() => {
+            let mut parts = Vec::with_capacity(images.len() + 1);
+            if !m.content.is_empty() {
+                parts.push(serde_json::json!({ "type": "text", "text": m.content }));
+            }
+            for image in images {
+                parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": image_data_uri(image) }
+                }));
+            }
+            serde_json::Value::Array(parts)
+        }
+        _ => serde_json::Value::String(m.content.clone()),
+    };
+    let tool_calls = m.tool_calls.as_ref().map(|calls| {
+        calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| OAIToolCall {
+                // gen_id() alone is time-based and can collide when called
+                // back-to-back for multiple tool calls in one message (a
+                // coarse clock could return the same reading twice) — the
+                // index makes each id unique within this message even
+                // then.
+                id: format!("{}_{i}", gen_id()),
+                type_: "function",
+                function: OAIToolCallFunction {
+                    name: c.function.name.clone(),
+                    arguments: c.function.arguments.to_string(),
+                },
+            })
+            .collect()
+    });
+    OAIMessage {
+        role: m.role.clone(),
+        content,
+        tool_calls,
+        name: m.tool_name.clone(),
+    }
+}
+
+/// Wraps a bare base64 image (Ollama's own `images` wire format) in a
+/// `data:` URI for llama-server's OpenAI-compatible `image_url` content
+/// part. `image/png` is a placeholder mime type — llama.cpp's clip
+/// decoder sniffs the actual format from the decoded bytes' own magic
+/// number rather than trusting this, so an arbitrary supported format
+/// (JPEG, WEBP, ...) still decodes correctly despite the label. Passed
+/// through unchanged if the caller already sent a full data URI (not
+/// Ollama's documented format, but harmless to accept).
+fn image_data_uri(base64_bytes: &str) -> String {
+    if base64_bytes.starts_with("data:") {
+        base64_bytes.to_string()
+    } else {
+        format!("data:image/png;base64,{base64_bytes}")
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -514,6 +746,12 @@ struct OAIChatRequest {
     // existed.
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<serde_json::Value>,
+    /// See `OllamaChatRequest::tools` — passed straight through.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<serde_json::Value>,
+    /// See `format_to_response_format`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
 }
 
 /// Ollama's documented default for `repeat_penalty` (see
@@ -544,6 +782,112 @@ struct OAIChunkDelta {
     /// The git repo uses "thinking" — accept both for forward compatibility.
     reasoning_content: Option<String>,
     thinking: Option<String>,
+    /// OpenAI-style streaming tool-call deltas — see
+    /// `oai_chunk_tool_call_deltas`/`ToolCallAccumulator`.
+    #[serde(default)]
+    tool_calls: Option<Vec<OAIToolCallDelta>>,
+}
+
+/// One fragment of one streamed tool call. Mirrors OpenAI's streaming
+/// shape: `function.name` normally arrives whole in the first delta for a
+/// given `index`, while `function.arguments` arrives incrementally as a
+/// partial JSON string across many deltas — see `ToolCallAccumulator`.
+/// (OpenAI's streaming shape also carries a top-level `id` on that first
+/// delta; deliberately not deserialized here — [`OllamaToolCall`], the
+/// only shape it ever needs to flow into, has no `id` field to carry it
+/// to.)
+#[derive(Debug, Deserialize, Default)]
+struct OAIToolCallDelta {
+    index: usize,
+    #[serde(default)]
+    function: Option<OAIToolCallFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OAIToolCallFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// Accumulates one tool call's streamed fragments (see
+/// [`OAIToolCallDelta`]) by index, across an entire `/api/chat` response —
+/// `stream_ollama` keeps one `BTreeMap<usize, ToolCallAccumulator>` per
+/// request and finalizes it (`finalize_tool_calls`) once the stream's
+/// `done` chunk arrives.
+#[derive(Default, Clone)]
+struct ToolCallAccumulator {
+    name: String,
+    arguments: String,
+}
+
+/// Extracts this SSE payload's tool-call deltas, if any — `[]` for the
+/// `[DONE]` sentinel (no JSON to parse) or any payload without a
+/// `tool_calls` delta, never an error, matching `oai_chunk_to_content`'s
+/// own "malformed/absent is empty, not fatal" handling.
+fn oai_chunk_tool_call_deltas(payload: &str) -> Vec<OAIToolCallDelta> {
+    if payload == "[DONE]" {
+        return Vec::new();
+    }
+    serde_json::from_str::<OAIChunk>(payload)
+        .ok()
+        .and_then(|c| c.choices.into_iter().next())
+        .and_then(|c| c.delta.tool_calls)
+        .unwrap_or_default()
+}
+
+/// Folds one SSE payload's tool-call deltas into `acc`, keyed by their
+/// streaming `index`. Pure bookkeeping — the actual arguments string is
+/// only parsed as JSON once complete, by `finalize_tool_calls`.
+fn accumulate_tool_call_deltas(
+    payload: &str,
+    acc: &std::cell::RefCell<std::collections::BTreeMap<usize, ToolCallAccumulator>>,
+) {
+    let deltas = oai_chunk_tool_call_deltas(payload);
+    if deltas.is_empty() {
+        return;
+    }
+    let mut acc = acc.borrow_mut();
+    for delta in deltas {
+        let entry = acc.entry(delta.index).or_default();
+        if let Some(f) = delta.function {
+            if let Some(name) = f.name {
+                entry.name.push_str(&name);
+            }
+            if let Some(args) = f.arguments {
+                entry.arguments.push_str(&args);
+            }
+        }
+    }
+}
+
+/// Turns the accumulated tool-call fragments into Ollama's own
+/// `tool_calls` shape once a response is `done`. Each call's `arguments`
+/// string (a JSON object, incrementally assembled — see
+/// [`OAIToolCallDelta`]) is parsed back into a decoded `serde_json::Value`
+/// here, since Ollama's `OllamaToolCallFunction::arguments` — unlike
+/// OpenAI's — is a JSON object, not a string. An empty accumulator (no
+/// tool calls made) yields `None` rather than `Some(vec![])`, so
+/// `OllamaMessage`'s `tool_calls` field is omitted entirely for an
+/// ordinary text response.
+fn finalize_tool_calls(
+    acc: &std::collections::BTreeMap<usize, ToolCallAccumulator>,
+) -> Option<Vec<OllamaToolCall>> {
+    if acc.is_empty() {
+        return None;
+    }
+    Some(
+        acc.values()
+            .map(|c| OllamaToolCall {
+                function: OllamaToolCallFunction {
+                    name: c.name.clone(),
+                    arguments: serde_json::from_str(&c.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                },
+            })
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +928,300 @@ fn gen_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{secs:032x}")
+}
+
+// ---------------------------------------------------------------------------
+// Idle-timeout auto-unload (`keep_alive`)
+//
+// Mirrors Ollama's own idle-unload scheduler (server/sched.go): every
+// loaded model carries a `keep_alive` duration and a last-activity
+// timestamp (see `RunningModel`); a background task (`reap_idle_models`,
+// spawned once from `serve_async`) periodically unloads whichever models
+// have gone unused past their own deadline. `ActivityGuard` is what keeps
+// that timer from firing mid-generation.
+// ---------------------------------------------------------------------------
+
+/// Ollama's documented default `keep_alive`: an idle, unused model is
+/// unloaded after 5 minutes (see ollama's docs/faq.mdx, "How do I keep a
+/// model loaded in memory or make it unload immediately?"). Applies
+/// whenever a request omits `keep_alive` entirely, or supplies a value
+/// that fails to parse.
+const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(5 * 60);
+
+/// The daemon-wide `keep_alive` to fall back on: [`DEFAULT_KEEP_ALIVE`],
+/// unless overridden by `LLMMAN_KEEP_ALIVE` (mirrors Ollama's own
+/// `OLLAMA_KEEP_ALIVE` env var), parsed with the same syntax as the
+/// per-request `keep_alive` field — see `parse_keep_alive_str`.
+fn default_keep_alive() -> Option<Duration> {
+    match std::env::var("LLMMAN_KEEP_ALIVE") {
+        Ok(v) => parse_keep_alive_str(&v).unwrap_or(Some(DEFAULT_KEEP_ALIVE)),
+        Err(_) => Some(DEFAULT_KEEP_ALIVE),
+    }
+}
+
+/// Resolves a request's `keep_alive` field to how long this daemon should
+/// wait, after the request finishes, before automatically unloading the
+/// model. `None` means "never". Falls back to [`default_keep_alive`] both
+/// when the field is absent and when present but unparseable — same as
+/// Ollama's own `api.Duration` silently keeping its default on a bad
+/// input rather than 400ing the whole request over it.
+fn resolve_keep_alive(value: &Option<serde_json::Value>) -> Option<Duration> {
+    value
+        .as_ref()
+        .and_then(parse_keep_alive_value)
+        .unwrap_or_else(default_keep_alive)
+}
+
+/// `None` = couldn't parse `v` as a keep_alive value at all (caller falls
+/// back to the daemon default). `Some(None)` = "never unload" (a negative
+/// number). `Some(Some(d))` = "unload after `d` of inactivity".
+fn parse_keep_alive_value(v: &serde_json::Value) -> Option<Option<Duration>> {
+    match v {
+        // secs_to_keep_alive rather than a bare `Duration::from_secs_f64`
+        // call: JSON itself can't spell NaN/Infinity, but a huge finite
+        // literal (e.g. `1e300`) still overflows Duration's own range, and
+        // `from_secs_f64` panics rather than erroring on that — see its
+        // own doc comment for why this must never panic on client input.
+        serde_json::Value::Number(n) => secs_to_keep_alive(n.as_f64()?),
+        serde_json::Value::String(s) => parse_keep_alive_str(s),
+        _ => None,
+    }
+}
+
+/// Converts a parsed seconds value to a keep_alive result without ever
+/// panicking, regardless of what a client sent: negative (including
+/// `-inf`) means "never unload"; anything `Duration::try_from_secs_f64`
+/// itself rejects — NaN, `+inf`, or a finite value too large to fit in a
+/// `Duration` — is treated as unparseable (`None`, the same as malformed
+/// input), not a crash. `Duration::from_secs_f64` (the panicking
+/// counterpart used nowhere in this module) would abort the whole request
+/// task on exactly the inputs this function exists to reject harmlessly —
+/// see rust-lang's own `Duration::from_secs_f64` docs ("Panics if the
+/// provided seconds is negative, overflows the internal representation of
+/// Duration or is otherwise invalid").
+fn secs_to_keep_alive(secs: f64) -> Option<Option<Duration>> {
+    if secs < 0.0 {
+        return Some(None);
+    }
+    Duration::try_from_secs_f64(secs).ok().map(Some)
+}
+
+/// Parses a `keep_alive` duration string: a bare number of seconds (e.g.
+/// `"300"`), a negative value meaning "never unload" (e.g. `"-1"`), or a
+/// sequence of `<number><unit>` pairs using the units Ollama's own docs
+/// show (`h`, `m`, `s`, `ms`) — e.g. `"10m"`, `"1h30m"`. A small,
+/// deliberately non-exhaustive subset of Go's `time.ParseDuration` (no
+/// `ns`/`us`, no fractional-only forms beyond what `str::parse::<f64>`
+/// already accepts per component) — enough for every value Ollama's own
+/// documentation and SDKs actually produce.
+fn parse_keep_alive_str(s: &str) -> Option<Option<Duration>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // f64's own FromStr also accepts "inf"/"infinity"/"nan" (any case) as
+    // a bare number — secs_to_keep_alive (not a raw `Duration::
+    // from_secs_f64`) is what keeps those from panicking instead of just
+    // falling through to "unparseable" below.
+    if let Ok(secs) = s.parse::<f64>() {
+        return secs_to_keep_alive(secs);
+    }
+    if s.starts_with('-') {
+        // A negative duration string (e.g. "-1m") — Ollama treats any
+        // negative keep_alive as "forever" regardless of unit.
+        return Some(None);
+    }
+    let mut total = Duration::ZERO;
+    let mut rest = s;
+    let mut matched_any = false;
+    while !rest.is_empty() {
+        let digits_end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        if digits_end == 0 {
+            return None;
+        }
+        let (num_str, tail) = rest.split_at(digits_end);
+        let num: f64 = num_str.parse().ok()?;
+        // Order matters: "ms" must be checked before "m" alone matches
+        // its leading byte.
+        let (secs, tail) = if let Some(t) = tail.strip_prefix("ms") {
+            (num / 1000.0, t)
+        } else if let Some(t) = tail.strip_prefix('h') {
+            (num * 3600.0, t)
+        } else if let Some(t) = tail.strip_prefix('m') {
+            (num * 60.0, t)
+        } else if let Some(t) = tail.strip_prefix('s') {
+            (num, t)
+        } else {
+            return None;
+        };
+        // A component that individually overflows Duration (e.g. a huge
+        // digit string like "999999999999999s"), or that overflows once
+        // added to the running total (e.g. two such components back to
+        // back), invalidates the whole string, same as any other
+        // unparseable input — never panic on it (see
+        // secs_to_keep_alive's doc comment; plain `total += ...` panics
+        // on overflow the same way `Duration::from_secs_f64` does).
+        let component = Duration::try_from_secs_f64(secs).ok()?;
+        total = total.checked_add(component)?;
+        rest = tail;
+        matched_any = true;
+    }
+    matched_any.then_some(Some(total))
+}
+
+/// Directly sets a running model's `keep_alive` deadline and resets its
+/// idle clock to now, without touching `in_flight` — used by a load-only
+/// `/api/generate` request (empty prompt, not the unload sentinel), which
+/// wants to set/refresh a model's `keep_alive` without itself counting as
+/// an in-flight generation. A no-op if the model isn't (or is no longer)
+/// running.
+async fn refresh_activity(state: &AppState, model_key: &str, keep_alive: Option<Duration>) {
+    let mut mgr = state.0.manager.lock().await;
+    if let Some(m) = mgr.running.get_mut(model_key) {
+        m.last_active = Instant::now();
+        m.last_active_wall = chrono::Utc::now();
+        m.keep_alive = keep_alive;
+    }
+}
+
+/// Held for the duration of one `/api/chat`, `/api/generate`, `/v1/*`, or
+/// `/v1/messages` request against `model_key`. While at least one
+/// `ActivityGuard` for a model is outstanding, `reap_idle_models` will
+/// never unload it — regardless of how long its `keep_alive` deadline has
+/// already passed — so a generation slower than its own `keep_alive`
+/// can't be killed mid-stream. On drop (successful completion, client
+/// disconnect, or panic) it resets the idle clock to now and, if this
+/// request carried an explicit `keep_alive` override, records it for the
+/// *next* idle check — mirroring Ollama's own runner refcounting
+/// (llm/server.go) at a coarser, whole-model granularity.
+///
+/// Must be moved into (captured by) whatever `Stream`/`Body` backs the
+/// actual HTTP response — see `stream_ollama`, `stream_anthropic`, and
+/// `proxy` — so it isn't dropped until the response has actually finished
+/// being sent, not merely until the handler function that built it
+/// returns.
+struct ActivityGuard {
+    state: AppState,
+    model_key: String,
+    /// `None` = leave this model's stored `keep_alive` exactly as it is
+    /// (used by the OpenAI-compatible and Anthropic surfaces, which have
+    /// no `keep_alive` field of their own to read an override from — see
+    /// `begin_activity`'s doc comment for why overwriting it with the
+    /// daemon default from those routes would be wrong). `Some(v)` sets
+    /// it to `v` (`v` itself: `None` = forever, `Some(d)` = idle timeout
+    /// `d`) — used by `/api/chat` and `/api/generate`, which always
+    /// resolve an explicit value (a request's own `keep_alive`, or the
+    /// daemon default when it's absent) via `resolve_keep_alive`.
+    keep_alive: Option<Option<Duration>>,
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        let state = self.state.clone();
+        let model_key = std::mem::take(&mut self.model_key);
+        let keep_alive = self.keep_alive;
+        // Drop can't be async; the update is best-effort and doesn't need
+        // to happen before this function returns. tokio::spawn panics
+        // outside a running Tokio runtime (e.g. this guard outliving the
+        // runtime during process teardown) — Handle::try_current lets that
+        // case be skipped instead of panicking mid-unwind.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let mut mgr = state.0.manager.lock().await;
+            if let Some(m) = mgr.running.get_mut(&model_key) {
+                m.in_flight = m.in_flight.saturating_sub(1);
+                m.last_active = Instant::now();
+                m.last_active_wall = chrono::Utc::now();
+                if let Some(kx) = keep_alive {
+                    m.keep_alive = kx;
+                }
+            }
+        });
+    }
+}
+
+/// Marks `model_key` as having one more in-flight request and returns the
+/// guard that un-marks it (and starts its idle clock) on drop — see
+/// [`ActivityGuard`]. Applies a `Some` `keep_alive` override immediately
+/// too (not just on drop), so a model can't be reaped while this request
+/// is still waiting on something upstream of actually streaming a
+/// response; a `None` override never touches `keep_alive` at all, here or
+/// on drop, exactly as if this request hadn't happened (`last_active` is
+/// still always refreshed, both here and on drop, regardless). A no-op
+/// (the returned guard's drop will be too) if `model_key` isn't found —
+/// defensive only; every caller obtains it from `ensure_model`
+/// immediately beforehand.
+async fn begin_activity(
+    state: &AppState,
+    model_key: &str,
+    keep_alive: Option<Option<Duration>>,
+) -> ActivityGuard {
+    {
+        let mut mgr = state.0.manager.lock().await;
+        if let Some(m) = mgr.running.get_mut(model_key) {
+            m.in_flight += 1;
+            m.last_active = Instant::now();
+            m.last_active_wall = chrono::Utc::now();
+            if let Some(kx) = keep_alive {
+                m.keep_alive = kx;
+            }
+        }
+    }
+    ActivityGuard {
+        state: state.clone(),
+        model_key: model_key.to_string(),
+        keep_alive,
+    }
+}
+
+/// How often the idle-unload reaper (see `reap_idle_models`) wakes up to
+/// check every running model's `keep_alive` deadline — independent of
+/// `keep_alive` itself, this just bounds how late an expiry can be
+/// noticed, not how soon.
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Runs forever in the background (spawned once from `serve_async`),
+/// automatically unloading any model whose `keep_alive` idle deadline has
+/// passed — the daemon-wide equivalent of Ollama's own scheduler
+/// idle-unload. Skips any model with `keep_alive: None` ("never") or an
+/// in-flight request (`in_flight > 0`) — see [`ActivityGuard`]'s doc
+/// comment for why the latter matters.
+async fn reap_idle_models(state: AppState) {
+    let mut ticker = tokio::time::interval(IDLE_CHECK_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        reap_idle_models_once(&state).await;
+    }
+}
+
+/// One pass of `reap_idle_models`'s loop body, split out so it can be
+/// driven directly (without waiting on real wall-clock ticks) by
+/// `reap_idle_models_unloads_only_idle_expired_models_not_in_flight_or_forever`.
+async fn reap_idle_models_once(state: &AppState) {
+    // Find-then-remove under one held lock, not two separate acquisitions:
+    // a `begin_activity` could otherwise land in between (bumping
+    // `in_flight` and refreshing `keep_alive`/`last_active` for a request
+    // that's just starting) and this would still remove the entry out from
+    // under it, killing a request that had already begun.
+    let mut mgr = state.0.manager.lock().await;
+    let expired: Vec<String> = mgr
+        .running
+        .iter()
+        .filter(|(_, m)| m.in_flight == 0)
+        .filter_map(|(name, m)| {
+            let deadline = m.keep_alive?;
+            (m.last_active.elapsed() >= deadline).then(|| name.clone())
+        })
+        .collect();
+    for name in expired {
+        eprintln!("[llmman] unloading {name}: idle past its keep_alive deadline");
+        mgr.running.remove(&name);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,6 +1706,10 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
             digest,
             size,
             started_at: now_rfc3339(),
+            last_active: Instant::now(),
+            last_active_wall: chrono::Utc::now(),
+            keep_alive: default_keep_alive(),
+            in_flight: 0,
         },
     );
     Ok((model_ref.to_string(), port))
@@ -1118,6 +1760,7 @@ async fn proxy(
     url: &str,
     headers: &HeaderMap,
     body: Bytes,
+    activity: ActivityGuard,
 ) -> Result<Response, AppError> {
     let mut req = client.post(url).body(body.to_vec());
     if let Some(ct) = headers.get("content-type") {
@@ -1127,9 +1770,13 @@ async fn proxy(
     let status = reqwest::StatusCode::from(resp.status());
     let resp_headers = resp.headers().clone();
 
-    let stream = resp
-        .bytes_stream()
-        .map(|item| item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>));
+    // Moved into the stream below (see ActivityGuard's doc comment) so it
+    // isn't dropped — resetting this model's idle clock — until the whole
+    // response body has actually been relayed.
+    let stream = resp.bytes_stream().map(move |item| {
+        let _activity = &activity;
+        item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    });
 
     let mut builder = Response::builder().status(status.as_u16());
     for (k, v) in &resp_headers {
@@ -1291,20 +1938,48 @@ async fn post_chat(
 // generic driver; build_chunk supplies just that piece.
 // ---------------------------------------------------------------------------
 
+/// `build_chunk`'s `tool_calls` parameter is only ever `Some` on the final
+/// (`done`) chunk of an `/api/chat` response that made one or more tool
+/// calls — `/api/generate` (no tool-calling support in real Ollama
+/// either) always gets `None` here and ignores it.
 async fn stream_ollama<T: Serialize + Send + 'static>(
     client: Client,
     url: String,
     oai_req: OAIChatRequest,
-    build_chunk: impl Fn(String, Option<String>, bool) -> T + Send + 'static,
+    activity: ActivityGuard,
+    build_chunk: impl Fn(String, Option<String>, Option<Vec<OllamaToolCall>>, bool) -> T
+        + Send
+        + 'static,
 ) -> Result<Response, AppError> {
     let resp = post_chat(&client, &url, &oai_req).await?;
 
+    let tool_calls_acc = std::cell::RefCell::new(std::collections::BTreeMap::new());
     let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
+        // Moved into this closure purely to keep it alive — see
+        // ActivityGuard's doc comment — until the stream itself is
+        // dropped, not referenced otherwise.
+        let _activity = &activity;
         let out = line
             .strip_prefix("data: ")
-            .and_then(|p| oai_chunk_to_content(p))
-            .map(|(content, thinking, done)| {
-                let chunk = build_chunk(content, thinking, done);
+            .and_then(|payload| {
+                accumulate_tool_call_deltas(payload, &tool_calls_acc);
+                let (content, thinking, done) = oai_chunk_to_content(payload)?;
+                // llama-server's SSE stream signals "done" twice — once on
+                // the chunk carrying a real finish_reason, then again on
+                // the trailing literal "[DONE]" line — so `done` here can
+                // be true more than once per response. Draining (not just
+                // reading) the accumulator on the first occurrence means
+                // finalize_tool_calls sees an empty map and returns `None`
+                // on any later one, so a client can't be handed (and
+                // potentially act on) the same tool call twice.
+                let tool_calls = done.then(|| {
+                    let drained = std::mem::take(&mut *tool_calls_acc.borrow_mut());
+                    finalize_tool_calls(&drained)
+                });
+                Some((content, thinking, tool_calls.flatten(), done))
+            })
+            .map(|(content, thinking, tool_calls, done)| {
+                let chunk = build_chunk(content, thinking, tool_calls, done);
                 serde_json::to_string(&chunk).unwrap_or_default() + "\n"
             })
             .unwrap_or_default();
@@ -1326,6 +2001,7 @@ async fn stream_anthropic(
     url: String,
     oai_req: OAIChatRequest,
     model: String,
+    activity: ActivityGuard,
 ) -> Result<Response, AppError> {
     let resp = post_chat(&client, &url, &oai_req).await?;
 
@@ -1395,6 +2071,12 @@ async fn stream_anthropic(
         };
         Ok::<_, std::convert::Infallible>(Bytes::from(out))
     });
+    // Moved into the tail of the chained stream so it lives until the
+    // whole SSE response has been sent — see ActivityGuard's doc comment.
+    let sse_stream = sse_stream.chain(futures::stream::once(async move {
+        let _activity = activity;
+        Ok::<_, std::convert::Infallible>(Bytes::new())
+    }));
 
     Ok(Response::builder()
         .header("content-type", "text/event-stream")
@@ -1573,6 +2255,7 @@ struct PsEntry {
     pid: Option<u32>,
     processor: String,
     started_at: String,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 async fn handle_ps(State(state): State<AppState>) -> impl IntoResponse {
@@ -1588,6 +2271,10 @@ async fn handle_ps(State(state): State<AppState>) -> impl IntoResponse {
                 pid: m.pid(),
                 processor: m.processor(),
                 started_at: m.started_at.clone(),
+                expires_at: m
+                    .keep_alive
+                    .and_then(|d| chrono::Duration::from_std(d).ok())
+                    .map(|d| m.last_active_wall + d),
             })
             .collect()
     };
@@ -1606,6 +2293,9 @@ async fn handle_ps(State(state): State<AppState>) -> impl IntoResponse {
             processor: entry.processor,
             context_length,
             started_at: entry.started_at,
+            expires_at: entry
+                .expires_at
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         });
     }
     Json(OllamaPsResponse { models })
@@ -1893,38 +2583,48 @@ async fn handle_ollama_chat(
         req.messages.len()
     );
     let (model, port) = ensure_model(&state, &req.model).await?;
+    let keep_alive = resolve_keep_alive(&req.keep_alive);
+    let activity = begin_activity(&state, &model, Some(keep_alive)).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let oai = OAIChatRequest {
         model: model.clone(),
-        messages: req
-            .messages
-            .iter()
-            .map(|m| OAIMessage {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
-            .collect(),
+        messages: req.messages.iter().map(ollama_message_to_oai).collect(),
         stream: true,
         temperature: opt_f64(&req.options, "temperature"),
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
         repeat_penalty: opt_f64(&req.options, "repeat_penalty").or(Some(DEFAULT_REPEAT_PENALTY)),
         chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
+        tools: req.tools.clone(),
+        response_format: format_to_response_format(&req.format),
     };
     stream_ollama(
         state.0.client.clone(),
         url,
         oai,
-        move |content, thinking, done| OllamaChatChunk {
-            model: model.clone(),
-            created_at: now_rfc3339(),
-            message: OllamaMessage {
-                role: "assistant".into(),
-                content,
-                thinking,
-            },
-            done,
-            done_reason: done.then_some("stop".into()),
+        activity,
+        move |content, thinking, tool_calls, done| {
+            let done_reason = done.then(|| {
+                if tool_calls.is_some() {
+                    "tool_calls".to_string()
+                } else {
+                    "stop".to_string()
+                }
+            });
+            OllamaChatChunk {
+                model: model.clone(),
+                created_at: now_rfc3339(),
+                message: OllamaMessage {
+                    role: "assistant".into(),
+                    content,
+                    thinking,
+                    tool_calls,
+                    images: None,
+                    tool_name: None,
+                },
+                done,
+                done_reason,
+            }
         },
     )
     .await
@@ -1943,13 +2643,12 @@ async fn handle_ollama_generate(
     );
 
     // Empty prompt + keep_alive:0 = unload request (ollama server/routes.go:354).
-    let is_unload = req.prompt.is_empty()
-        && req
-            .keep_alive
-            .as_ref()
-            .and_then(|v| v.as_i64())
-            .map(|n| n == 0)
-            .unwrap_or(false);
+    // resolve_keep_alive (not a bare `.as_i64() == Some(0)` check) so every
+    // zero form it accepts — the JSON number 0, but also "0"/"0s"/etc as a
+    // string — is treated as the unload sentinel, matching how the very
+    // same value is interpreted everywhere else keep_alive is read.
+    let is_unload =
+        req.prompt.is_empty() && resolve_keep_alive(&req.keep_alive) == Some(Duration::ZERO);
     if is_unload {
         let resolved = crate::shortnames::resolve_ollama_api(&req.model);
         let canonical = canonical_ref(&state.0.store_path, &resolved);
@@ -1969,8 +2668,11 @@ async fn handle_ollama_generate(
     }
 
     let (model, port) = ensure_model(&state, &req.model).await?;
-    // Empty prompt = load-only request (mirrors ollama server/routes.go:429).
+    // Empty prompt = load-only request (mirrors ollama server/routes.go:429)
+    // — including "preload with a custom keep_alive", so refresh it here
+    // even though no generation is happening.
     if req.prompt.is_empty() {
+        refresh_activity(&state, &model, resolve_keep_alive(&req.keep_alive)).await;
         return Ok(Json(OllamaGenerateChunk {
             model: req.model,
             created_at: now_rfc3339(),
@@ -1982,25 +2684,27 @@ async fn handle_ollama_generate(
         .into_response());
     }
 
+    let keep_alive = resolve_keep_alive(&req.keep_alive);
+    let activity = begin_activity(&state, &model, Some(keep_alive)).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let oai = OAIChatRequest {
         model: model.clone(),
-        messages: vec![OAIMessage {
-            role: "user".into(),
-            content: req.prompt.clone(),
-        }],
+        messages: vec![OAIMessage::text("user", req.prompt.clone())],
         stream: true,
         temperature: opt_f64(&req.options, "temperature"),
         top_p: opt_f64(&req.options, "top_p"),
         max_tokens: opt_u32(&req.options, "num_predict"),
         repeat_penalty: opt_f64(&req.options, "repeat_penalty").or(Some(DEFAULT_REPEAT_PENALTY)),
         chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
+        tools: None,
+        response_format: format_to_response_format(&req.format),
     };
     stream_ollama(
         state.0.client.clone(),
         url,
         oai,
-        move |response, thinking, done| OllamaGenerateChunk {
+        activity,
+        move |response, thinking, _tool_calls, done| OllamaGenerateChunk {
             model: model.clone(),
             created_at: now_rfc3339(),
             response,
@@ -2052,10 +2756,17 @@ async fn proxy_openai(
         serde_json::from_slice(&body).context("parse OpenAI request body")?;
     let model = req["model"].as_str().unwrap_or("").to_string();
     let (model, port) = ensure_model(state, &model).await?;
+    // The OpenAI-compatible surface has no `keep_alive` field of its own
+    // (real Ollama's doesn't either) — `None` leaves whatever this model
+    // already has untouched (its load-time default, or an explicit value
+    // pinned via `/api/chat`) rather than overwriting it, e.g. clobbering
+    // a `keep_alive: -1` ("never unload") pin with the daemon default the
+    // instant one OpenAI-compatible request comes in.
+    let activity = begin_activity(state, &model, None).await;
     req["model"] = serde_json::Value::String(model);
     let body = Bytes::from(serde_json::to_vec(&req).context("re-serialize OpenAI request body")?);
     let url = format!("http://127.0.0.1:{port}{llama_path}");
-    proxy(&state.0.client, &url, headers, body).await
+    proxy(&state.0.client, &url, headers, body, activity).await
 }
 
 async fn handle_openai_chat(
@@ -2255,19 +2966,10 @@ fn build_anthropic_messages(req: &AnthropicRequest) -> Vec<OAIMessage> {
             system_text.push_str(&m.content.as_text());
             continue;
         }
-        messages.push(OAIMessage {
-            role: m.role.clone(),
-            content: m.content.as_text(),
-        });
+        messages.push(OAIMessage::text(m.role.clone(), m.content.as_text()));
     }
     if !system_text.is_empty() {
-        messages.insert(
-            0,
-            OAIMessage {
-                role: "system".into(),
-                content: system_text,
-            },
-        );
+        messages.insert(0, OAIMessage::text("system", system_text));
     }
     messages
 }
@@ -2279,6 +2981,10 @@ async fn handle_anthropic_messages(
     // Backend needs its canonical name (see ensure_model); the response
     // below still echoes req.model back, unchanged from before.
     let (canonical_model, port) = ensure_model(&state, &req.model).await?;
+    // The Anthropic Messages API has no `keep_alive` field of its own —
+    // `None` leaves it untouched, same as the OpenAI-compatible surface
+    // (see proxy_openai's own comment on why).
+    let activity = begin_activity(&state, &canonical_model, None).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
 
     let messages = build_anthropic_messages(&req);
@@ -2295,10 +3001,12 @@ async fn handle_anthropic_messages(
         repeat_penalty: Some(DEFAULT_REPEAT_PENALTY),
         // Nor a `think` override — see think_to_chat_template_kwargs.
         chat_template_kwargs: None,
+        tools: None,
+        response_format: None,
     };
 
     if req.stream {
-        stream_anthropic(state.0.client.clone(), url, oai, req.model).await
+        stream_anthropic(state.0.client.clone(), url, oai, req.model, activity).await
     } else {
         let resp = state
             .0
@@ -2512,14 +3220,27 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .with_context(|| format!("bind {addr}"))?;
     eprintln!("llmman serve listening on {addr}");
 
+    // Background idle-unload reaper — see reap_idle_models's doc comment.
+    tokio::spawn(reap_idle_models(state.clone()));
+
     // If a model was given on the command line, start loading it immediately
     // so the first request finds it already warm.
     if let Some(model) = &_args.model {
         let model = crate::shortnames::resolve_ollama_api(model);
         let state_clone = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = ensure_model(&state_clone, &model).await {
-                eprintln!("[llmman] pre-load failed: {:#}", e.0);
+            match ensure_model(&state_clone, &model).await {
+                // ensure_model's own keep_alive (the daemon default, 5
+                // minutes) would otherwise start counting down the moment
+                // this finishes loading — with no request traffic and no
+                // ActivityGuard to reset it, the idle reaper could unload
+                // a model asked for on the command line before it's ever
+                // actually used, defeating the whole point of pre-loading
+                // it. Pin it ("never unload") instead — a model named
+                // explicitly at startup is meant to stay warm for the
+                // daemon's lifetime, not just its first 5 idle minutes.
+                Ok((canonical, _)) => refresh_activity(&state_clone, &canonical, None).await,
+                Err(e) => eprintln!("[llmman] pre-load failed: {:#}", e.0),
             }
         });
     }
@@ -2574,6 +3295,612 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
+    // -- keep_alive parsing / resolution (idle-timeout auto-unload) ---------
+
+    #[test]
+    fn parse_keep_alive_str_handles_bare_seconds_units_and_negatives() {
+        assert_eq!(
+            parse_keep_alive_str("300"),
+            Some(Some(Duration::from_secs(300)))
+        );
+        assert_eq!(
+            parse_keep_alive_str("10m"),
+            Some(Some(Duration::from_secs(600)))
+        );
+        assert_eq!(
+            parse_keep_alive_str("1h30m"),
+            Some(Some(Duration::from_secs(5400)))
+        );
+        assert_eq!(
+            parse_keep_alive_str("30s"),
+            Some(Some(Duration::from_secs(30)))
+        );
+        assert_eq!(
+            parse_keep_alive_str("500ms"),
+            Some(Some(Duration::from_millis(500)))
+        );
+        // Any negative value — bare number or unit string — means "never
+        // unload", matching Ollama's own keep_alive: -1 convention.
+        assert_eq!(parse_keep_alive_str("-1"), Some(None));
+        assert_eq!(parse_keep_alive_str("-5m"), Some(None));
+        // Unparseable input falls back (via the caller, resolve_keep_alive)
+        // to the daemon default, signaled here by an outer None.
+        assert_eq!(parse_keep_alive_str("not-a-duration"), None);
+        assert_eq!(parse_keep_alive_str(""), None);
+        assert_eq!(parse_keep_alive_str("10x"), None);
+    }
+
+    /// Regression test: `f64`'s own `FromStr` accepts "inf"/"infinity"/
+    /// "nan" (any case) as a bare number, and even an ordinary huge finite
+    /// literal can overflow `Duration`'s own range — every one of these
+    /// used to panic via `Duration::from_secs_f64` (see
+    /// `secs_to_keep_alive`'s doc comment) instead of being treated as
+    /// just another unparseable `keep_alive` value.
+    #[test]
+    fn parse_keep_alive_str_never_panics_on_non_finite_or_overflowing_input() {
+        assert_eq!(parse_keep_alive_str("inf"), None);
+        assert_eq!(parse_keep_alive_str("Infinity"), None);
+        assert_eq!(parse_keep_alive_str("nan"), None);
+        assert_eq!(parse_keep_alive_str("NaN"), None);
+        // A negative infinity is still just "negative" — "never unload",
+        // same as any other negative value — not an error.
+        assert_eq!(parse_keep_alive_str("-inf"), Some(None));
+        // Finite, but far larger than Duration can represent.
+        assert_eq!(parse_keep_alive_str("1e300"), None);
+        assert_eq!(parse_keep_alive_str("1e300s"), None);
+        // Two components that each individually fit, but whose sum
+        // overflows once added together.
+        assert_eq!(
+            parse_keep_alive_str(&format!("{}s{}s", u64::MAX, u64::MAX)),
+            None
+        );
+    }
+
+    /// Same non-panicking guarantee, exercised through the JSON-number
+    /// path (`resolve_keep_alive`/`parse_keep_alive_value`) rather than
+    /// the duration-string one.
+    #[test]
+    fn resolve_keep_alive_never_panics_on_an_overflowing_json_number() {
+        assert_eq!(
+            resolve_keep_alive(&Some(serde_json::json!(1e300))),
+            default_keep_alive()
+        );
+    }
+
+    #[test]
+    fn resolve_keep_alive_falls_back_to_the_default_on_absent_or_unparseable_values() {
+        // Against default_keep_alive() itself, not the DEFAULT_KEEP_ALIVE
+        // constant directly: if LLMMAN_KEEP_ALIVE happens to be set in
+        // whatever environment runs this test (a developer's shell, a CI
+        // job), the constant and the actual fallback would disagree
+        // through no fault of the code under test.
+        let default = default_keep_alive();
+        assert_eq!(resolve_keep_alive(&None), default);
+        assert_eq!(
+            resolve_keep_alive(&Some(serde_json::json!("garbage"))),
+            default
+        );
+        assert_eq!(resolve_keep_alive(&Some(serde_json::json!(true))), default);
+    }
+
+    #[test]
+    fn resolve_keep_alive_accepts_a_json_number_of_seconds_or_a_duration_string() {
+        assert_eq!(
+            resolve_keep_alive(&Some(serde_json::json!(30))),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            resolve_keep_alive(&Some(serde_json::json!("10m"))),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(resolve_keep_alive(&Some(serde_json::json!(-1))), None);
+    }
+
+    /// Regression test for `handle_ollama_generate`'s unload-sentinel
+    /// check: it must reuse `resolve_keep_alive` (as asserted here) rather
+    /// than a bare `keep_alive.as_i64() == Some(0)` check, since the
+    /// latter misses every non-integer zero form `resolve_keep_alive`
+    /// itself accepts — a string `"0"`, `"0s"`, or a float `0.0` — leaving
+    /// a client that sends one of those loaded until the next idle-reaper
+    /// tick instead of unloading immediately as requested.
+    #[test]
+    fn resolve_keep_alive_treats_every_zero_form_as_the_unload_sentinel() {
+        assert_eq!(
+            resolve_keep_alive(&Some(serde_json::json!(0))),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            resolve_keep_alive(&Some(serde_json::json!("0"))),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            resolve_keep_alive(&Some(serde_json::json!("0s"))),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            resolve_keep_alive(&Some(serde_json::json!(0.0))),
+            Some(Duration::ZERO)
+        );
+    }
+
+    // -- format -> response_format (structured output) -----------------------
+
+    #[test]
+    fn format_to_response_format_maps_json_string_and_schema_object() {
+        assert_eq!(
+            format_to_response_format(&Some(serde_json::json!("json"))),
+            Some(serde_json::json!({ "type": "json_object" }))
+        );
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } }
+        });
+        assert_eq!(
+            format_to_response_format(&Some(schema.clone())),
+            Some(serde_json::json!({
+                "type": "json_schema",
+                "json_schema": { "name": "response", "schema": schema, "strict": true }
+            }))
+        );
+    }
+
+    #[test]
+    fn format_to_response_format_is_a_no_op_when_absent_or_unrecognized() {
+        assert_eq!(format_to_response_format(&None), None);
+        // Ollama documents only "json" and a schema object — anything else
+        // (a bare bool/number/other string) has no equivalent, same as an
+        // unrecognized `think` shape in think_to_chat_template_kwargs.
+        assert_eq!(
+            format_to_response_format(&Some(serde_json::json!(true))),
+            None
+        );
+        assert_eq!(
+            format_to_response_format(&Some(serde_json::json!("text"))),
+            None
+        );
+    }
+
+    // -- OllamaMessage -> OAIMessage (vision, tool calls, tool results) -----
+
+    #[test]
+    fn ollama_message_to_oai_plain_text_has_string_content_and_no_extras() {
+        let m = OllamaMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            ..Default::default()
+        };
+        let oai = ollama_message_to_oai(&m);
+        assert_eq!(oai.role, "user");
+        assert_eq!(oai.content, serde_json::json!("hi"));
+        assert_eq!(oai.tool_calls, None);
+        assert_eq!(oai.name, None);
+    }
+
+    #[test]
+    fn ollama_message_to_oai_with_images_builds_a_content_parts_array() {
+        let m = OllamaMessage {
+            role: "user".into(),
+            content: "what is this?".into(),
+            images: Some(vec!["Zm9v".into()]),
+            ..Default::default()
+        };
+        let oai = ollama_message_to_oai(&m);
+        assert_eq!(
+            oai.content,
+            serde_json::json!([
+                { "type": "text", "text": "what is this?" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } }
+            ])
+        );
+    }
+
+    #[test]
+    fn ollama_message_to_oai_with_only_an_image_omits_the_empty_text_part() {
+        let m = OllamaMessage {
+            role: "user".into(),
+            images: Some(vec!["Zm9v".into()]),
+            ..Default::default()
+        };
+        let oai = ollama_message_to_oai(&m);
+        assert_eq!(
+            oai.content,
+            serde_json::json!([
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,Zm9v" } }
+            ])
+        );
+    }
+
+    #[test]
+    fn ollama_message_to_oai_carries_tool_calls_and_re_encodes_arguments_as_a_string() {
+        let m = OllamaMessage {
+            role: "assistant".into(),
+            tool_calls: Some(vec![OllamaToolCall {
+                function: OllamaToolCallFunction {
+                    name: "get_weather".into(),
+                    arguments: serde_json::json!({ "city": "nyc" }),
+                },
+            }]),
+            ..Default::default()
+        };
+        let oai = ollama_message_to_oai(&m);
+        let calls = oai.tool_calls.expect("tool_calls must be carried over");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        // OpenAI's function.arguments is a JSON-*encoded string*, unlike
+        // Ollama's already-decoded object.
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap(),
+            serde_json::json!({ "city": "nyc" })
+        );
+    }
+
+    /// Regression test: `gen_id()` alone is time-based and, on a platform
+    /// with coarse clock resolution, two calls made back-to-back (as
+    /// happens once per tool call in a single message) can return the same
+    /// value — an id collision that would make a strict id-matching chat
+    /// template mismatch tool results. The per-call index appended to
+    /// `gen_id()`'s own output must make every id in one message unique
+    /// even then.
+    #[test]
+    fn ollama_message_to_oai_gives_each_tool_call_a_distinct_id_even_with_identical_names() {
+        let m = OllamaMessage {
+            role: "assistant".into(),
+            tool_calls: Some(vec![
+                OllamaToolCall {
+                    function: OllamaToolCallFunction {
+                        name: "get_weather".into(),
+                        arguments: serde_json::json!({ "city": "nyc" }),
+                    },
+                },
+                OllamaToolCall {
+                    function: OllamaToolCallFunction {
+                        name: "get_weather".into(),
+                        arguments: serde_json::json!({ "city": "sf" }),
+                    },
+                },
+            ]),
+            ..Default::default()
+        };
+        let oai = ollama_message_to_oai(&m);
+        let calls = oai.tool_calls.expect("tool_calls must be carried over");
+        assert_eq!(calls.len(), 2);
+        assert_ne!(
+            calls[0].id, calls[1].id,
+            "two tool calls in one message must never share an id"
+        );
+    }
+
+    #[test]
+    fn ollama_message_to_oai_maps_tool_name_to_name_on_a_tool_result_message() {
+        let m = OllamaMessage {
+            role: "tool".into(),
+            content: "72F and sunny".into(),
+            tool_name: Some("get_weather".into()),
+            ..Default::default()
+        };
+        let oai = ollama_message_to_oai(&m);
+        assert_eq!(oai.name.as_deref(), Some("get_weather"));
+    }
+
+    #[test]
+    fn image_data_uri_wraps_bare_base64_and_passes_through_existing_data_uris() {
+        assert_eq!(image_data_uri("Zm9v"), "data:image/png;base64,Zm9v");
+        assert_eq!(
+            image_data_uri("data:image/jpeg;base64,Zm9v"),
+            "data:image/jpeg;base64,Zm9v"
+        );
+    }
+
+    // -- Streaming tool-call accumulation (/api/chat) -------------------------
+
+    /// Regression test for OpenAI's own streaming tool-call shape: `id`
+    /// and `function.name` normally arrive whole in the first delta for a
+    /// given `index`, while `function.arguments` is only complete, valid
+    /// JSON once every fragment across possibly-many chunks is
+    /// concatenated — never fragment-by-fragment.
+    #[test]
+    fn tool_call_accumulator_assembles_fragmented_streaming_deltas() {
+        let acc = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        accumulate_tool_call_deltas(
+            r#"{"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}
+            ]},"finish_reason":null}]}"#,
+            &acc,
+        );
+        accumulate_tool_call_deltas(
+            r#"{"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"\"nyc\"}"}}
+            ]},"finish_reason":null}]}"#,
+            &acc,
+        );
+        let calls = finalize_tool_calls(&acc.borrow()).expect("must assemble one tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(
+            calls[0].function.arguments,
+            serde_json::json!({ "city": "nyc" })
+        );
+    }
+
+    /// Regression test: llama-server's SSE stream signals "done" twice per
+    /// response — once on the chunk carrying a real `finish_reason`, then
+    /// again on the trailing literal `"[DONE]"` line — so whatever reads
+    /// `oai_chunk_to_content`'s `done` flag sees it `true` more than once.
+    /// `stream_ollama` drains the accumulator (`std::mem::take`, mirrored
+    /// here) rather than just reading it on each such occurrence, so a
+    /// tool call is finalized — and so delivered to the client — exactly
+    /// once, never twice.
+    #[test]
+    fn draining_the_accumulator_on_finalize_prevents_delivering_a_tool_call_twice() {
+        let acc = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        accumulate_tool_call_deltas(
+            r#"{"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"name":"get_weather","arguments":"{}"}}
+            ]},"finish_reason":"tool_calls"}]}"#,
+            &acc,
+        );
+
+        let first = finalize_tool_calls(&std::mem::take(&mut *acc.borrow_mut()));
+        assert!(
+            first.is_some(),
+            "the first done signal must still deliver the tool call"
+        );
+
+        let second = finalize_tool_calls(&std::mem::take(&mut *acc.borrow_mut()));
+        assert_eq!(
+            second, None,
+            "a second done signal (the trailing [DONE] line) must not re-deliver it"
+        );
+    }
+
+    #[test]
+    fn finalize_tool_calls_is_none_when_no_tool_calls_were_made() {
+        assert_eq!(
+            finalize_tool_calls(&std::collections::BTreeMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn finalize_tool_calls_falls_back_to_an_empty_object_on_unparseable_arguments() {
+        let mut acc = std::collections::BTreeMap::new();
+        acc.insert(
+            0,
+            ToolCallAccumulator {
+                name: "f".into(),
+                arguments: "not json".into(),
+            },
+        );
+        let calls = finalize_tool_calls(&acc).unwrap();
+        assert_eq!(calls[0].function.arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn oai_chunk_tool_call_deltas_is_empty_for_done_sentinel_and_ordinary_content() {
+        assert!(oai_chunk_tool_call_deltas("[DONE]").is_empty());
+        assert!(oai_chunk_tool_call_deltas(
+            r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#
+        )
+        .is_empty());
+    }
+
+    // -- Idle-timeout auto-unload reaper --------------------------------------
+
+    fn test_state() -> AppState {
+        AppState(Arc::new(Inner {
+            manager: Mutex::new(ModelManager {
+                running: HashMap::new(),
+            }),
+            llama_server_bin: StdMutex::new(None),
+            exe: None,
+            ociman: None,
+            llama_cpp_version: None,
+            ctx_size: None,
+            store_path: std::env::temp_dir(),
+            cache_path: std::env::temp_dir(),
+            client: Client::new(),
+        }))
+    }
+
+    /// A long-lived, harmless real child process to back a test
+    /// `RunningModel` — `ModelProcess::is_alive`/`Drop` both need a real
+    /// `tokio::process::Child`, not a mock. `sleep` isn't on `PATH` on
+    /// Windows (which this project does target — see the `#[cfg(windows)]`
+    /// branches elsewhere in this module), so it's spawned differently per
+    /// platform rather than assuming a Unix-only test environment.
+    #[cfg(unix)]
+    fn spawn_placeholder_process() -> tokio::process::Child {
+        tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn placeholder `sleep` process")
+    }
+
+    #[cfg(windows)]
+    fn spawn_placeholder_process() -> tokio::process::Child {
+        tokio::process::Command::new("cmd")
+            .args(["/C", "timeout", "/T", "60", "/NOBREAK"])
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn placeholder `cmd /C timeout` process")
+    }
+
+    fn running_model_fixture(
+        keep_alive: Option<Duration>,
+        idle_for: Duration,
+        in_flight: u32,
+    ) -> RunningModel {
+        RunningModel {
+            process: ModelProcess::Local(Engine::LlamaServer, spawn_placeholder_process(), None),
+            port: 0,
+            digest: String::new(),
+            size: 0,
+            started_at: now_rfc3339(),
+            last_active: Instant::now() - idle_for,
+            last_active_wall: chrono::Utc::now(),
+            keep_alive,
+            in_flight,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reap_idle_models_unloads_only_idle_expired_models_not_in_flight_or_forever() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "expired-and-idle".into(),
+                running_model_fixture(Some(Duration::from_secs(1)), Duration::from_secs(10), 0),
+            );
+            mgr.running.insert(
+                "expired-but-in-flight".into(),
+                running_model_fixture(Some(Duration::from_secs(1)), Duration::from_secs(10), 1),
+            );
+            mgr.running.insert(
+                "expired-but-forever".into(),
+                running_model_fixture(None, Duration::from_secs(10), 0),
+            );
+            mgr.running.insert(
+                "not-yet-expired".into(),
+                running_model_fixture(Some(Duration::from_secs(300)), Duration::from_secs(1), 0),
+            );
+        }
+
+        reap_idle_models_once(&state).await;
+
+        let mgr = state.0.manager.lock().await;
+        assert!(
+            !mgr.running.contains_key("expired-and-idle"),
+            "an idle model past its keep_alive deadline must be unloaded"
+        );
+        assert!(
+            mgr.running.contains_key("expired-but-in-flight"),
+            "a model with an in-flight request must survive regardless of its deadline"
+        );
+        assert!(
+            mgr.running.contains_key("expired-but-forever"),
+            "keep_alive: None (forever) must never be reaped"
+        );
+        assert!(
+            mgr.running.contains_key("not-yet-expired"),
+            "a model whose keep_alive deadline hasn't passed yet must survive"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn begin_activity_marks_in_flight_and_its_drop_releases_it_and_updates_keep_alive() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "m".into(),
+                running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+            );
+        }
+
+        let guard = begin_activity(&state, "m", Some(Some(Duration::from_secs(42)))).await;
+        {
+            let mgr = state.0.manager.lock().await;
+            let m = &mgr.running["m"];
+            assert_eq!(
+                m.in_flight, 1,
+                "begin_activity must mark one in-flight request"
+            );
+            assert_eq!(m.keep_alive, Some(Duration::from_secs(42)));
+        }
+
+        drop(guard);
+        // ActivityGuard::drop can't be async, so it spawns a task to
+        // finish the update — give it a moment to run.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mgr = state.0.manager.lock().await;
+        let m = &mgr.running["m"];
+        assert_eq!(
+            m.in_flight, 0,
+            "dropping the guard must release the in-flight count"
+        );
+        assert_eq!(m.keep_alive, Some(Duration::from_secs(42)));
+    }
+
+    /// Regression test: a `None` `keep_alive` override (what the
+    /// OpenAI-compatible and Anthropic Messages routes pass, since
+    /// neither has a `keep_alive` field of its own to read one from) must
+    /// leave a model's existing `keep_alive` completely untouched, both
+    /// immediately and on the guard's drop — e.g. a model pinned via
+    /// `/api/chat`'s `keep_alive: -1` ("never unload") must not have that
+    /// silently downgraded to the daemon default just because an
+    /// OpenAI-compatible request also happens to hit it. `last_active`
+    /// (the idle clock) is still expected to refresh either way — a
+    /// `None` override only means "don't touch keep_alive", not "don't
+    /// count as activity".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn begin_activity_with_no_override_never_touches_an_existing_keep_alive() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            // "Forever" — as if pinned via `/api/chat`'s `keep_alive: -1`.
+            mgr.running.insert(
+                "m".into(),
+                running_model_fixture(None, Duration::from_secs(600), 0),
+            );
+        }
+
+        let guard = begin_activity(&state, "m", None).await;
+        {
+            let mgr = state.0.manager.lock().await;
+            let m = &mgr.running["m"];
+            assert_eq!(m.in_flight, 1);
+            assert_eq!(
+                m.keep_alive, None,
+                "a None override must not touch the model's existing keep_alive"
+            );
+            assert!(
+                m.last_active.elapsed() < Duration::from_secs(600),
+                "the idle clock must still refresh even without a keep_alive override"
+            );
+        }
+
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mgr = state.0.manager.lock().await;
+        assert_eq!(
+            mgr.running["m"].keep_alive, None,
+            "dropping the guard must still leave keep_alive untouched"
+        );
+    }
+
+    /// Regression test for `serve_async`'s `ServeArgs::model` pre-load:
+    /// `ensure_model` alone leaves a freshly loaded model at the daemon
+    /// default `keep_alive` (5 minutes) with nothing to reset its idle
+    /// clock (no request has been served yet, so no `ActivityGuard`
+    /// exists) — the idle reaper would unload a model asked for on the
+    /// command line before it's ever actually used, defeating the whole
+    /// point of pre-loading it. `refresh_activity(state, model, None)`
+    /// (what the pre-load task now calls right after `ensure_model`
+    /// succeeds) must pin it to "never unload" instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_activity_with_none_pins_a_model_to_never_unload() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "preloaded".into(),
+                running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+            );
+        }
+
+        refresh_activity(&state, "preloaded", None).await;
+
+        let mgr = state.0.manager.lock().await;
+        assert_eq!(
+            mgr.running["preloaded"].keep_alive, None,
+            "a pre-loaded model must be pinned to never unload, not left at the daemon default"
+        );
+    }
+
     #[test]
     fn parse_context_length_accepts_a_plain_number_and_rejects_everything_else() {
         assert_eq!(parse_context_length(Some("32768")), Some(32768));
@@ -2609,22 +3936,13 @@ mod tests {
         assert_eq!(
             messages,
             vec![
-                OAIMessage {
-                    role: "system".into(),
-                    content: "leading system prompt\n\na mid-conversation reminder".into(),
-                },
-                OAIMessage {
-                    role: "user".into(),
-                    content: "hi".into()
-                },
-                OAIMessage {
-                    role: "assistant".into(),
-                    content: "hello".into()
-                },
-                OAIMessage {
-                    role: "user".into(),
-                    content: "bye".into()
-                },
+                OAIMessage::text(
+                    "system",
+                    "leading system prompt\n\na mid-conversation reminder"
+                ),
+                OAIMessage::text("user", "hi"),
+                OAIMessage::text("assistant", "hello"),
+                OAIMessage::text("user", "bye"),
             ]
         );
     }
@@ -2639,13 +3957,7 @@ mod tests {
 
         let messages = build_anthropic_messages(&req);
 
-        assert_eq!(
-            messages,
-            vec![OAIMessage {
-                role: "user".into(),
-                content: "hi".into()
-            }]
-        );
+        assert_eq!(messages, vec![OAIMessage::text("user", "hi")]);
     }
 
     /// Regression test for the Codex tool-type bug described on
@@ -2858,14 +4170,8 @@ mod tests {
         assert_eq!(
             messages,
             vec![
-                OAIMessage {
-                    role: "system".into(),
-                    content: "you are a helpful assistant".into()
-                },
-                OAIMessage {
-                    role: "user".into(),
-                    content: "hi".into()
-                },
+                OAIMessage::text("system", "you are a helpful assistant"),
+                OAIMessage::text("user", "hi"),
             ]
         );
     }

@@ -89,6 +89,16 @@ Or with any Ollama, Anthropic or OpenAI-compatible client.
 
 Models are loaded on demand. Each model gets its own `llama-server` subprocess on a random loopback port; subsequent requests reuse the running process.
 
+`/api/chat` also supports Ollama's `tools` (function calling, streamed back
+as `message.tool_calls`), `images` (vision, base64 — same as Ollama's own
+wire format), and `format` (`"json"` or a JSON Schema object, for
+constrained structured output).
+
+An idle, unused model is automatically unloaded after `keep_alive`
+(default 5 minutes, matching Ollama — set per-request, or daemon-wide via
+`LLMMAN_KEEP_ALIVE`), and `llmman ps`/`/api/ps` reports each model's
+`expires_at`.
+
 ### Launch an integration
 
 Point an integration at a model in one step. `llmman launch` starts `serve` in the background if it isn't already running (preloading the requested model), then sets the right environment variables and execs the integration:

@@ -74,6 +74,36 @@ pub fn relative_time_rfc3339(s: &str) -> String {
     relative_time_secs(secs)
 }
 
+/// "Time until" string for a duration expressed in seconds-in-the-future.
+/// Shared core of [`until_rfc3339`] — split out (mirroring
+/// `relative_time_secs`) so it can be tested with fixed inputs instead of
+/// real wall-clock timestamps, which are inherently a little racy against
+/// integer-seconds truncation right at a unit boundary.
+fn until_secs(secs: u64) -> String {
+    match secs {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{} minutes from now", s / 60),
+        s if s < 86400 => format!("{} hours from now", s / 3600),
+        s => format!("{} days from now", s / 86400),
+    }
+}
+
+/// "Time until" string for an RFC 3339 timestamp in the future (a model's
+/// computed `keep_alive` expiry) — used by `llmman ps`'s UNTIL column,
+/// mirroring `ollama ps`'s own phrasing ("4 minutes from now"). A
+/// timestamp already in the past (the idle-unload reaper just hasn't
+/// caught up with it yet — see `reap_idle_models`) renders as "just now"
+/// rather than a nonsensical negative duration.
+pub fn until_rfc3339(s: &str) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(s) else {
+        return "unknown".into();
+    };
+    let secs = (parsed.with_timezone(&chrono::Utc) - chrono::Utc::now())
+        .num_seconds()
+        .max(0) as u64;
+    until_secs(secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +131,28 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         assert_eq!(relative_time_rfc3339(&now), "just now");
         assert_eq!(relative_time_rfc3339("not a timestamp"), "unknown");
+    }
+
+    #[test]
+    fn until_secs_formats_the_unit_ladder() {
+        assert_eq!(until_secs(0), "just now");
+        assert_eq!(until_secs(59), "just now");
+        assert_eq!(until_secs(60), "1 minutes from now");
+        assert_eq!(until_secs(300), "5 minutes from now");
+        assert_eq!(until_secs(3_600), "1 hours from now");
+        assert_eq!(until_secs(7_200), "2 hours from now");
+        assert_eq!(until_secs(86_400), "1 days from now");
+    }
+
+    #[test]
+    fn until_rfc3339_clamps_a_past_timestamp_and_rejects_garbage() {
+        // Already past its deadline (the reaper hasn't caught up yet) —
+        // clamp rather than print a negative duration.
+        let a_minute_ago = (chrono::Utc::now() - chrono::Duration::minutes(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert_eq!(until_rfc3339(&a_minute_ago), "just now");
+
+        assert_eq!(until_rfc3339("not a timestamp"), "unknown");
     }
 
     /// Ported from ollama's format/bytes_test.go (TestHumanBytes), adapted
