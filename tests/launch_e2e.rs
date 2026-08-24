@@ -37,8 +37,10 @@
 //! one shared daemon and to keep three real model launches from
 //! competing for the same GPU/CPU at once.
 //!
-//! Not run as part of `cargo build` or CI (`.github/workflows/ci.yml`
-//! never invokes `cargo test`) — run explicitly:
+//! Not run as part of `cargo build`, and not run by the `test` job in
+//! `.github/workflows/ci.yml` (that job only runs the in-crate
+//! `#[cfg(test)]` unit tests) — this file is its own separate `e2e` job
+//! there instead. To run it locally, invoke it explicitly:
 //!
 //!   cargo test --release --test launch_e2e -- --nocapture --test-threads=1
 //!
@@ -128,8 +130,28 @@ fn lock_serial() -> std::sync::MutexGuard<'static, ()> {
 /// actually reach it.
 static WARM: Once = Once::new();
 
+/// The `llmman` binary every test in this file launches.
+///
+/// CI (see `.github/workflows/ci.yml`'s e2e job) installs the exact
+/// binary `cargo build` just produced via the real `install.sh`/
+/// `install.ps1` scripts before running this suite, then points
+/// `LLMMAN_E2E_BIN` at the resulting installed copy (`~/.local/bin/llmman`
+/// on Unix, `%LOCALAPPDATA%\Microsoft\WindowsApps\llmman.exe` on Windows)
+/// — so what's actually under test is the same installed artifact a real
+/// user's `curl ... | sh`/`irm ... | iex` produces, not just whatever
+/// `cargo build` itself dropped in `target/`, closing the gap between
+/// this suite and how llmman is actually obtained in practice.
+///
+/// Falls back to Cargo's own `CARGO_BIN_EXE_llmman` (the pre-existing
+/// behavior) when that env var isn't set, so a plain local
+/// `cargo test --release --test launch_e2e` (see this file's own module
+/// doc comment) keeps working without requiring the installer to have
+/// been run first.
 fn llmman_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_llmman"))
+    match std::env::var_os("LLMMAN_E2E_BIN") {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(env!("CARGO_BIN_EXE_llmman")),
+    }
 }
 
 /// True if `bin` resolves on `PATH` — enough for test-skip purposes
