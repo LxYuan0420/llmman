@@ -105,16 +105,6 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # ── Go module cache ───────────────────────────────────────────────────
-      - name: Cache Go modules
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-${{ matrix.go-os }}-${{ hashFiles('go-shim/go.sum') }}
-          restore-keys: go-${{ matrix.go-os }}-
-
       # ── Windows: set up MSVC with the correct target architecture ─────────
       # msvc-arch is explicit in the matrix so the ARM64 runner gets the ARM64
       # toolchain rather than the default x64, which would cause the wrong
@@ -251,15 +241,6 @@ jobs:
         with:
           key: test-${{ matrix.target }}
 
-      - name: Cache Go modules
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-${{ matrix.go-os }}-${{ hashFiles('go-shim/go.sum') }}
-          restore-keys: go-${{ matrix.go-os }}-
-
       # ── Windows: set up MSVC (needed for CGO, same as the `build` job) ────
       # arch: matrix-driven (not a hardcoded amd64) — the ARM64 runner
       # needs the ARM64 toolchain, or CGO compiling Go's ARM64 runtime
@@ -291,44 +272,29 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
   # --------------------------------------------------------------------------
-  # E2E: `llmman launch <claude|opencode|codex> --model qwen3.5:0.8b`
-  # (tests/launch_e2e.rs) against a real `llmman serve`, a real pulled model,
-  # a real llama-server, and the real third-party CLIs — not mocks. Mirrors
-  # the `build` job's own 5-target matrix exactly (same runners, same
-  # msvc-arch/rustflags choices), so the launch/env/config plumbing this
-  # actually exercises gets checked on every platform/architecture llmman
-  # ships a binary for, not just a subset of them.
+  # E2E: `llmman launch <claude|opencode|codex|hermes|openclaw> --model
+  # qwen3.5:0.8b` (tests/launch_e2e.rs) against a real `llmman serve`, a
+  # real pulled model, a real llama-server, and the real third-party CLIs
+  # — not mocks. Mirrors the `build` job's own 5-target matrix exactly
+  # (same runners, same msvc-arch/rustflags choices), so the launch/env/
+  # config plumbing this actually exercises gets checked on every
+  # platform/architecture llmman ships a binary for, not just a subset.
   # --------------------------------------------------------------------------
   e2e:
-    name: E2E (launch claude/opencode/codex) — ${{ matrix.target }} (${{ matrix.backend }})
+    name: E2E (launch claude/opencode/codex/hermes/openclaw) — ${{ matrix.target }} (${{ matrix.backend }})
     runs-on: ${{ matrix.runner }}
-    # 25 was set back when this only ever ran on ubuntu-24.04 (a typical
-    # run there takes 5-7 minutes total). Confirmed against real
-    # windows-2025/windows-11-arm runs that setup+build overhead alone
-    # (checkout, toolchains, npm installs, cargo build) already consumes
-    # 5-8 of those minutes on Windows, before any of tests/launch_e2e.rs's
-    # own three tests even start. Those three tests run serialized
-    # (--test-threads=1 + lock_serial()), so the real worst case sums all
-    # three's own retry budgets, not just one, each capped at
-    # MAX_ATTEMPTS * TIMEOUT (3 * 600s = 30 min) — plus warm_model()'s own
-    # separate TIMEOUT budget (10 min), paid at most once across all three
-    # tests (guarded by WARM's own Once — see that function's doc comment)
-    # but not otherwise included in any single test's own 30 min above,
-    # since warm_model() and the actual launch it precedes are each their
-    # own independent try_spawn_with_timeout call: 8 + 10 + 30 + 30 + 30 =
-    # 108 minutes. 120 leaves real headroom for that worst case across
-    # every platform, not just the fastest one. (A previous revision of
-    # this comment gave opencode its own larger MAX_ATTEMPTS after CI run
-    # 32376290299 exhausted 3/3 attempts on two platforms at once —
-    # reverted, see tests/launch_e2e.rs's own MAX_ATTEMPTS doc comment for
-    # why paying for more retries there doesn't actually fix anything; that
-    # revert didn't change this budget; it was already 108/120 before it
-    # even without opencode's own extra attempt, once warm_model()'s
-    # separate budget above is accounted for. Exhausting every attempt no
-    # longer fails this job either way — see that same doc comment — but a
-    # run can still legitimately take this long in wall-clock time before
-    # giving up, so this budget is sized the same regardless.)
-    timeout-minutes: 120
+    # 5 tests run serialized (--test-threads=1 + lock_serial()), so the
+    # worst case sums all 5's own retry budgets: MAX_ATTEMPTS * TIMEOUT
+    # (3 * 600s = 30 min) each — a timeout itself never retries (see
+    # launch_and_assert's own doc comment), so 30 min/test is only hit if
+    # every attempt fails via a missing "pong" instead. Plus warm_model()'s
+    # own separate TIMEOUT budget (10 min), paid at most once across all
+    # tests (guarded by WARM's own Once). 5*30 + 10 = 160 min; 180 leaves
+    # headroom on top of that for setup/build overhead (5-8 min on
+    # Windows). Exhausting every attempt doesn't fail this job either way
+    # (see launch_and_assert's own doc comment) — a run can still
+    # legitimately take this long in wall-clock time before giving up.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -434,15 +400,6 @@ jobs:
           # invalidating) the same cache entry.
           key: e2e-${{ matrix.target }}-${{ matrix.backend }}
 
-      - name: Cache Go modules
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-${{ matrix.go-os }}-${{ hashFiles('go-shim/go.sum') }}
-          restore-keys: go-${{ matrix.go-os }}-
-
       # ── Windows: set up MSVC (needed for CGO, same as the `build` job) ────
       # arch: matrix-driven (not a hardcoded amd64) — the ARM64 runner
       # needs the ARM64 toolchain, or CGO compiling Go's ARM64 runtime
@@ -479,12 +436,39 @@ jobs:
       # installed. `shell: bash` (not the Windows default of `pwsh`) is
       # needed on every OS-agnostic step from here on for consistent `||`/
       # multi-line syntax; ubuntu/macOS already default to bash.
-      - name: Install integration CLIs (claude, opencode, codex)
+      - name: Install integration CLIs (claude, opencode, codex, openclaw)
         shell: bash
         run: |
           npm install -g @anthropic-ai/claude-code || echo "::warning::claude-code install failed on ${{ runner.os }}"
           npm install -g opencode-ai || echo "::warning::opencode-ai install failed on ${{ runner.os }}"
           npm install -g @openai/codex || echo "::warning::codex install failed on ${{ runner.os }}"
+          # Pinned (not @latest): tests/launch_e2e.rs's own openclaw
+          # invocation was verified against this exact release — its
+          # docs describe CLI commands/flags this build doesn't actually
+          # have (see launch_and_assert_tolerating's own doc comment),
+          # so an unpinned upgrade could silently break the same way
+          # again with no warning here.
+          npm install -g openclaw@2026.7.1-2 || echo "::warning::openclaw install failed on ${{ runner.os }}"
+
+      # hermes has no npm package (install.sh/install.ps1 only, like
+      # llmman's own install scripts) — --skip-setup skips its
+      # interactive onboarding wizard, since tests/launch_e2e.rs's own
+      # write_hermes_config already configures it non-interactively.
+      # Adds ~/.local/bin to GITHUB_PATH since that's where install.sh
+      # puts the binary and it isn't necessarily already on PATH here.
+      - name: Install Hermes Agent (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup || echo "::warning::hermes install failed on ${{ runner.os }}"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Hermes Agent (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          & ([scriptblock]::Create((irm https://hermes-agent.nousresearch.com/install.ps1))) -SkipSetup
 
       # opencode installs its configured provider's npm package (here
       # @ai-sdk/openai-compatible — see launch::opencode_config) on demand

@@ -88,17 +88,14 @@ fn is_safetensors_layer(l: &crate::storage::oci::Descriptor) -> bool {
 // + --override-kv builder that let --ctx-size force a context above a
 // model's own trained length) were tried and removed: llama-server's own
 // capping of --ctx-size back down to a model's trained context — see
-// ServeArgs::ctx_size's doc comment — is deliberate, matching behavior
-// Ollama's own server independently implements (see llm/server.go in
-// ollama/ollama: it clamps num_ctx to n_ctx_train with a warning, with no
-// override of any kind). Defeating that safety net via --override-kv
-// produces the same NaN/incoherent-output risk for out-of-distribution
-// RoPE positions that both llama-server's warning and Ollama's clamp
-// exist to prevent, for a use case (fitting a real coding agent's system
-// prompt) that a model whose trained context is that tight was never
-// going to serve well regardless — see docker/sandboxes' own
-// llmmanCtxSize doc comment for the model-selection fix that replaced
-// this instead.
+// cmd::serve::context_length_from_env's doc comment — is deliberate, not
+// a bug to work around. Defeating that safety net via --override-kv
+// produces a real NaN/incoherent-output risk for out-of-distribution
+// RoPE positions that llama-server's own warning exists to prevent, for
+// a use case (fitting a real coding agent's system prompt) that a model
+// whose trained context is that tight was never going to serve well
+// regardless — see docker/sandboxes' own llmmanCtxSize doc comment for the
+// model-selection fix that replaced this instead.
 
 /// Resolve `model_ref` (already present in the `OciStore` at `store_path`)
 /// to either a `.gguf` file or an extracted safetensors directory, caching

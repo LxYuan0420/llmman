@@ -63,6 +63,30 @@ pub fn detect() -> HostGpu {
     }
 }
 
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// VRAM-tiered context-size default (used by `cmd::serve` when
+/// `LLMMAN_CONTEXT_LENGTH` isn't set). Below a 47GiB VRAM threshold,
+/// defaults to 32768 tokens instead of a model's full trained context:
+/// llmman forwards requests to llama-server as-is rather than
+/// truncating oversized prompts, and real agentic CLIs routinely send
+/// 7-8k-token prompts before any reply — a smaller floor would be too
+/// tight for that without truncation. `None` defers to a model's own
+/// trained context rather than hardcoding a fixed ceiling for
+/// well-resourced hosts.
+pub fn default_ctx_size_for(vram_bytes: u64) -> Option<u32> {
+    if vram_bytes >= 47 * GIB {
+        None
+    } else {
+        Some(32768)
+    }
+}
+
+/// [`default_ctx_size_for`] applied to [`detect_with_vram`]'s live probe.
+pub fn default_ctx_size() -> Option<u32> {
+    default_ctx_size_for(detect_with_vram().1)
+}
+
 /// The hidden re-exec argument `main()` checks for, before anything else,
 /// to reach [`probe_subprocess_main`] — see that function's own doc
 /// comment.
@@ -94,6 +118,15 @@ fn detect_gpu_api_isolated() -> HostGpu {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn spawn_probe_subprocess() -> Option<HostGpu> {
+    Some(spawn_probe_subprocess_with_vram()?.0)
+}
+
+/// Same probe subprocess as [`spawn_probe_subprocess`], also returning
+/// its second output line (total VRAM bytes, 0 if unknown) — used by
+/// [`detect_with_vram`], kept separate so plain [`detect`] callers don't
+/// pay for a probe that also reads GPU memory.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn spawn_probe_subprocess_with_vram() -> Option<(HostGpu, u64)> {
     let exe = std::env::current_exe().ok()?;
     let output = std::process::Command::new(exe)
         .arg(PROBE_SUBPROCESS_ARG)
@@ -102,13 +135,27 @@ fn spawn_probe_subprocess() -> Option<HostGpu> {
     if !output.status.success() {
         return None;
     }
-    parse_probe_output(&String::from_utf8_lossy(&output.stdout))
+    parse_probe_output_with_vram(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Parses [`probe_subprocess_main`]'s one-line stdout protocol
-/// (`"none"`, `"rocm"`, `"vulkan"`, or `"cuda:<major>"`) back into a
-/// [`HostGpu`] — split out from [`spawn_probe_subprocess`] so this
-/// parsing itself is unit-testable without actually spawning a process.
+/// Parses both of [`probe_subprocess_main`]'s output lines — split out,
+/// like [`parse_probe_output`], for testing without spawning a process.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_probe_output_with_vram(stdout: &str) -> Option<(HostGpu, u64)> {
+    let gpu = parse_probe_output(stdout)?;
+    let vram = stdout
+        .lines()
+        .nth(1)
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or(0);
+    Some((gpu, vram))
+}
+
+/// Parses [`probe_subprocess_main`]'s first output line (`"none"`,
+/// `"rocm"`, `"vulkan"`, or `"cuda:<major>"`) into a [`HostGpu`] — split
+/// out so parsing is unit-testable without spawning a process. Ignores
+/// any second (VRAM) line; see [`spawn_probe_subprocess_with_vram`] for
+/// that.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn parse_probe_output(stdout: &str) -> Option<HostGpu> {
     let line = stdout.lines().next()?.trim();
@@ -126,31 +173,24 @@ fn parse_probe_output(stdout: &str) -> Option<HostGpu> {
 }
 
 /// [`main()`]'s hidden re-exec target (see [`PROBE_SUBPROCESS_ARG`]) —
-/// runs the real, potentially-crashing [`detect_gpu_api_uncontained`] in
-/// what is, from [`detect_gpu_api_isolated`]'s point of view, a
-/// disposable child process, and reports the result back over stdout
-/// using a trivial one-line protocol (`"none"`, `"rocm"`, `"vulkan"`, or
-/// `"cuda:<major>"`) instead of any richer IPC — there's nothing here
-/// that needs one, and keeping this side of the protocol this simple
-/// means [`parse_probe_output`] has very little surface to get wrong.
-/// Never returns: always exits the process itself, successfully,
-/// regardless of what was actually detected (a "no GPU found" result is
-/// just as much a successful probe as finding one — only an actual crash
-/// should ever produce a non-zero/abnormal exit here, and that's
-/// entirely the point).
+/// runs [`detect_gpu_api_uncontained`] in what is, from the caller's
+/// point of view, a disposable child process, and reports the result as
+/// two stdout lines: kind (`"none"`/`"rocm"`/`"vulkan"`/`"cuda:<major>"`)
+/// then total VRAM bytes. Never returns: always exits successfully,
+/// regardless of what was detected — only a real crash should produce a
+/// non-zero/abnormal exit here.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub fn probe_subprocess_main() -> ! {
-    let line = match detect_gpu_api_uncontained() {
+    let (gpu, vram) = detect_gpu_api_uncontained();
+    let line = match gpu {
         HostGpu::None => "none".to_string(),
         HostGpu::Cuda { major } => format!("cuda:{major}"),
         HostGpu::Rocm => "rocm".to_string(),
         HostGpu::Vulkan => "vulkan".to_string(),
-        // Unreachable in practice: this subprocess is only ever spawned
-        // from detect_gpu_api_isolated, itself only compiled/called on
-        // Linux/Windows — kept only so this match stays exhaustive.
+        // Unreachable: this subprocess only runs on Linux/Windows.
         HostGpu::Metal => "none".to_string(),
     };
-    println!("{line}");
+    println!("{line}\n{vram}");
     std::process::exit(0);
 }
 
@@ -182,21 +222,61 @@ fn detect_macos() -> HostGpu {
     }
 }
 
+/// Kind + total VRAM bytes (0 if none/unknown) for the best accelerator
+/// on this host — used by [`crate::hostgpu::default_ctx_size`]. A
+/// separate probe from [`detect`] (which only needs kind) rather than a
+/// shared cache, since this only runs once at `llmman serve` startup.
+pub fn detect_with_vram() -> (HostGpu, u64) {
+    #[cfg(target_os = "macos")]
+    {
+        (detect_macos(), apple_unified_memory_bytes().unwrap_or(0))
+    }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        spawn_probe_subprocess_with_vram().unwrap_or((HostGpu::None, 0))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        (HostGpu::None, 0)
+    }
+}
+
+/// Apple Silicon shares one unified memory pool between CPU and GPU, so
+/// total system memory (`sysctlbyname("hw.memsize")`) stands in for
+/// "VRAM" here — the same assumption llama.cpp's own Metal backend makes
+/// when sizing its buffers.
+#[cfg(target_os = "macos")]
+fn apple_unified_memory_bytes() -> Option<u64> {
+    let mut bytes: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    let name = c"hw.memsize";
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut bytes as *mut u64 as *mut c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0).then_some(bytes)
+}
+
 /// The real, potentially-crashing detection logic — see
 /// [`detect_gpu_api_isolated`]'s doc comment for why every caller outside
 /// this module reaches this only indirectly, via a subprocess.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn detect_gpu_api_uncontained() -> HostGpu {
-    if let Some(g) = detect_cuda() {
-        return g;
+fn detect_gpu_api_uncontained() -> (HostGpu, u64) {
+    if let Some((gpu, vram)) = detect_cuda() {
+        return (gpu, vram);
     }
-    if detect_rocm() {
-        return HostGpu::Rocm;
+    if let Some(vram) = detect_rocm() {
+        return (HostGpu::Rocm, vram);
     }
-    if detect_vulkan() {
-        return HostGpu::Vulkan;
+    if let Some(vram) = detect_vulkan() {
+        return (HostGpu::Vulkan, vram);
     }
-    HostGpu::None
+    (HostGpu::None, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +357,7 @@ fn cuda_major_from_driver_version(driver_version: i32) -> u32 {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn detect_cuda() -> Option<HostGpu> {
+fn detect_cuda() -> Option<(HostGpu, u64)> {
     let lib = open_cuda_lib()?;
     unsafe {
         let cu_driver_get_version: Symbol<unsafe extern "C" fn(*mut i32) -> i32> =
@@ -298,6 +378,7 @@ fn detect_cuda() -> Option<HostGpu> {
             return None;
         }
 
+        let mut vram: u64 = 0;
         if let (Ok(cu_device_get), Ok(cu_device_get_attribute)) = (
             lib.get::<unsafe extern "C" fn(*mut i32, i32) -> i32>(b"cuDeviceGet\0"),
             lib.get::<unsafe extern "C" fn(*mut i32, i32, i32) -> i32>(b"cuDeviceGetAttribute\0"),
@@ -317,12 +398,24 @@ fn detect_cuda() -> Option<HostGpu> {
                     device,
                 );
                 eprintln!("[llmman] CUDA device 0 compute capability: {major}.{minor}");
+
+                if let Ok(cu_device_total_mem) =
+                    lib.get::<unsafe extern "C" fn(*mut u64, i32) -> i32>(b"cuDeviceTotalMem_v2\0")
+                {
+                    let mut bytes: u64 = 0;
+                    if cu_device_total_mem(&mut bytes, device) == CUDA_SUCCESS {
+                        vram = bytes;
+                    }
+                }
             }
         }
 
-        Some(HostGpu::Cuda {
-            major: cuda_major_from_driver_version(driver_version),
-        })
+        Some((
+            HostGpu::Cuda {
+                major: cuda_major_from_driver_version(driver_version),
+            },
+            vram,
+        ))
     }
 }
 
@@ -338,19 +431,32 @@ fn detect_cuda() -> Option<HostGpu> {
 
 const HIP_SUCCESS: i32 = 0;
 
+/// `Some(total_vram_bytes)` if a HIP device is present (0 if its memory
+/// couldn't be read), `None` if not.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn detect_rocm() -> bool {
-    let Some(lib) = open_hip_lib() else {
-        return false;
-    };
+fn detect_rocm() -> Option<u64> {
+    let lib = open_hip_lib()?;
     unsafe {
-        let Ok(hip_get_device_count) =
-            lib.get::<unsafe extern "C" fn(*mut i32) -> i32>(b"hipGetDeviceCount\0")
-        else {
-            return false;
-        };
+        let hip_get_device_count = lib
+            .get::<unsafe extern "C" fn(*mut i32) -> i32>(b"hipGetDeviceCount\0")
+            .ok()?;
         let mut count: i32 = 0;
-        hip_get_device_count(&mut count) == HIP_SUCCESS && count > 0
+        if hip_get_device_count(&mut count) != HIP_SUCCESS || count == 0 {
+            return None;
+        }
+
+        let mut vram: u64 = 0;
+        if let (Ok(hip_set_device), Ok(hip_mem_get_info)) = (
+            lib.get::<unsafe extern "C" fn(i32) -> i32>(b"hipSetDevice\0"),
+            lib.get::<unsafe extern "C" fn(*mut u64, *mut u64) -> i32>(b"hipMemGetInfo\0"),
+        ) {
+            hip_set_device(0);
+            let (mut free, mut total): (u64, u64) = (0, 0);
+            if hip_mem_get_info(&mut free, &mut total) == HIP_SUCCESS {
+                vram = total;
+            }
+        }
+        Some(vram)
     }
 }
 
@@ -416,16 +522,39 @@ struct VkQueueFamilyProperties {
 #[repr(C, align(8))]
 struct RawPhysicalDeviceProperties([u8; 1024]);
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn detect_vulkan() -> bool {
-    let Some(lib) = open_vulkan_lib() else {
-        return false;
-    };
-    unsafe { detect_vulkan_inner(&lib).unwrap_or(false) }
+const VK_MAX_MEMORY_HEAPS: usize = 16;
+const VK_MEMORY_HEAP_DEVICE_LOCAL_BIT: u32 = 0x1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VkMemoryHeap {
+    size: u64,
+    flags: u32,
+    _pad: u32,
+}
+
+/// `VkPhysicalDeviceMemoryProperties`, minus its 32-entry `memoryTypes`
+/// array (unused here) — safe to overwrite as a stand-in the same way
+/// [`RawPhysicalDeviceProperties`] is: `vkGetPhysicalDeviceMemoryProperties`
+/// only ever reads/writes the struct's fixed, spec-frozen layout, and
+/// this reads back just `memoryHeapCount`/`memoryHeaps`, past a
+/// same-sized raw padding block standing in for `memoryTypes`.
+#[repr(C)]
+struct RawPhysicalDeviceMemoryProperties {
+    memory_type_count: u32,
+    _memory_types_padding: [u8; 32 * 8],
+    memory_heap_count: u32,
+    memory_heaps: [VkMemoryHeap; VK_MAX_MEMORY_HEAPS],
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-unsafe fn detect_vulkan_inner(lib: &Library) -> Option<bool> {
+fn detect_vulkan() -> Option<u64> {
+    let lib = open_vulkan_lib()?;
+    unsafe { detect_vulkan_inner(&lib).unwrap_or(None) }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+unsafe fn detect_vulkan_inner(lib: &Library) -> Option<Option<u64>> {
     let vk_create_instance: Symbol<
         unsafe extern "C" fn(*const VkInstanceCreateInfo, *const c_void, *mut VkInstance) -> i32,
     > = lib.get(b"vkCreateInstance\0").ok()?;
@@ -441,6 +570,9 @@ unsafe fn detect_vulkan_inner(lib: &Library) -> Option<bool> {
     > = lib
         .get(b"vkGetPhysicalDeviceQueueFamilyProperties\0")
         .ok()?;
+    let vk_get_physical_device_memory_properties: Symbol<
+        unsafe extern "C" fn(VkPhysicalDevice, *mut RawPhysicalDeviceMemoryProperties),
+    > = lib.get(b"vkGetPhysicalDeviceMemoryProperties\0").ok()?;
 
     let create_info = VkInstanceCreateInfo {
         s_type: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -454,21 +586,21 @@ unsafe fn detect_vulkan_inner(lib: &Library) -> Option<bool> {
     };
     let mut instance: VkInstance = std::ptr::null_mut();
     if vk_create_instance(&create_info, std::ptr::null(), &mut instance) != VK_SUCCESS {
-        return Some(false);
+        return Some(None);
     }
 
     let mut count: u32 = 0;
-    let capable = if vk_enumerate_physical_devices(instance, &mut count, std::ptr::null_mut())
+    let found = if vk_enumerate_physical_devices(instance, &mut count, std::ptr::null_mut())
         != VK_SUCCESS
         || count == 0
     {
-        false
+        None
     } else {
         let mut devices: Vec<VkPhysicalDevice> = vec![std::ptr::null_mut(); count as usize];
         if vk_enumerate_physical_devices(instance, &mut count, devices.as_mut_ptr()) != VK_SUCCESS {
-            false
+            None
         } else {
-            let mut capable_count = 0u32;
+            let mut found: Option<u64> = None;
             for &device in &devices {
                 let mut props_buf = RawPhysicalDeviceProperties([0u8; 1024]);
                 vk_get_physical_device_properties(device, props_buf.0.as_mut_ptr());
@@ -502,16 +634,31 @@ unsafe fn detect_vulkan_inner(lib: &Library) -> Option<bool> {
                     q.queue_flags & VK_QUEUE_COMPUTE_BIT != 0
                         && q.queue_flags & VK_QUEUE_TRANSFER_BIT != 0
                 });
-                if has_compute {
-                    capable_count += 1;
+                if !has_compute {
+                    continue;
                 }
+
+                let mut mem_props = RawPhysicalDeviceMemoryProperties {
+                    memory_type_count: 0,
+                    _memory_types_padding: [0u8; 32 * 8],
+                    memory_heap_count: 0,
+                    memory_heaps: [VkMemoryHeap::default(); VK_MAX_MEMORY_HEAPS],
+                };
+                vk_get_physical_device_memory_properties(device, &mut mem_props);
+                let vram: u64 = mem_props.memory_heaps
+                    [..(mem_props.memory_heap_count as usize).min(VK_MAX_MEMORY_HEAPS)]
+                    .iter()
+                    .filter(|h| h.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT != 0)
+                    .map(|h| h.size)
+                    .sum();
+                found = Some(found.unwrap_or(0) + vram);
             }
-            capable_count > 0
+            found
         }
     };
 
     vk_destroy_instance(instance, std::ptr::null());
-    Some(capable)
+    Some(found)
 }
 
 #[cfg(test)]
@@ -523,6 +670,16 @@ mod tests {
         assert_eq!(cuda_major_from_driver_version(12040), 12); // "12.4"
         assert_eq!(cuda_major_from_driver_version(13030), 13); // "13.3"
         assert_eq!(cuda_major_from_driver_version(0), 0);
+    }
+
+    #[test]
+    fn default_ctx_size_for_defers_above_the_top_vram_tier() {
+        assert_eq!(default_ctx_size_for(0), Some(32768));
+        assert_eq!(default_ctx_size_for(8 * GIB), Some(32768));
+        assert_eq!(default_ctx_size_for(23 * GIB), Some(32768));
+        assert_eq!(default_ctx_size_for(46 * GIB), Some(32768));
+        assert_eq!(default_ctx_size_for(47 * GIB), None);
+        assert_eq!(default_ctx_size_for(80 * GIB), None);
     }
 
     #[test]
@@ -549,6 +706,25 @@ mod tests {
         assert_eq!(parse_probe_output(""), None);
         assert_eq!(parse_probe_output("garbage\n"), None);
         assert_eq!(parse_probe_output("cuda:not-a-number\n"), None);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn parse_probe_output_with_vram_reads_the_second_line() {
+        assert_eq!(
+            parse_probe_output_with_vram("cuda:12\n8589934592\n"),
+            Some((HostGpu::Cuda { major: 12 }, 8589934592))
+        );
+        // Missing or unparseable second line: VRAM unknown, not an error.
+        assert_eq!(
+            parse_probe_output_with_vram("none\n"),
+            Some((HostGpu::None, 0))
+        );
+        assert_eq!(
+            parse_probe_output_with_vram("rocm\ngarbage\n"),
+            Some((HostGpu::Rocm, 0))
+        );
+        assert_eq!(parse_probe_output_with_vram("garbage\n0\n"), None);
     }
 
     /// A crashing (or otherwise abnormally-exiting) probe subprocess must
@@ -602,5 +778,6 @@ mod tests {
         println!("detect_cuda() -> {:?}", detect_cuda());
         println!("detect_rocm() -> {:?}", detect_rocm());
         println!("detect_vulkan() -> {:?}", detect_vulkan());
+        println!("default_ctx_size() -> {:?}", default_ctx_size());
     }
 }

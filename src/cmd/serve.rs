@@ -100,30 +100,26 @@ pub struct ServeArgs {
     /// resolves a local binary at all).
     #[arg(long, conflicts_with_all = ["ociman", "pull_oci"])]
     pub pull_bin: bool,
+}
 
-    /// Request this many tokens of context (`--ctx-size`/`-c`) for every
-    /// `llama-server` this daemon spawns, instead of leaving it unset and
-    /// letting llama-server fall back to each model's own trained context
-    /// length (`n_ctx_train` from its GGUF metadata). This is a ceiling,
-    /// not a guarantee: llama-server caps the requested value back down
-    /// to a model's own n_ctx_train whenever it's smaller, logging "the
-    /// slot context (N) exceeds the training context of the model (M) -
-    /// capping" and loading at M instead — the same clamp-and-warn
-    /// behavior Ollama's own server (llm/server.go in ollama/ollama)
-    /// independently implements for the same reason: serving positions
-    /// beyond a model's trained length is unverified territory for a
-    /// model's RoPE-based position embeddings and risks incoherent or
-    /// NaN output, so neither this flag nor anything else in llmman
-    /// tries to defeat that safety net (e.g. via llama-server's own
-    /// `--override-kv`, which can rewrite the GGUF metadata llama-server
-    /// checks against — deliberately not done here). This is a single
-    /// value applied to every model this daemon loads (there is no
-    /// per-model override): a model whose own trained context is larger
-    /// than this gets capped down to this value; a model whose own
-    /// trained context is smaller gets capped down to its own instead,
-    /// per the paragraph above.
-    #[arg(long, value_name = "N")]
-    pub ctx_size: Option<u32>,
+/// Context tokens requested for every `llama-server` this daemon spawns —
+/// read from `LLMMAN_CONTEXT_LENGTH` (an env var, not a `llmman serve`
+/// flag). A ceiling, not a guarantee: llama-server caps it back down to
+/// a model's own trained context (`n_ctx_train`) when that's smaller,
+/// with a warning, since serving positions past a model's trained
+/// length risks incoherent/NaN output.
+///
+/// Unset or unparseable, this falls back to
+/// [`crate::hostgpu::default_ctx_size`]: a VRAM-tiered value (see that
+/// function's doc comment).
+fn context_length_from_env() -> Option<u32> {
+    parse_context_length(std::env::var("LLMMAN_CONTEXT_LENGTH").ok().as_deref())
+}
+
+/// [`context_length_from_env`]'s parsing, split out so it's testable
+/// without mutating the real process environment.
+fn parse_context_length(value: Option<&str>) -> Option<u32> {
+    value?.trim().parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -150,8 +146,9 @@ struct Inner {
     exe: Option<PathBuf>,
     ociman: Option<crate::container::ContainerManager>,
     llama_cpp_version: Option<String>,
-    // See ServeArgs::ctx_size's doc comment — forwarded verbatim to every
-    // spawn_llama_server/container::spawn call, local or containerized.
+    // See context_length_from_env's doc comment — forwarded verbatim to
+    // every spawn_llama_server/container::spawn call, local or
+    // containerized.
     ctx_size: Option<u32>,
     store_path: PathBuf,
     cache_path: PathBuf,
@@ -630,11 +627,9 @@ async fn spawn_llama_server(
         "--host",
         "127.0.0.1",
     ]);
-    // See ServeArgs::ctx_size's doc comment — unset leaves llama-server's
-    // own default (each model's trained n_ctx_train) untouched. llama-server
-    // itself caps this back down to n_ctx_train when it's smaller, with a
-    // warning, the same way Ollama's own server does — this is intentional,
-    // not a bug to work around (see ServeArgs::ctx_size).
+    // `ctx_size` is already the effective value (see
+    // context_length_from_env); `None` leaves --ctx-size unset, falling
+    // back to n_ctx_train.
     if let Some(n) = ctx_size {
         cmd.args(["--ctx-size", &n.to_string()]);
     }
@@ -2374,6 +2369,16 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let cache_path = store_path.parent().unwrap_or(&store_path).join("cache");
     std::fs::create_dir_all(&cache_path)?;
 
+    // See context_length_from_env's doc comment. spawn_blocking: like
+    // resolve_llama_server above, the VRAM probe fallback spawns a
+    // subprocess and must not block this async fn's executor thread.
+    let ctx_size = match context_length_from_env() {
+        Some(n) => Some(n),
+        None => tokio::task::spawn_blocking(crate::hostgpu::default_ctx_size)
+            .await
+            .context("hostgpu probe task panicked")?,
+    };
+
     let state = AppState(Arc::new(Inner {
         manager: Mutex::new(ModelManager {
             running: HashMap::new(),
@@ -2387,7 +2392,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             .map(|p| p.canonicalize().unwrap_or(p)),
         ociman: _args.ociman,
         llama_cpp_version: _args.llama_cpp_version.clone(),
-        ctx_size: _args.ctx_size,
+        ctx_size,
         store_path,
         cache_path,
         client: Client::new(),
@@ -2493,6 +2498,16 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_context_length_accepts_a_plain_number_and_rejects_everything_else() {
+        assert_eq!(parse_context_length(Some("32768")), Some(32768));
+        assert_eq!(parse_context_length(Some(" 32768 \n")), Some(32768));
+        assert_eq!(parse_context_length(None), None);
+        assert_eq!(parse_context_length(Some("")), None);
+        assert_eq!(parse_context_length(Some("not-a-number")), None);
+        assert_eq!(parse_context_length(Some("-1")), None);
+    }
 
     /// Regression test for the Claude Code bug described on
     /// `build_anthropic_messages`'s own doc comment: a `system`-role

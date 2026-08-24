@@ -210,8 +210,9 @@ pub fn pull_image(ociman: ContainerManager, llama_cpp_version: Option<&str>) -> 
 /// (see [`GpuBackend::image_ref`]) instead of the floating one.
 ///
 /// `ctx_size`, when given, is forwarded as `--ctx-size` to the
-/// containerized `llama-server` — see `cmd::serve::ServeArgs::ctx_size`'s
-/// doc comment for what this does and doesn't guarantee.
+/// containerized `llama-server` — see
+/// `cmd::serve::context_length_from_env`'s doc comment for what this
+/// does and doesn't guarantee.
 pub fn spawn(
     ociman: ContainerManager,
     model_path: &Path,
