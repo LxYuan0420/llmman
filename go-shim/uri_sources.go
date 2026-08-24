@@ -92,8 +92,9 @@ func classifyFile(name string) string {
 	case ".safetensors", ".bin", ".pt", ".pth", ".gguf", ".ggml",
 		".gguf_v2", ".ot", ".engine", ".trt", ".onnx":
 		return "application/vnd.cncf.model.weight.v1.raw"
+	// ".jinja": a standalone chat_template.jinja file, see hf.go.
 	case ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
-		".model", ".tiktoken", ".vocab", ".merges", ".spm":
+		".model", ".tiktoken", ".vocab", ".merges", ".spm", ".jinja":
 		return "application/vnd.cncf.model.weight.config.v1.raw"
 	case ".txt":
 		// tokenizer vocab / merges files are config; README is doc

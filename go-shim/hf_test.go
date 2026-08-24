@@ -254,3 +254,20 @@ func TestBuildCNCFManifestPopulatesMetadata(t *testing.T) {
 		t.Errorf("modelfs.diffIds has %d entries, want 2 (one per layer)", len(model.ModelFS.DiffIDs))
 	}
 }
+
+// Regression: a standalone chat_template.jinja file used to be silently
+// excluded from a safetensors pull, causing vllm/transformers to refuse
+// every chat request with "you must provide a chat template".
+func TestShouldDownloadSafetensorsIncludesChatTemplateJinja(t *testing.T) {
+	if !shouldDownloadSafetensors("chat_template.jinja") {
+		t.Error("chat_template.jinja must be downloaded as part of a safetensors pull")
+	}
+}
+
+func TestSafetensorsMediaTypeClassifiesChatTemplateJinjaAsConfig(t *testing.T) {
+	got := safetensorsMediaType("chat_template.jinja")
+	want := modelspec.MediaTypeModelWeightConfigRaw
+	if got != want {
+		t.Errorf("safetensorsMediaType(chat_template.jinja) = %q, want %q", got, want)
+	}
+}

@@ -827,11 +827,16 @@ func pullHF(ctx context.Context, ref, layoutDir, progressKey string) error {
 }
 
 // safetensorsMediaType maps a file extension to the appropriate CNCF layer media type.
+//
+// ".jinja" is config, not doc: many HF repos ship a standalone
+// chat_template.jinja file, and the Rust-side extractor drops "doc"
+// layers, so a chat template classified that way never reaches the
+// served model directory and vllm refuses every chat request.
 func safetensorsMediaType(path string) string {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".safetensors", ".bin", ".pt", ".pth":
 		return modelspec.MediaTypeModelWeightRaw
-	case ".json", ".model", ".txt", ".tiktoken":
+	case ".json", ".model", ".txt", ".tiktoken", ".jinja":
 		return modelspec.MediaTypeModelWeightConfigRaw
 	default:
 		return modelspec.MediaTypeModelDocRaw
@@ -849,7 +854,9 @@ func shouldDownloadSafetensors(path string) bool {
 	switch ext {
 	case ".safetensors", ".bin", ".pt", ".pth": // weights
 		return true
-	case ".json", ".model", ".txt", ".tiktoken": // config / tokeniser
+	// config / tokenizer — ".jinja" is a standalone chat template file,
+	// see safetensorsMediaType.
+	case ".json", ".model", ".txt", ".tiktoken", ".jinja":
 		return true
 	}
 	// README and licence are useful but optional.

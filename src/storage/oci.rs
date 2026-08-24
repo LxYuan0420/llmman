@@ -269,27 +269,18 @@ impl OciStore {
         desc.annotations = Some(ann);
 
         let mut idx = self.read_index()?;
-        let mut replaced = false;
-        for entry in &mut idx.manifests {
-            if ref_matches(entry, reference) {
-                *entry = desc.clone();
-                replaced = true;
-                break;
-            }
-        }
-        if !replaced {
-            idx.manifests.push(desc);
+        match matching_index(&idx.manifests, reference) {
+            Some(i) => idx.manifests[i] = desc,
+            None => idx.manifests.push(desc),
         }
         self.write_index(&idx)
     }
 
-    /// Find the descriptor for `reference` in the index.
-    /// Matches either the full stored reference or (as fallback) just its tag component.
+    /// Find the descriptor for `reference` in the index — see `matching_index`.
     pub fn find(&self, reference: &str) -> anyhow::Result<Descriptor> {
         let idx = self.read_index()?;
-        idx.manifests
-            .into_iter()
-            .find(|m| ref_matches(m, reference))
+        matching_index(&idx.manifests, reference)
+            .map(|i| idx.manifests[i].clone())
             .ok_or_else(|| anyhow!("image not found: {}", reference))
     }
 
@@ -338,14 +329,14 @@ impl OciStore {
             .collect())
     }
 
-    /// Remove a manifest from the index by reference.  Does not GC blobs.
+    /// Remove the same single entry `find` would return for `reference`
+    /// (see `matching_index`). Does not GC blobs.
     pub fn remove(&self, reference: &str) -> anyhow::Result<()> {
         let mut idx = self.read_index()?;
-        let before = idx.manifests.len();
-        idx.manifests.retain(|m| !ref_matches(m, reference));
-        if idx.manifests.len() == before {
+        let Some(i) = matching_index(&idx.manifests, reference) else {
             return Err(anyhow!("image not found: {}", reference));
-        }
+        };
+        idx.manifests.remove(i);
         self.write_index(&idx)
     }
 
@@ -482,8 +473,9 @@ fn classify_model_layer(rel_path: &str) -> &'static str {
     match ext {
         "safetensors" | "bin" | "pt" | "pth" | "gguf" | "ggml" | "ot" | "engine" | "trt"
         | "onnx" => WEIGHT_TAR_MEDIA_TYPE,
+        // "jinja": a standalone chat_template.jinja file, see go-shim/hf.go.
         "json" | "yaml" | "yml" | "toml" | "ini" | "cfg" | "conf" | "model" | "tiktoken"
-        | "vocab" | "merges" | "spm" => WEIGHT_CONFIG_TAR_MEDIA_TYPE,
+        | "vocab" | "merges" | "spm" | "jinja" => WEIGHT_CONFIG_TAR_MEDIA_TYPE,
         "txt" => {
             if base.contains("vocab") || base.contains("merges") {
                 WEIGHT_CONFIG_TAR_MEDIA_TYPE
@@ -505,55 +497,74 @@ fn classify_model_layer(rel_path: &str) -> &'static str {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Returns true if the descriptor's ref annotation matches `reference`.
-///
-/// Three strategies are tried in order:
-/// 1. Exact match (`"reg/repo:tag"` == `"reg/repo:tag"`)
-/// 2. Tag-only match (`"latest"` matches `"reg/repo:latest"`)
-/// 3. Tagless match: if `reference` has no tag, implicitly append `:latest`
-///    so `"reg/repo"` matches `"reg/repo:latest"`
-fn ref_matches(desc: &Descriptor, reference: &str) -> bool {
-    let stored = match desc
-        .annotations
-        .as_ref()
-        .and_then(|a| a.get("org.opencontainers.image.ref.name"))
-    {
-        Some(s) => s,
-        None => return false,
+/// True if the descriptor's ref annotation matches `reference` precisely
+/// — exact match, tag-only match (a bare `reference` against a stored
+/// `"reg/repo:tag"`), or tagless match (`reference` with an implicit
+/// `:latest` appended). The tag-only branch is unambiguous only when
+/// `reference` is a bare tag that's unique across stored tags — two
+/// different repos sharing the same tag (e.g. both `:0.8b`) can still
+/// both match here, same as `ref_matches_bare_tag_heuristic` below.
+fn ref_matches_precise(desc: &Descriptor, reference: &str) -> bool {
+    let Some(stored) = stored_ref_name(desc) else {
+        return false;
     };
 
     if stored == reference || tag_from_ref(stored) == reference {
         return true;
     }
-
-    // The podman backend's own OCI-layout writer can only ever record a
-    // bare tag here, never a full reference: go-shim/backend_podman.go's
-    // pullToLayout builds the destination as `oci:<layoutDir>:<tag>`
-    // (via tagFromRef), and go.podman.io/image's oci transport uses that
-    // trailing component verbatim as the stored annotation
-    // (oci/layout/oci_dest.go's PutManifest) — there's no repository
-    // component in that reference shape at all to also record. This is
-    // architecturally different from the docker/containerd backend's own
-    // writer (shared_oci.go's updateIndex), which always stores the
-    // *full* reference it was called with, matched by the first check
-    // above. A `stored` value with no '/' is that shape: match it
-    // against the incoming reference's own tag instead of requiring an
-    // (impossible, for this backend) full-reference match.
-    //
-    // Known limitation, not fixed here: two different repositories
-    // pulled with the podman backend that happen to share the same bare
-    // tag are indistinguishable once stored this way — podman's
-    // OCI-layout writer has no way to record more than a tag per entry
-    // to begin with, regardless of what this lookup does.
-    if !stored.contains('/') && stored.as_str() == tag_from_ref(reference) {
+    // `default_tag` also guards non-taggable sources (URI schemes, absolute
+    // paths), so this can't accidentally match one of those against some
+    // unrelated stored `"...:latest"`.
+    if stored == default_tag(reference) {
         return true;
     }
-
-    if stored.as_str() == default_tag(reference) {
-        return true;
-    }
-
     false
+}
+
+/// The podman backend can only ever store a bare tag here, never a full
+/// reference (see backend_podman.go's pullToLayout) — match it against
+/// `reference`'s own tag component instead. Deliberately weaker/lower
+/// priority than `ref_matches_precise`: comparing only a tag substring,
+/// with no repository info, can false-positive against an unrelated
+/// entry (e.g. every tagless reference defaults to "latest"), so `find`
+/// only consults this once nothing in the index matches precisely.
+///
+/// Known limitation: two different repos pulled via podman that happen
+/// to share the same bare tag are indistinguishable once stored this way.
+fn ref_matches_bare_tag_heuristic(desc: &Descriptor, reference: &str) -> bool {
+    let Some(stored) = stored_ref_name(desc) else {
+        return false;
+    };
+    !stored.contains('/') && stored == tag_from_ref(reference)
+}
+
+/// The index of the entry in `manifests` that `find`/`tag`/`remove` should
+/// treat as matching `reference`, or `None`.
+///
+/// Two full passes, not one pass with per-entry fallbacks: two different
+/// entries can each satisfy a different strategy for the same
+/// `reference`, and only iteration order would decide the winner
+/// otherwise. Regression this fixes: an unrelated model stored under a
+/// bare "latest" tag could hijack an unrelated tagless reference (which
+/// also defaults to "latest"), including on a second lookup of a
+/// reference already canonicalized to `...:latest` by a first call. A
+/// precise match anywhere in the index now always wins.
+fn matching_index(manifests: &[Descriptor], reference: &str) -> Option<usize> {
+    manifests
+        .iter()
+        .position(|m| ref_matches_precise(m, reference))
+        .or_else(|| {
+            manifests
+                .iter()
+                .position(|m| ref_matches_bare_tag_heuristic(m, reference))
+        })
+}
+
+fn stored_ref_name(desc: &Descriptor) -> Option<&str> {
+    desc.annotations
+        .as_ref()
+        .and_then(|a| a.get("org.opencontainers.image.ref.name"))
+        .map(|s| s.as_str())
 }
 
 /// Appends `:latest` to `reference` if it has no tag, so a tag-less
@@ -632,31 +643,17 @@ mod tests {
     /// The docker/containerd backend's own writer (shared_oci.go's
     /// updateIndex) always stores the full reference it was called with.
     #[test]
-    fn ref_matches_a_full_reference_stored_verbatim() {
+    fn ref_matches_precise_a_full_reference_stored_verbatim() {
         let d = desc_with_ref("docker.io/ai/qwen3.5:0.8b");
-        assert!(ref_matches(&d, "docker.io/ai/qwen3.5:0.8b"));
-        assert!(!ref_matches(&d, "docker.io/ai/qwen3.5:1.5b"));
-        assert!(!ref_matches(&d, "docker.io/ai/other:0.8b"));
-    }
-
-    /// Regression test: the podman backend's OCI-layout writer
-    /// (go.podman.io/image, via the `oci:<dir>:<tag>` reference shape —
-    /// see backend_podman.go's pullToLayout) can only ever store a bare
-    /// tag here, never a full reference — a real pull otherwise
-    /// succeeded but the model could never be found again afterward
-    /// (`resolve model ...: image not found`) until this matched.
-    #[test]
-    fn ref_matches_a_bare_tag_stored_by_the_podman_backend() {
-        let d = desc_with_ref("0.8b");
-        assert!(ref_matches(&d, "docker.io/ai/qwen3.5:0.8b"));
-        assert!(ref_matches(&d, "0.8b"));
-        assert!(!ref_matches(&d, "docker.io/ai/qwen3.5:1.5b"));
+        assert!(ref_matches_precise(&d, "docker.io/ai/qwen3.5:0.8b"));
+        assert!(!ref_matches_precise(&d, "docker.io/ai/qwen3.5:1.5b"));
+        assert!(!ref_matches_precise(&d, "docker.io/ai/other:0.8b"));
     }
 
     #[test]
-    fn ref_matches_defaults_a_tagless_reference_to_latest() {
+    fn ref_matches_precise_defaults_a_tagless_reference_to_latest() {
         let d = desc_with_ref("docker.io/ai/qwen3.5:latest");
-        assert!(ref_matches(&d, "docker.io/ai/qwen3.5"));
+        assert!(ref_matches_precise(&d, "docker.io/ai/qwen3.5"));
     }
 
     #[test]
@@ -692,14 +689,65 @@ mod tests {
     }
 
     #[test]
-    fn ref_matches_returns_false_without_a_ref_name_annotation() {
+    fn ref_matches_precise_returns_false_without_a_ref_name_annotation() {
         let d = Descriptor {
             media_type: "application/vnd.oci.image.manifest.v1+json".into(),
             digest: "sha256:deadbeef".into(),
             size: 123,
             annotations: None,
         };
-        assert!(!ref_matches(&d, "docker.io/ai/qwen3.5:0.8b"));
+        assert!(!ref_matches_precise(&d, "docker.io/ai/qwen3.5:0.8b"));
+    }
+
+    /// Regression test: the podman backend's OCI-layout writer
+    /// (go.podman.io/image, via the `oci:<dir>:<tag>` reference shape —
+    /// see backend_podman.go's pullToLayout) can only ever store a bare
+    /// tag here, never a full reference — a real pull otherwise
+    /// succeeded but the model could never be found again afterward
+    /// (`resolve model ...: image not found`) until this matched.
+    #[test]
+    fn ref_matches_bare_tag_heuristic_matches_a_bare_tag_stored_by_the_podman_backend() {
+        let d = desc_with_ref("0.8b");
+        assert!(ref_matches_bare_tag_heuristic(
+            &d,
+            "docker.io/ai/qwen3.5:0.8b"
+        ));
+        assert!(!ref_matches_bare_tag_heuristic(
+            &d,
+            "docker.io/ai/qwen3.5:1.5b"
+        ));
+        // An exact bare-tag match is ref_matches_precise's job instead,
+        // via matching_index's two-tier priority.
+        assert_eq!(matching_index(&[d], "0.8b"), Some(0));
+    }
+
+    /// Regression: an unrelated model stored under a bare "latest" tag
+    /// must not hijack a precisely-matching tagless reference (which also
+    /// defaults to "latest"), whether that reference is still tagless or
+    /// already canonicalized to `...:latest` by a prior lookup — earlier
+    /// index position must not decide the winner either way.
+    #[test]
+    fn matching_index_prefers_a_precise_match_over_an_unrelated_bare_latest_regardless_of_order() {
+        let unrelated_bare_latest = desc_with_ref("latest");
+        let inferact = desc_with_ref("hf.co/Inferact/Qwen3.8-27B-NVFP4:latest");
+        let manifests = vec![unrelated_bare_latest.clone(), inferact.clone()];
+
+        let i = matching_index(&manifests, "hf.co/Inferact/Qwen3.8-27B-NVFP4")
+            .expect("must find a match");
+        assert_eq!(manifests[i].digest, inferact.digest);
+
+        let i = matching_index(&manifests, "hf.co/Inferact/Qwen3.8-27B-NVFP4:latest")
+            .expect("must find a match");
+        assert_eq!(manifests[i].digest, inferact.digest);
+
+        // No more specific match anywhere: the bare-tag heuristic still
+        // applies as a last resort.
+        let only_bare_latest = vec![unrelated_bare_latest.clone()];
+        assert_eq!(
+            matching_index(&only_bare_latest, "docker.io/ai/qwen3.5:latest"),
+            Some(0)
+        );
+        assert_eq!(matching_index(&only_bare_latest, "latest"), Some(0));
     }
 
     #[test]
@@ -708,8 +756,9 @@ mod tests {
         assert_eq!(tag_from_ref("docker.io/ai/qwen3.5"), "latest");
         // A bare tag with no slash and no colon (podman's own stored
         // shape) has nothing to extract from — falls back to "latest",
-        // which is why ref_matches needs its own dedicated bare-tag
-        // check above rather than reusing this for both directions.
+        // which is why ref_matches_bare_tag_heuristic exists as its own
+        // dedicated check above rather than reusing this for both
+        // directions.
         assert_eq!(tag_from_ref("0.8b"), "latest");
     }
 
