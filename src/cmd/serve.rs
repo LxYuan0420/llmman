@@ -122,6 +122,59 @@ fn parse_context_length(value: Option<&str>) -> Option<u32> {
     value?.trim().parse().ok()
 }
 
+/// Flash Attention mode requested for every `llama-server` this daemon
+/// spawns — read from `LLMMAN_FLASH_ATTENTION` (an env var, not a
+/// `llmman serve` flag, mirroring [`context_length_from_env`]). Forwarded
+/// verbatim as `--flash-attn <mode>`; unset leaves it off llama-server's
+/// own command line entirely, falling back to its own default (`auto`,
+/// which already enables it whenever the backend/model support it).
+fn flash_attention_from_env() -> Option<String> {
+    parse_flash_attention(std::env::var("LLMMAN_FLASH_ATTENTION").ok().as_deref())
+}
+
+/// [`flash_attention_from_env`]'s parsing, split out so it's testable
+/// without mutating the real process environment. Accepts llama-server's
+/// own vocabulary (`on`/`off`/`auto`) as well as the boolean spelling
+/// (`1`/`0`, `true`/`false`) Ollama documents for `OLLAMA_FLASH_ATTENTION`,
+/// since users porting a config from there would otherwise silently get
+/// llama-server's default instead of what they asked for.
+fn parse_flash_attention(value: Option<&str>) -> Option<String> {
+    let v = value?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    Some(match v.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => "on".to_string(),
+        "0" | "false" | "no" => "off".to_string(),
+        other => other.to_string(),
+    })
+}
+
+/// KV-cache quantization type requested for every `llama-server` this
+/// daemon spawns — read from `LLMMAN_KV_CACHE_TYPE` (an env var, not a
+/// `llmman serve` flag, mirroring [`context_length_from_env`]). Forwarded
+/// as both `--cache-type-k` and `--cache-type-v`: llama-server takes
+/// those separately, but Ollama's `OLLAMA_KV_CACHE_TYPE` (the convention
+/// this mirrors) documents a single value applied to both, and there's no
+/// use case yet for setting K and V independently through this daemon.
+///
+/// One of `f16` (llama-server's own default), `q8_0`, or `q4_0` — the
+/// same set Ollama documents — trades output quality for a smaller
+/// KV-cache footprint at long context lengths. Not validated here;
+/// llama-server rejects an unsupported value itself, surfaced via
+/// `wait_for_ready`'s stderr-tail capture same as any other startup
+/// failure.
+fn kv_cache_type_from_env() -> Option<String> {
+    parse_kv_cache_type(std::env::var("LLMMAN_KV_CACHE_TYPE").ok().as_deref())
+}
+
+/// [`kv_cache_type_from_env`]'s parsing, split out so it's testable
+/// without mutating the real process environment.
+fn parse_kv_cache_type(value: Option<&str>) -> Option<String> {
+    let v = value?.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
@@ -150,6 +203,14 @@ struct Inner {
     // every spawn_llama_server/container::spawn call, local or
     // containerized.
     ctx_size: Option<u32>,
+    // See flash_attention_from_env's doc comment — forwarded verbatim to
+    // every spawn_llama_server/container::spawn call, local or
+    // containerized.
+    flash_attention: Option<String>,
+    // See kv_cache_type_from_env's doc comment — forwarded verbatim to
+    // every spawn_llama_server/container::spawn call, local or
+    // containerized.
+    kv_cache_type: Option<String>,
     store_path: PathBuf,
     cache_path: PathBuf,
     client: Client,
@@ -1281,6 +1342,8 @@ async fn spawn_llama_server(
     model: &Path,
     port: u16,
     ctx_size: Option<u32>,
+    flash_attention: Option<&str>,
+    kv_cache_type: Option<&str>,
 ) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([
@@ -1296,6 +1359,16 @@ async fn spawn_llama_server(
     // back to n_ctx_train.
     if let Some(n) = ctx_size {
         cmd.args(["--ctx-size", &n.to_string()]);
+    }
+    // See flash_attention_from_env's doc comment; `None` leaves
+    // --flash-attn unset, falling back to llama-server's own `auto`.
+    if let Some(mode) = flash_attention {
+        cmd.args(["--flash-attn", mode]);
+    }
+    // See kv_cache_type_from_env's doc comment; `None` leaves
+    // --cache-type-k/-v unset, falling back to llama-server's own `f16`.
+    if let Some(t) = kv_cache_type {
+        cmd.args(["--cache-type-k", t, "--cache-type-v", t]);
     }
     // See GPU_VISIBLE_DEVICE_VARS's own doc comment — already inherited
     // by default, forwarded explicitly here for clarity.
@@ -1681,11 +1754,21 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
                 port,
                 state.0.llama_cpp_version.as_deref(),
                 state.0.ctx_size,
+                state.0.flash_attention.as_deref(),
+                state.0.kv_cache_type.as_deref(),
             )?,
         ),
         (ModelPath::Gguf(path), None) => {
             let bin = local_llama_server_bin(state).await?;
-            let (child, tail) = spawn_llama_server(&bin, path, port, state.0.ctx_size).await?;
+            let (child, tail) = spawn_llama_server(
+                &bin,
+                path,
+                port,
+                state.0.ctx_size,
+                state.0.flash_attention.as_deref(),
+                state.0.kv_cache_type.as_deref(),
+            )
+            .await?;
             stderr_tail = Some(tail);
             ModelProcess::Local(Engine::LlamaServer, child, None)
         }
@@ -3176,6 +3259,8 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         ociman: _args.ociman,
         llama_cpp_version: _args.llama_cpp_version.clone(),
         ctx_size,
+        flash_attention: flash_attention_from_env(),
+        kv_cache_type: kv_cache_type_from_env(),
         store_path,
         cache_path,
         client: Client::new(),
@@ -3696,6 +3781,8 @@ mod tests {
             ociman: None,
             llama_cpp_version: None,
             ctx_size: None,
+            flash_attention: None,
+            kv_cache_type: None,
             store_path: std::env::temp_dir(),
             cache_path: std::env::temp_dir(),
             client: Client::new(),
@@ -3909,6 +3996,34 @@ mod tests {
         assert_eq!(parse_context_length(Some("")), None);
         assert_eq!(parse_context_length(Some("not-a-number")), None);
         assert_eq!(parse_context_length(Some("-1")), None);
+    }
+
+    #[test]
+    fn parse_flash_attention_accepts_llama_server_and_ollama_spellings() {
+        // llama-server's own vocabulary passes straight through.
+        assert_eq!(parse_flash_attention(Some("on")), Some("on".into()));
+        assert_eq!(parse_flash_attention(Some("off")), Some("off".into()));
+        assert_eq!(parse_flash_attention(Some("auto")), Some("auto".into()));
+        // Ollama's OLLAMA_FLASH_ATTENTION boolean spelling is translated.
+        assert_eq!(parse_flash_attention(Some("1")), Some("on".into()));
+        assert_eq!(parse_flash_attention(Some("true")), Some("on".into()));
+        assert_eq!(parse_flash_attention(Some("0")), Some("off".into()));
+        assert_eq!(parse_flash_attention(Some("false")), Some("off".into()));
+        // Case-insensitive, whitespace-tolerant.
+        assert_eq!(parse_flash_attention(Some(" ON \n")), Some("on".into()));
+        // Unset/empty leaves llama-server's own default untouched.
+        assert_eq!(parse_flash_attention(None), None);
+        assert_eq!(parse_flash_attention(Some("")), None);
+        assert_eq!(parse_flash_attention(Some("   ")), None);
+    }
+
+    #[test]
+    fn parse_kv_cache_type_trims_whitespace_and_treats_empty_as_unset() {
+        assert_eq!(parse_kv_cache_type(Some("q8_0")), Some("q8_0".into()));
+        assert_eq!(parse_kv_cache_type(Some(" q4_0 \n")), Some("q4_0".into()));
+        assert_eq!(parse_kv_cache_type(None), None);
+        assert_eq!(parse_kv_cache_type(Some("")), None);
+        assert_eq!(parse_kv_cache_type(Some("   ")), None);
     }
 
     /// Regression test for the Claude Code bug described on

@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod build;
 pub mod inspect;
 pub mod launch;
