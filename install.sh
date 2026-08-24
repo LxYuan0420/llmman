@@ -17,6 +17,16 @@
 # Env overrides:
 #   LLMMAN_VERSION   pin an exact release tag (e.g. "v0.2.0"); default: latest
 #   LLMMAN_REPO      "owner/repo" to fetch from; default: llmmanorg/llmman
+#   LLMMAN_BASE_URL  release base URL to fetch from, in place of GitHub's own
+#                    "https://github.com/$LLMMAN_REPO/releases"; exists so
+#                    CI (.github/workflows/ci.yml's e2e job) can point this
+#                    script at a throwaway local HTTP server serving that
+#                    job's own just-built binary instead — a real GitHub
+#                    release for a commit/PR still under test wouldn't exist
+#                    yet — while every other part of the install (OS/arch
+#                    detection, the download itself, the --version smoke
+#                    check, the final install-directory copy) still runs
+#                    completely unmodified against a real HTTP round trip.
 #   SKIP_INSTALL     download and verify only, don't install to ~/.local/bin
 
 : "${LLMMAN_REPO:=llmmanorg/llmman}"
@@ -62,11 +72,12 @@ main() {
 	[ "$HOME" ] || die "No HOME, please check your OS"
 
 	ASSET="llmman-${TARGET}"
+	BASE_URL="${LLMMAN_BASE_URL:-https://github.com/$LLMMAN_REPO/releases}"
 	if [ "$LLMMAN_VERSION" ]; then
-		URL="https://github.com/$LLMMAN_REPO/releases/download/$LLMMAN_VERSION/$ASSET"
+		URL="$BASE_URL/download/$LLMMAN_VERSION/$ASSET"
 		printf "Version: %s\n" "$LLMMAN_VERSION"
 	else
-		URL="https://github.com/$LLMMAN_REPO/releases/latest/download/$ASSET"
+		URL="$BASE_URL/latest/download/$ASSET"
 		printf "Version: latest\n"
 	fi
 

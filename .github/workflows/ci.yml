@@ -614,6 +614,118 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
+      # ── Install llmman via the real install script ───────────────────────
+      # Runs the actual install.sh (Unix) / install.ps1 (Windows) a real
+      # user's `curl ... | sh` / `irm ... | iex` runs, pointed (via
+      # LLMMAN_BASE_URL — an env override added to both scripts
+      # specifically for this) at a throwaway local HTTP server serving
+      # *this job's own* just-built binary from the step above, instead of
+      # a real GitHub release: a release for a commit/PR still under test
+      # wouldn't exist yet, and even on `main` a real release still lags
+      # one full CI run behind whatever's actually being tested right now.
+      # Every other part of the install — OS/arch detection, the download
+      # itself, the `--version` smoke check, and the final
+      # install-directory copy — runs completely unmodified, so this is a
+      # real test of the install script's own logic, not a stand-in for
+      # it. `tests/launch_e2e.rs` (next step) then runs the resulting
+      # *installed* binary (via LLMMAN_E2E_BIN, set below) instead of the
+      # one `cargo build` itself dropped in target/, so the whole e2e
+      # suite ends up testing the same artifact a real install actually
+      # produces.
+      #
+      # `shell: bash` throughout (including the Windows entries, same as
+      # the "Install llama-server" step above): install.ps1 itself still
+      # needs real PowerShell, invoked here as `pwsh -NoProfile -File`
+      # from within this bash script — the same pattern that step already
+      # uses for `powershell -NoProfile -Command` — rather than a second,
+      # Windows-only `shell: pwsh` step, since everything else here (the
+      # local server, the download readiness poll) is identical on every
+      # OS.
+      - name: Install llmman (via install script)
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            asset="llmman-$target.exe"
+            bin="target/$target/release/llmman.exe"
+          else
+            asset="llmman-$target"
+            bin="target/$target/release/llmman"
+          fi
+
+          # Mirrors the one path shape both scripts ever request
+          # ("<base>/latest/download/<asset>" — neither script is given
+          # LLMMAN_VERSION here, so both take their own "latest" branch),
+          # so the download step below is exercising the exact same
+          # URL-construction logic a real unpinned install does.
+          release_dir="$RUNNER_TEMP/fake-releases/latest/download"
+          mkdir -p "$release_dir"
+          cp "$bin" "$release_dir/$asset"
+
+          # A minimal static file server (plain Node http/fs — no npm
+          # package fetch) standing in for GitHub's own release-asset
+          # CDN. Node, not e.g. Python: every entry in this matrix already
+          # has Node on PATH (set up above for the claude/opencode/codex
+          # CLIs under test), so this adds no new dependency/toolchain,
+          # unlike Python (present, but not guaranteed to be `python3` vs
+          # `python` the same way across all five of this matrix's OSes).
+          # A real HTTP round trip, not a file:// URL curl/Invoke-WebRequest
+          # would also happily accept but a real install never goes
+          # through.
+          cat > "$RUNNER_TEMP/serve-release.js" <<'EOF'
+          const http = require("http");
+          const fs = require("fs");
+          const path = require("path");
+          const root = process.argv[2];
+          const port = Number(process.argv[3]);
+          http.createServer((req, res) => {
+            const file = path.join(root, decodeURIComponent(req.url));
+            fs.readFile(file, (err, data) => {
+              if (err) { res.writeHead(404); res.end(); return; }
+              res.writeHead(200);
+              res.end(data);
+            });
+          }).listen(port, "127.0.0.1");
+          EOF
+          node "$RUNNER_TEMP/serve-release.js" "$RUNNER_TEMP/fake-releases" 8791 &
+          server_pid=$!
+          # This server only needs to live long enough for the install
+          # below — killed at the end of this step either way (`trap ...
+          # EXIT`, not a separate step) rather than left running for the
+          # rest of the job for nothing.
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 50); do
+            curl -fsS "http://127.0.0.1:8791/latest/download/$asset" -o /dev/null 2>/dev/null && break
+            sleep 0.2
+          done
+
+          export LLMMAN_BASE_URL="http://127.0.0.1:8791"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            pwsh -NoProfile -File install.ps1
+            # cygpath -w, not a bare "$LOCALAPPDATA/..." concatenation:
+            # this exact value is about to cross into $GITHUB_ENV for the
+            # *next* step's own child process (tests/launch_e2e.rs's
+            # `Command::new`) to spawn directly — a canonical
+            # backslash-separated Windows path there is one less thing to
+            # go wrong than relying on that consumer also tolerating
+            # forward slashes.
+            install_bin=$(cygpath -w "$LOCALAPPDATA/Microsoft/WindowsApps/llmman.exe")
+          else
+            sh install.sh
+            install_bin="$HOME/.local/bin/llmman"
+            # install.sh itself only prints instructions to add this to
+            # PATH for *future* shell sessions (see its own PATH-check
+            # branch) — added here too so any later step in this job that
+            # just runs `llmman` bare (matching what a real post-install
+            # shell would do) can.
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+
+          "$install_bin" --version
+          echo "LLMMAN_E2E_BIN=$install_bin" >> "$GITHUB_ENV"
+
       # LLAMA_ARG_N_GPU_LAYERS=0 on macOS only: llama-server reads this
       # itself (it's the env form of its own --gpu-layers flag), and this
       # process's environment reaches the llama-server subprocess
@@ -667,6 +779,17 @@ jobs:
       # this test binary must link against the same backend the one built
       # above did, or the two podman entries would silently test a docker-
       # backed binary instead.
+      #
+      # LLMMAN_E2E_BIN isn't set here — it doesn't need to be. The
+      # "Install llmman (via install script)" step above already exported
+      # it into $GITHUB_ENV, which every later step in this job (this one
+      # included) inherits automatically; see tests/launch_e2e.rs's own
+      # `llmman_bin` doc comment for what it's actually for: making this
+      # whole suite launch the *installed* binary the step above produced,
+      # not the one `cargo build`/this step's own compile drops in
+      # target/ (which still happens regardless — env!("CARGO_BIN_EXE_llmman")
+      # is a compile-time macro, and it's still that step's fallback for a
+      # plain local `cargo test` run).
       - name: cargo test --test launch_e2e
         run: cargo test --release --target ${{ matrix.target }} ${{ matrix.feature-flags }} --test launch_e2e -- --test-threads=1 --nocapture
         env:

@@ -17,6 +17,16 @@
 # Env overrides:
 #   LLMMAN_VERSION   pin an exact release tag (e.g. "v0.2.0"); default: latest
 #   LLMMAN_REPO      "owner/repo" to fetch from; default: llmmanorg/llmman
+#   LLMMAN_BASE_URL  release base URL to fetch from, in place of GitHub's own
+#                    "https://github.com/$Repo/releases"; exists so CI
+#                    (.github/workflows/ci.yml's e2e job) can point this
+#                    script at a throwaway local HTTP server serving that
+#                    job's own just-built binary instead — a real GitHub
+#                    release for a commit/PR still under test wouldn't exist
+#                    yet — while every other part of the install (arch
+#                    detection, the download itself, the --version smoke
+#                    check, the final install-directory copy) still runs
+#                    completely unmodified against a real HTTP round trip.
 #   SKIP_INSTALL     download and verify only, don't install
 
 function Die {
@@ -36,12 +46,14 @@ function Main {
     }
 
     $Asset = "llmman-$Target.exe"
+    $BaseUrl = $env:LLMMAN_BASE_URL
+    if (!$BaseUrl) { $BaseUrl = "https://github.com/$Repo/releases" }
     $Version = $env:LLMMAN_VERSION
     if ($Version) {
-        $Url = "https://github.com/$Repo/releases/download/$Version/$Asset"
+        $Url = "$BaseUrl/download/$Version/$Asset"
         "Version: $Version"
     } else {
-        $Url = "https://github.com/$Repo/releases/latest/download/$Asset"
+        $Url = "$BaseUrl/latest/download/$Asset"
         "Version: latest"
     }
 
