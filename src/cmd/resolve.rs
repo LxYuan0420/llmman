@@ -88,8 +88,7 @@ pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
         let layout_dir = store_path
             .to_str()
             .context("store path is not valid UTF-8")?;
-        crate::ffi::pull(&reference, layout_dir)
-            .with_context(|| format!("pulling {reference}"))?;
+        crate::ffi::pull(&reference, layout_dir).with_context(|| format!("pulling {reference}"))?;
     }
 
     let resolved = resolve_model(&store_path, &cache_path, &reference)

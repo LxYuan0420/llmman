@@ -20,6 +20,21 @@ env:
   LLAMA_CPP_RELEASE: b10293
 
 jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}

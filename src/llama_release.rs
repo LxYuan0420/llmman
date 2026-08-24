@@ -82,7 +82,10 @@ fn fetch_release(client: &reqwest::blocking::Client, version: Option<&str>) -> R
 }
 
 fn find_asset<'a>(release: &'a Release, must_contain: &str) -> Option<&'a Asset> {
-    release.assets.iter().find(|a| a.name.contains(must_contain))
+    release
+        .assets
+        .iter()
+        .find(|a| a.name.contains(must_contain))
 }
 
 // ---------------------------------------------------------------------------
@@ -283,15 +286,24 @@ fn progress_bar(total: u64, label: &str) -> Option<ProgressBar> {
     Some(pb)
 }
 
-fn download_to_file(client: &reqwest::blocking::Client, url: &str, dest: &Path, label: &str) -> Result<()> {
-    let mut resp = client.get(url).send().with_context(|| format!("download {url}"))?;
+fn download_to_file(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    dest: &Path,
+    label: &str,
+) -> Result<()> {
+    let mut resp = client
+        .get(url)
+        .send()
+        .with_context(|| format!("download {url}"))?;
     if !resp.status().is_success() {
         anyhow::bail!("download {url} returned {}", resp.status());
     }
     let total = resp.content_length().unwrap_or(0);
     let pb = progress_bar(total, label);
 
-    let mut file = std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+    let mut file =
+        std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
     let mut buf = [0u8; 1 << 16];
     let mut downloaded = 0u64;
     loop {
@@ -365,7 +377,11 @@ pub struct Resolved {
 /// `resolve_llama_server`).
 pub fn ensure_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
     let query = asset_query();
-    let bin_name = if cfg!(target_os = "windows") { "llama-server.exe" } else { "llama-server" };
+    let bin_name = if cfg!(target_os = "windows") {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
 
     // If we already fetched this exact (tag, backend) combination before,
     // reuse it without touching the network at all — pinned or not, a
@@ -373,7 +389,10 @@ pub fn ensure_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
     if let Some(tag) = pinned_version {
         let dest = install_dir(tag, &query.label)?;
         if let Some(bin) = find_binary(&dest, bin_name) {
-            return Ok(Resolved { bin, backend_label: query.label });
+            return Ok(Resolved {
+                bin,
+                backend_label: query.label,
+            });
         }
     } else {
         // Unpinned: still worth a cheap local check for *some* cached tag
@@ -390,7 +409,10 @@ pub fn ensure_llama_server(pinned_version: Option<&str>) -> Result<Resolved> {
                         "[llmman] could not check for a newer llama-server release ({e:#}); \
                          using previously downloaded build"
                     );
-                    return Ok(Resolved { bin, backend_label: query.label });
+                    return Ok(Resolved {
+                        bin,
+                        backend_label: query.label,
+                    });
                 }
             }
         }
@@ -410,7 +432,10 @@ fn try_ensure_from_network(
     let dest = install_dir(&tag, &query.label)?;
 
     if let Some(bin) = find_binary(&dest, bin_name) {
-        return Ok(Resolved { bin, backend_label: query.label.clone() });
+        return Ok(Resolved {
+            bin,
+            backend_label: query.label.clone(),
+        });
     }
 
     let asset = find_asset(&release, &query.must_contain)
@@ -422,7 +447,10 @@ fn try_ensure_from_network(
         })?
         .clone();
 
-    eprintln!("[llmman] downloading llama-server ({}) {tag}: {}", query.label, asset.name);
+    eprintln!(
+        "[llmman] downloading llama-server ({}) {tag}: {}",
+        query.label, asset.name
+    );
     let tmp = tmp_path(&asset.name)?;
     download_to_file(&client, &asset.browser_download_url, &tmp, &asset.name)?;
     let extracted = extract(&tmp, &asset.name, &dest);
@@ -435,7 +463,12 @@ fn try_ensure_from_network(
                 let companion = companion.clone();
                 eprintln!("[llmman] downloading {}", companion.name);
                 let tmp2 = tmp_path(&companion.name)?;
-                download_to_file(&client, &companion.browser_download_url, &tmp2, &companion.name)?;
+                download_to_file(
+                    &client,
+                    &companion.browser_download_url,
+                    &tmp2,
+                    &companion.name,
+                )?;
                 let extracted = extract(&tmp2, &companion.name, &dest);
                 let _ = std::fs::remove_file(&tmp2);
                 extracted?;
@@ -448,10 +481,17 @@ fn try_ensure_from_network(
         }
     }
 
-    let bin = find_binary(&dest, bin_name)
-        .with_context(|| format!("llama-server binary not found after extracting {}", asset.name))?;
+    let bin = find_binary(&dest, bin_name).with_context(|| {
+        format!(
+            "llama-server binary not found after extracting {}",
+            asset.name
+        )
+    })?;
     mark_executable(&bin)?;
-    Ok(Resolved { bin, backend_label: query.label.clone() })
+    Ok(Resolved {
+        bin,
+        backend_label: query.label.clone(),
+    })
 }
 
 #[cfg(unix)]
@@ -489,9 +529,13 @@ fn newest_cached(label: &str, bin_name: &str) -> Result<Option<PathBuf>> {
             continue;
         }
         let tag = entry.file_name().to_string_lossy().into_owned();
-        let Some(build) = build_number(&tag) else { continue };
+        let Some(build) = build_number(&tag) else {
+            continue;
+        };
         let dest = entry.path().join(label);
-        let Some(bin) = find_binary(&dest, bin_name) else { continue };
+        let Some(bin) = find_binary(&dest, bin_name) else {
+            continue;
+        };
         if best.as_ref().map(|(b, _)| build > *b).unwrap_or(true) {
             best = Some((build, bin));
         }
@@ -508,9 +552,18 @@ mod tests {
         let release = Release {
             tag_name: "b10360".into(),
             assets: vec![
-                Asset { name: "llama-b10360-bin-ubuntu-x64.tar.gz".into(), browser_download_url: String::new() },
-                Asset { name: "llama-b10360-bin-ubuntu-vulkan-x64.tar.gz".into(), browser_download_url: String::new() },
-                Asset { name: "llama-b10360-bin-ubuntu-rocm-7.14-x64.tar.gz".into(), browser_download_url: String::new() },
+                Asset {
+                    name: "llama-b10360-bin-ubuntu-x64.tar.gz".into(),
+                    browser_download_url: String::new(),
+                },
+                Asset {
+                    name: "llama-b10360-bin-ubuntu-vulkan-x64.tar.gz".into(),
+                    browser_download_url: String::new(),
+                },
+                Asset {
+                    name: "llama-b10360-bin-ubuntu-rocm-7.14-x64.tar.gz".into(),
+                    browser_download_url: String::new(),
+                },
             ],
         };
         assert_eq!(
@@ -518,7 +571,9 @@ mod tests {
             "llama-b10360-bin-ubuntu-x64.tar.gz"
         );
         assert_eq!(
-            find_asset(&release, "-bin-ubuntu-vulkan-x64.tar.gz").unwrap().name,
+            find_asset(&release, "-bin-ubuntu-vulkan-x64.tar.gz")
+                .unwrap()
+                .name,
             "llama-b10360-bin-ubuntu-vulkan-x64.tar.gz"
         );
         assert_eq!(
@@ -557,11 +612,18 @@ mod tests {
     #[ignore = "hits the network and downloads a real llama.cpp release"]
     fn ensure_llama_server_downloads_a_runnable_binary() {
         let resolved = ensure_llama_server(None).expect("ensure_llama_server");
-        assert!(resolved.bin.is_file(), "{} is not a file", resolved.bin.display());
+        assert!(
+            resolved.bin.is_file(),
+            "{} is not a file",
+            resolved.bin.display()
+        );
         let output = std::process::Command::new(&resolved.bin)
             .arg("--version")
             .output()
             .expect("run downloaded llama-server --version");
-        assert!(output.status.success(), "llama-server --version failed: {output:?}");
+        assert!(
+            output.status.success(),
+            "llama-server --version failed: {output:?}"
+        );
     }
 }

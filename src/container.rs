@@ -319,13 +319,19 @@ mod tests {
 
     #[test]
     fn cuda_major_12_picks_cuda12_image() {
-        assert_eq!(backend_from_hostgpu(HostGpu::Cuda { major: 12 }), GpuBackend::Cuda12);
+        assert_eq!(
+            backend_from_hostgpu(HostGpu::Cuda { major: 12 }),
+            GpuBackend::Cuda12
+        );
         assert_eq!(GpuBackend::Cuda12.image_tag(), "server-cuda");
     }
 
     #[test]
     fn cuda_major_13_picks_cuda13_image() {
-        assert_eq!(backend_from_hostgpu(HostGpu::Cuda { major: 13 }), GpuBackend::Cuda13);
+        assert_eq!(
+            backend_from_hostgpu(HostGpu::Cuda { major: 13 }),
+            GpuBackend::Cuda13
+        );
         assert_eq!(GpuBackend::Cuda13.image_tag(), "server-cuda13");
     }
 
@@ -334,7 +340,10 @@ mod tests {
         // No cuda14+ image exists yet -- a future driver reporting a
         // higher major version should still bucket into the newer of the
         // two published images rather than falling back to cuda12.
-        assert_eq!(backend_from_hostgpu(HostGpu::Cuda { major: 14 }), GpuBackend::Cuda13);
+        assert_eq!(
+            backend_from_hostgpu(HostGpu::Cuda { major: 14 }),
+            GpuBackend::Cuda13
+        );
     }
 
     #[test]
@@ -356,7 +365,10 @@ mod tests {
 
     #[test]
     fn image_ref_uses_floating_tag_when_no_version_given() {
-        assert_eq!(GpuBackend::Cpu.image_ref(None), "ghcr.io/ggml-org/llama.cpp:server");
+        assert_eq!(
+            GpuBackend::Cpu.image_ref(None),
+            "ghcr.io/ggml-org/llama.cpp:server"
+        );
         assert_eq!(
             GpuBackend::Cuda13.image_ref(None),
             "ghcr.io/ggml-org/llama.cpp:server-cuda13"
@@ -391,13 +403,23 @@ mod tests {
         let args = GpuBackend::Rocm.engine_args();
         assert_eq!(
             args,
-            vec!["--device", "/dev/kfd", "--device", "/dev/dri", "--group-add", "video"]
+            vec![
+                "--device",
+                "/dev/kfd",
+                "--device",
+                "/dev/dri",
+                "--group-add",
+                "video"
+            ]
         );
     }
 
     #[test]
     fn vulkan_backend_mounts_dri_only() {
-        assert_eq!(GpuBackend::Vulkan.engine_args(), vec!["--device", "/dev/dri"]);
+        assert_eq!(
+            GpuBackend::Vulkan.engine_args(),
+            vec!["--device", "/dev/dri"]
+        );
     }
 
     #[test]
@@ -416,6 +438,9 @@ mod tests {
     #[ignore = "result depends on this host's actual GPU/driver setup"]
     fn detect_backend_reports_this_hosts_real_hardware() {
         let backend = detect_backend();
-        println!("container::detect_backend() -> {backend:?} ({})", backend.image_ref(None));
+        println!(
+            "container::detect_backend() -> {backend:?} ({})",
+            backend.image_ref(None)
+        );
     }
 }

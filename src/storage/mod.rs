@@ -1,2 +1,2 @@
 pub mod oci;
-pub use oci::OciStore;
+pub use oci::{default_tag, OciStore};

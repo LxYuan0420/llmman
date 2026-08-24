@@ -4,14 +4,11 @@
 /// file from the `webui/` directory.  Serve them with the headers
 /// `Content-Encoding: gzip` and the appropriate `Content-Type`.
 
-pub static INDEX_HTML: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/webui_gz/index.html.gz"));
+pub static INDEX_HTML: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/webui_gz/index.html.gz"));
 
-pub static BUNDLE_JS: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/webui_gz/bundle.js.gz"));
+pub static BUNDLE_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/webui_gz/bundle.js.gz"));
 
-pub static BUNDLE_CSS: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/webui_gz/bundle.css.gz"));
+pub static BUNDLE_CSS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/webui_gz/bundle.css.gz"));
 
 pub static LOADING_HTML: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/webui_gz/loading.html.gz"));

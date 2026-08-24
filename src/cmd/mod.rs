@@ -1,7 +1,6 @@
 pub mod build;
-pub mod launch;
-pub mod run;
 pub mod inspect;
+pub mod launch;
 pub mod list;
 pub mod login;
 pub mod logout;
@@ -10,6 +9,7 @@ pub mod pull;
 pub mod push;
 pub mod resolve;
 pub mod rm;
+pub mod run;
 pub mod serve;
 pub mod tag;
 pub mod transfer;

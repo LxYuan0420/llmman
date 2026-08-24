@@ -40,11 +40,19 @@ pub fn run(args: &ListArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let name_w = images.iter().map(|i| i.reference.len()).max().unwrap_or(4).max(4);
+    let name_w = images
+        .iter()
+        .map(|i| i.reference.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
 
     println!(
         "{:<name_w$}    {:<16}    {:<10}    {}",
-        "NAME", "ID", "SIZE", "MODIFIED",
+        "NAME",
+        "ID",
+        "SIZE",
+        "MODIFIED",
         name_w = name_w,
     );
 
@@ -155,24 +163,39 @@ mod tests {
 
     #[test]
     fn split_repo_tag_splits_explicit_tag() {
-        assert_eq!(split_repo_tag("unsloth/Qwen3.5-0.8B:latest"), ("unsloth/Qwen3.5-0.8B", Some("latest")));
-        assert_eq!(split_repo_tag("unsloth/Qwen3.5-0.8B:q4"), ("unsloth/Qwen3.5-0.8B", Some("q4")));
+        assert_eq!(
+            split_repo_tag("unsloth/Qwen3.5-0.8B:latest"),
+            ("unsloth/Qwen3.5-0.8B", Some("latest"))
+        );
+        assert_eq!(
+            split_repo_tag("unsloth/Qwen3.5-0.8B:q4"),
+            ("unsloth/Qwen3.5-0.8B", Some("q4"))
+        );
     }
 
     #[test]
     fn split_repo_tag_returns_none_without_a_tag() {
-        assert_eq!(split_repo_tag("unsloth/Qwen3.5-0.8B"), ("unsloth/Qwen3.5-0.8B", None));
+        assert_eq!(
+            split_repo_tag("unsloth/Qwen3.5-0.8B"),
+            ("unsloth/Qwen3.5-0.8B", None)
+        );
     }
 
     #[test]
     fn matches_filter_matches_repo_without_tag() {
         // Both sides already fully-qualified: exact-match path.
-        assert!(matches_filter("hf.co/unsloth/Qwen3.5-0.8B:latest", "hf.co/unsloth/Qwen3.5-0.8B"));
+        assert!(matches_filter(
+            "hf.co/unsloth/Qwen3.5-0.8B:latest",
+            "hf.co/unsloth/Qwen3.5-0.8B"
+        ));
         assert!(matches_filter(
             "hf.co/unsloth/Qwen3.5-0.8B:latest",
             "hf.co/unsloth/Qwen3.5-0.8B:latest"
         ));
-        assert!(!matches_filter("hf.co/unsloth/Qwen3.5-0.8B:latest", "hf.co/other/model"));
+        assert!(!matches_filter(
+            "hf.co/unsloth/Qwen3.5-0.8B:latest",
+            "hf.co/other/model"
+        ));
     }
 
     #[test]
@@ -214,8 +237,14 @@ mod tests {
     fn render_format_substitutes_known_fields() {
         let img = sample();
         assert_eq!(render_format("{{.ID}}", &img).unwrap(), "0123456789ab");
-        assert_eq!(render_format("{{.Name}}", &img).unwrap(), "unsloth/Qwen3.5-0.8B:latest");
-        assert_eq!(render_format("{{.Repository}}", &img).unwrap(), "unsloth/Qwen3.5-0.8B");
+        assert_eq!(
+            render_format("{{.Name}}", &img).unwrap(),
+            "unsloth/Qwen3.5-0.8B:latest"
+        );
+        assert_eq!(
+            render_format("{{.Repository}}", &img).unwrap(),
+            "unsloth/Qwen3.5-0.8B"
+        );
         assert_eq!(render_format("{{.Tag}}", &img).unwrap(), "latest");
         assert_eq!(render_format("{{.Size}}", &img).unwrap(), "1.5 GB");
         assert_eq!(

@@ -118,9 +118,7 @@ pub fn login_device() -> anyhow::Result<Option<DeviceLoginResult>> {
         .split('?')
         .next()
         .unwrap_or(&state.verification_uri_complete);
-    println!(
-        "Press ENTER to open your browser or submit your device code here: {display_url}"
-    );
+    println!("Press ENTER to open your browser or submit your device code here: {display_url}");
     println!();
     println!("Waiting for authentication in the browser\u{2026}");
 
@@ -195,10 +193,7 @@ fn wait_for_device_token(
             .post(format!("{}/oauth/token", tenant_url()))
             .form(&[
                 ("client_id", CLIENT_ID),
-                (
-                    "grant_type",
-                    "urn:ietf:params:oauth:grant-type:device_code",
-                ),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", state.device_code.as_str()),
             ])
             .timeout(Duration::from_secs(60))
@@ -210,7 +205,10 @@ fn wait_for_device_token(
         match token.error.as_deref() {
             Some("authorization_pending") => continue,
             Some(_) => {
-                anyhow::bail!("failed waiting for authentication: {}", token.error_description);
+                anyhow::bail!(
+                    "failed waiting for authentication: {}",
+                    token.error_description
+                );
             }
             None => return Ok(token),
         }

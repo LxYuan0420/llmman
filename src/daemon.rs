@@ -127,16 +127,22 @@ fn kill_daemon(identity: &DaemonIdentity, force: bool) {
         // Negative pid = the whole process group (the daemon is its own
         // group leader), falling back to just the pid if that fails.
         Some(pid) => {
-            let group = Command::new("kill").args([signal, &format!("-{pid}")]).status();
+            let group = Command::new("kill")
+                .args([signal, &format!("-{pid}")])
+                .status();
             if !group.map(|s| s.success()).unwrap_or(false) {
-                let _ = Command::new("kill").args([signal, &pid.to_string()]).status();
+                let _ = Command::new("kill")
+                    .args([signal, &pid.to_string()])
+                    .status();
             }
         }
         // A daemon too old to report its pid: match on the command line
         // ("<path>/llmman serve ..."), which no plain llmman CLI client
         // invocation shares.
         None => {
-            let _ = Command::new("pkill").args([signal, "-f", "llmman serve"]).status();
+            let _ = Command::new("pkill")
+                .args([signal, "-f", "llmman serve"])
+                .status();
         }
     }
 }
@@ -149,7 +155,9 @@ fn kill_daemon(identity: &DaemonIdentity, _force: bool) {
     match identity.pid {
         // /T takes the daemon's llama-server children down with it.
         Some(pid) => {
-            let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).status();
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .status();
         }
         None => {
             let _ = Command::new("powershell")
@@ -544,7 +552,10 @@ pub fn stream_progress(path: &str, reference: &str) -> anyhow::Result<()> {
             // clearly "nothing left worth animating" either way.
             if bar.is_none() && completed * 100 >= total * 99 {
                 if !printed_instant_complete {
-                    println!("Already have {reference} ({})", crate::fmt::human_size(total));
+                    println!(
+                        "Already have {reference} ({})",
+                        crate::fmt::human_size(total)
+                    );
                     printed_instant_complete = true;
                 }
                 last_status = "pulling".to_string(); // suppress a redundant plain "pulling" line below
@@ -626,5 +637,6 @@ pub fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T>
         let body = resp.text().unwrap_or_default();
         anyhow::bail!("{path}: server returned {status}: {body}");
     }
-    resp.json().with_context(|| format!("parse response from {path}"))
+    resp.json()
+        .with_context(|| format!("parse response from {path}"))
 }

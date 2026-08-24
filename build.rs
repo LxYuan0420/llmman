@@ -139,9 +139,9 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
         let msvc_triple = match arch.as_str() {
-            "x86_64"  => "x86_64-pc-windows-msvc",
+            "x86_64" => "x86_64-pc-windows-msvc",
             "aarch64" => "aarch64-pc-windows-msvc",
-            other     => panic!("unsupported Windows MSVC arch: {}", other),
+            other => panic!("unsupported Windows MSVC arch: {}", other),
         };
         // The wrapper calls clang with a fixed --target then forwards all other
         // args (%*).  Go treats this .cmd as the C compiler.
@@ -225,15 +225,12 @@ fn main() {
     for name in &["index.html", "bundle.js", "bundle.css", "loading.html"] {
         let src = webui_src.join(name);
         let dst = webui_out.join(format!("{name}.gz"));
-        let data = fs::read(&src)
-            .unwrap_or_else(|e| panic!("read webui/{name}: {e}"));
+        let data = fs::read(&src).unwrap_or_else(|e| panic!("read webui/{name}: {e}"));
         let mut enc = GzEncoder::new(Vec::new(), Compression::best());
         enc.write_all(&data).expect("gzip write");
         let compressed = enc.finish().expect("gzip finish");
-        fs::write(&dst, &compressed)
-            .unwrap_or_else(|e| panic!("write {name}.gz: {e}"));
+        fs::write(&dst, &compressed).unwrap_or_else(|e| panic!("write {name}.gz: {e}"));
     }
 
     println!("cargo:rerun-if-changed=webui/");
 }
-
