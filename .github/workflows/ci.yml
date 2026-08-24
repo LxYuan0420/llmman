@@ -28,21 +28,6 @@ env:
   LLAMA_CPP_RELEASE: b10293
 
 jobs:
-  fmt:
-    name: cargo fmt --check
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          components: rustfmt
-
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
@@ -183,6 +168,11 @@ jobs:
   # `cargo test` as `cargo build`. Mirrors the `build` job's own 5-target
   # matrix exactly for that reason, rather than assuming Linux x86_64 is
   # representative of the other four.
+  #
+  # `cargo fmt --check` also lives here rather than in its own job:
+  # formatting is platform-independent, so it only runs once, on the
+  # Linux x86_64 leg (matrix.check-fmt below), instead of duplicating the
+  # same check across all five targets.
   # --------------------------------------------------------------------------
   test:
     name: Unit tests (${{ matrix.target }})
@@ -193,9 +183,13 @@ jobs:
       matrix:
         include:
           # ── Linux x86_64 ──────────────────────────────────────────────────
+          # check-fmt: true — this is the one leg that also runs
+          # `cargo fmt --check` (see the job's own comment above on why
+          # only here).
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             go-os: linux
+            check-fmt: true
 
           # ── Linux aarch64 ─────────────────────────────────────────────────
           - target: aarch64-unknown-linux-gnu
@@ -238,11 +232,16 @@ jobs:
 
       # targets: matches the build job's own Set up Rust step — needed
       # there for genuinely cross-compiled targets, harmless here where
-      # every target is actually native.
+      # every target is actually native. components: rustfmt is only
+      # actually needed on the check-fmt leg (see this job's own comment
+      # above), but dtolnay/rust-toolchain accepts an empty components
+      # list fine on every other leg, so this stays a single step rather
+      # than a second, conditional "Set up Rust" step.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.target }}
+          components: ${{ matrix.check-fmt && 'rustfmt' || '' }}
 
       - name: Cache Rust build artefacts
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -266,6 +265,13 @@ jobs:
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get install -y gcc
+
+      # Only runs on the check-fmt leg (Linux x86_64) — see this job's
+      # own comment above on why formatting is checked once rather than
+      # once per matrix entry.
+      - name: cargo fmt --check
+        if: matrix.check-fmt
+        run: cargo fmt --all -- --check
 
       # --target: matches the build job's own invocation (every one of
       # these is a native build, but explicit --target keeps the output
@@ -863,13 +869,16 @@ jobs:
   # --------------------------------------------------------------------------
   release:
     name: Release
-    # All of fmt/build/test/e2e must be green before a release is cut —
-    # not just build. e2e itself only runs on the same two push events
-    # this job's own `if:` below fires on (see e2e's own `if:` comment),
-    # so this `needs` entry lines up with both the main-push and v*-tag
-    # release channels without ever blocking on an e2e run that was
-    # never going to happen for some other event (e.g. a PR).
-    needs: [fmt, build, test, e2e]
+    # All of build/test/e2e must be green before a release is cut — not
+    # just build. (`cargo fmt --check` now runs as part of `test`'s own
+    # check-fmt leg — see that job's own comment — so it's covered here
+    # too without a separate `fmt` entry.) e2e itself only runs on the
+    # same two push events this job's own `if:` below fires on (see e2e's
+    # own `if:` comment), so this `needs` entry lines up with both the
+    # main-push and v*-tag release channels without ever blocking on an
+    # e2e run that was never going to happen for some other event (e.g. a
+    # PR).
+    needs: [build, test, e2e]
     runs-on: ubuntu-24.04
     # Two release channels, both attaching one binary per matrix.target
     # (see the build job above — this is where "all the platforms
