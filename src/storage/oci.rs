@@ -151,8 +151,7 @@ impl OciStore {
     // ------------------------------------------------------------------
 
     pub fn read_index(&self) -> anyhow::Result<Index> {
-        let data = fs::read(self.root.join("index.json"))
-            .context("read index.json")?;
+        let data = fs::read(self.root.join("index.json")).context("read index.json")?;
         serde_json::from_slice(&data).context("parse index.json")
     }
 
@@ -206,8 +205,8 @@ impl OciStore {
             .join("sha256")
             .join(format!("tmp-{}", std::process::id()));
         {
-            let mut src = fs::File::open(path)
-                .with_context(|| format!("open {}", path.display()))?;
+            let mut src =
+                fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
             let mut dst = fs::File::create(&tmp)?;
             let mut buf = vec![0u8; 1 << 20]; // 1 MiB chunks
             loop {
@@ -429,10 +428,8 @@ impl OciStore {
             },
         };
         let config_data = serde_json::to_vec(&cncf_config)?;
-        let config_desc = self.write_blob(
-            "application/vnd.cncf.model.config.v1+json",
-            &config_data,
-        )?;
+        let config_desc =
+            self.write_blob("application/vnd.cncf.model.config.v1+json", &config_data)?;
 
         // `--label key=value` pairs have no dedicated slot in the model
         // config schema, so they're carried as manifest annotations instead.
@@ -477,7 +474,10 @@ fn classify_model_layer(rel_path: &str) -> &'static str {
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or(lower.as_str());
-    let ext = Path::new(base).extension().and_then(|e| e.to_str()).unwrap_or("");
+    let ext = Path::new(base)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
 
     match ext {
         "safetensors" | "bin" | "pt" | "pth" | "gguf" | "ggml" | "ot" | "engine" | "trt"
@@ -549,19 +549,39 @@ fn ref_matches(desc: &Descriptor, reference: &str) -> bool {
         return true;
     }
 
-    // If reference carries no tag (no ':' after the last '/'), try `:latest`.
-    let after_slash = &reference[reference.rfind('/').unwrap_or(0)..];
-    if !after_slash.contains(':') && stored.as_str() == format!("{reference}:latest") {
+    if stored.as_str() == default_tag(reference) {
         return true;
     }
 
     false
 }
 
+/// Appends `:latest` to `reference` if it has no tag, so a tag-less
+/// reference and its `:latest` spelling are one string wherever a
+/// reference is used as a map/lock key. A no-op on anything that isn't a
+/// taggable registry reference — a URI-scheme source (`s3://`, `ngc://`,
+/// `ms://`, ...) or an absolute local path — since those never carry a
+/// tag and appending one would corrupt them.
+pub fn default_tag(reference: &str) -> String {
+    if reference.starts_with('/') || reference.contains("://") {
+        return reference.to_owned();
+    }
+    let after_slash = &reference[reference.rfind('/').unwrap_or(0)..];
+    if after_slash.contains(':') {
+        reference.to_owned()
+    } else {
+        format!("{reference}:latest")
+    }
+}
+
 fn split_digest(digest: &str) -> anyhow::Result<(&str, &str)> {
     let mut parts = digest.splitn(2, ':');
-    let algo = parts.next().ok_or_else(|| anyhow!("invalid digest: {}", digest))?;
-    let hex = parts.next().ok_or_else(|| anyhow!("invalid digest: {}", digest))?;
+    let algo = parts
+        .next()
+        .ok_or_else(|| anyhow!("invalid digest: {}", digest))?;
+    let hex = parts
+        .next()
+        .ok_or_else(|| anyhow!("invalid digest: {}", digest))?;
     Ok((algo, hex))
 }
 
@@ -597,7 +617,10 @@ mod tests {
 
     fn desc_with_ref(ref_name: &str) -> Descriptor {
         let mut ann = std::collections::HashMap::new();
-        ann.insert("org.opencontainers.image.ref.name".to_string(), ref_name.to_string());
+        ann.insert(
+            "org.opencontainers.image.ref.name".to_string(),
+            ref_name.to_string(),
+        );
         Descriptor {
             media_type: "application/vnd.oci.image.manifest.v1+json".into(),
             digest: "sha256:deadbeef".into(),
@@ -634,6 +657,38 @@ mod tests {
     fn ref_matches_defaults_a_tagless_reference_to_latest() {
         let d = desc_with_ref("docker.io/ai/qwen3.5:latest");
         assert!(ref_matches(&d, "docker.io/ai/qwen3.5"));
+    }
+
+    #[test]
+    fn default_tag_appends_latest_only_when_no_tag_is_present() {
+        assert_eq!(
+            default_tag("docker.io/ai/gemma4"),
+            "docker.io/ai/gemma4:latest"
+        );
+        assert_eq!(
+            default_tag("docker.io/ai/gemma4:latest"),
+            "docker.io/ai/gemma4:latest"
+        );
+        assert_eq!(
+            default_tag("docker.io/ai/gemma4:e4b"),
+            "docker.io/ai/gemma4:e4b"
+        );
+        // A colon before the last '/' (a port in a registry host) must not
+        // be mistaken for a tag separator.
+        assert_eq!(
+            default_tag("localhost:5000/gemma4"),
+            "localhost:5000/gemma4:latest"
+        );
+    }
+
+    #[test]
+    fn default_tag_leaves_non_registry_sources_untouched() {
+        // These never carry a tag; appending one would corrupt them.
+        assert_eq!(default_tag("ngc://org/model"), "ngc://org/model");
+        assert_eq!(default_tag("s3://bucket/key"), "s3://bucket/key");
+        assert_eq!(default_tag("gs://bucket/key"), "gs://bucket/key");
+        assert_eq!(default_tag("ms://owner/repo"), "ms://owner/repo");
+        assert_eq!(default_tag("/abs/path/model.gguf"), "/abs/path/model.gguf");
     }
 
     #[test]

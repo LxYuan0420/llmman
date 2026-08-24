@@ -47,7 +47,9 @@ struct PsModel {
 /// precondition, since if there's no daemon there's nothing running to list.
 pub fn run(args: &PsArgs) -> anyhow::Result<()> {
     if !crate::daemon::server_alive() {
-        anyhow::bail!("llmman serve is not running (nothing is loaded) — start it with `llmman serve`");
+        anyhow::bail!(
+            "llmman serve is not running (nothing is loaded) — start it with `llmman serve`"
+        );
     }
 
     let resp: PsResponse = crate::daemon::get_json("/api/ps")?;
@@ -62,12 +64,26 @@ pub fn run(args: &PsArgs) -> anyhow::Result<()> {
     // which unconditionally renders its table (unlike `llmman list`, which
     // prints nothing at all for an empty store).
 
-    let name_w = models.iter().map(|m| m.name.len()).max().unwrap_or(4).max(4);
-    let proc_w = models.iter().map(|m| m.processor.len()).max().unwrap_or(9).max(9);
+    let name_w = models
+        .iter()
+        .map(|m| m.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let proc_w = models
+        .iter()
+        .map(|m| m.processor.len())
+        .max()
+        .unwrap_or(9)
+        .max(9);
 
     println!(
         "{:<name_w$}    {:<12}    {:<10}    {:<proc_w$}    {:<9}    STARTED",
-        "NAME", "ID", "SIZE", "PROCESSOR", "CONTEXT",
+        "NAME",
+        "ID",
+        "SIZE",
+        "PROCESSOR",
+        "CONTEXT",
         name_w = name_w,
         proc_w = proc_w,
     );

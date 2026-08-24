@@ -214,22 +214,37 @@ mod tests {
         // and dead-ended in the Go shim's HF-only parser with a misleading
         // "invalid HuggingFace reference" error instead.
         assert_eq!(resolve_ollama_api("qwen3.5"), "docker.io/ai/qwen3.5");
-        assert_eq!(resolve_ollama_api("qwen3.5:0.8B"), "docker.io/ai/qwen3.5:0.8B");
+        assert_eq!(
+            resolve_ollama_api("qwen3.5:0.8B"),
+            "docker.io/ai/qwen3.5:0.8B"
+        );
     }
 
     #[test]
     fn resolve_ollama_api_leaves_structured_references_to_resolve() {
         // Owner/repo (has a "/") falls back to resolve()'s hf.co default.
-        assert_eq!(resolve_ollama_api("unsloth/Qwen3.5-0.8B-GGUF"), resolve("unsloth/Qwen3.5-0.8B-GGUF"));
+        assert_eq!(
+            resolve_ollama_api("unsloth/Qwen3.5-0.8B-GGUF"),
+            resolve("unsloth/Qwen3.5-0.8B-GGUF")
+        );
         // Already has an explicit host.
         assert_eq!(resolve_ollama_api("hf.co/foo/bar"), "hf.co/foo/bar");
-        assert_eq!(resolve_ollama_api("docker.io/ai/gemma4"), "docker.io/ai/gemma4");
+        assert_eq!(
+            resolve_ollama_api("docker.io/ai/gemma4"),
+            "docker.io/ai/gemma4"
+        );
     }
 
     #[test]
     fn resolve_ollama_api_matches_resolve_for_uri_schemes_and_paths() {
-        assert_eq!(resolve_ollama_api("hf://unsloth/Qwen3.5-0.8B-GGUF"), resolve("hf://unsloth/Qwen3.5-0.8B-GGUF"));
-        assert_eq!(resolve_ollama_api("/abs/path/model.gguf"), "/abs/path/model.gguf");
+        assert_eq!(
+            resolve_ollama_api("hf://unsloth/Qwen3.5-0.8B-GGUF"),
+            resolve("hf://unsloth/Qwen3.5-0.8B-GGUF")
+        );
+        assert_eq!(
+            resolve_ollama_api("/abs/path/model.gguf"),
+            "/abs/path/model.gguf"
+        );
     }
 
     #[test]
@@ -258,10 +273,16 @@ mod tests {
         // namespace/model (ollama: -> registry.ollama.ai/namespace/model).
         assert_eq!(resolve("namespace/model"), "hf.co/namespace/model");
         // Fully-qualified references pass through untouched...
-        assert_eq!(resolve("example.com/ns/model:tag"), "example.com/ns/model:tag");
+        assert_eq!(
+            resolve("example.com/ns/model:tag"),
+            "example.com/ns/model:tag"
+        );
         // ...including a host:port first component (ollama's
         // "host:port/namespace/model:tag" case) and localhost.
-        assert_eq!(resolve("example.com:5000/ns/model:tag"), "example.com:5000/ns/model:tag");
+        assert_eq!(
+            resolve("example.com:5000/ns/model:tag"),
+            "example.com:5000/ns/model:tag"
+        );
         assert_eq!(resolve("localhost/ns/model"), "localhost/ns/model");
     }
 

@@ -53,7 +53,10 @@ fn relative_time_secs(secs: u64) -> String {
 /// by `llmman list`'s MODIFIED column.
 pub fn relative_time(t: Option<SystemTime>) -> String {
     let secs = match t {
-        Some(t) => SystemTime::now().duration_since(t).unwrap_or_default().as_secs(),
+        Some(t) => SystemTime::now()
+            .duration_since(t)
+            .unwrap_or_default()
+            .as_secs(),
         None => return "unknown".into(),
     };
     relative_time_secs(secs)

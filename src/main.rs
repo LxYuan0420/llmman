@@ -87,7 +87,9 @@ fn main() {
     // `ffi::ensure_runtime_init`/`daemon::disable_std_handle_inheritance`
     // below: this child is meant to do nothing but the one raw probe and
     // exit, as fast and dependency-free as possible.
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(hostgpu::PROBE_SUBPROCESS_ARG)) {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(hostgpu::PROBE_SUBPROCESS_ARG))
+    {
         hostgpu::probe_subprocess_main();
     }
 
@@ -106,21 +108,21 @@ fn main() {
 
     let cli = Cli::parse();
     let result = match &cli.command {
-        Commands::Launch(a)   => cmd::launch::run(a),
-        Commands::Run(a)      => cmd::run::run(a),
-        Commands::Build(a)    => cmd::build::run(a),
-        Commands::Login(a)    => cmd::login::run(a),
-        Commands::Logout(a)   => cmd::logout::run(a),
-        Commands::Push(a)     => cmd::push::run(a),
-        Commands::Pull(a)     => cmd::pull::run(a),
-        Commands::Resolve(a)  => cmd::resolve::run(a),
+        Commands::Launch(a) => cmd::launch::run(a),
+        Commands::Run(a) => cmd::run::run(a),
+        Commands::Build(a) => cmd::build::run(a),
+        Commands::Login(a) => cmd::login::run(a),
+        Commands::Logout(a) => cmd::logout::run(a),
+        Commands::Push(a) => cmd::push::run(a),
+        Commands::Pull(a) => cmd::pull::run(a),
+        Commands::Resolve(a) => cmd::resolve::run(a),
         Commands::Transfer(a) => cmd::transfer::run(a),
-        Commands::List(a)     => cmd::list::run(a),
-        Commands::Ps(a)       => cmd::ps::run(a),
-        Commands::Rm(a)       => cmd::rm::run(a),
-        Commands::Inspect(a)  => cmd::inspect::run(a),
-        Commands::Serve(a)    => cmd::serve::run(a),
-        Commands::Tag(a)      => cmd::tag::run(a),
+        Commands::List(a) => cmd::list::run(a),
+        Commands::Ps(a) => cmd::ps::run(a),
+        Commands::Rm(a) => cmd::rm::run(a),
+        Commands::Inspect(a) => cmd::inspect::run(a),
+        Commands::Serve(a) => cmd::serve::run(a),
+        Commands::Tag(a) => cmd::tag::run(a),
     };
     if let Err(e) = result {
         eprintln!("Error: {:#}", e);

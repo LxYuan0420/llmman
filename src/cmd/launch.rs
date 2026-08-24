@@ -135,7 +135,10 @@ fn print_integrations() {
         if find_on_path(i.binary).is_some() {
             println!("  {:<12} {}", i.name, i.description);
         } else {
-            println!("  {:<12} {} (not installed — {})", i.name, i.description, i.install_hint);
+            println!(
+                "  {:<12} {} (not installed — {})",
+                i.name, i.description, i.install_hint
+            );
         }
     }
     println!("\nUsage: llmman launch <integration> [--model <model>]");
@@ -203,8 +206,9 @@ fn launch(name: &str, model: &str, extra_args: &[String]) -> anyhow::Result<()> 
 /// claude: set ANTHROPIC_BASE_URL and a dummy ANTHROPIC_API_KEY so it talks to
 /// our server's Anthropic-compatible API.
 fn launch_claude(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("claude")
-        .ok_or_else(|| anyhow::anyhow!("claude is not installed — https://code.claude.com/docs/en/quickstart"))?;
+    let bin = find_on_path("claude").ok_or_else(|| {
+        anyhow::anyhow!("claude is not installed — https://code.claude.com/docs/en/quickstart")
+    })?;
 
     let mut args: Vec<String> = Vec::new();
     if !model.is_empty() {
@@ -231,18 +235,13 @@ fn launch_opencode(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
             p.exists().then_some(p)
         })
     });
-    let bin = bin.ok_or_else(|| {
-        anyhow::anyhow!("opencode is not installed — https://opencode.ai")
-    })?;
+    let bin =
+        bin.ok_or_else(|| anyhow::anyhow!("opencode is not installed — https://opencode.ai"))?;
 
     let effective_model = if model.is_empty() { "default" } else { model };
     let config = opencode_config(effective_model);
 
-    exec_with_env(
-        &bin,
-        extra_args,
-        &[("OPENCODE_CONFIG_CONTENT", &config)],
-    )
+    exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
 }
 
 fn opencode_config(model: &str) -> String {
@@ -294,11 +293,7 @@ fn launch_codex(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     args.extend(["--profile".to_string(), "llmman".to_string()]);
     args.extend_from_slice(extra_args);
 
-    exec_with_env(
-        &bin,
-        &args,
-        &[("OPENAI_API_KEY", "llmman")],
-    )
+    exec_with_env(&bin, &args, &[("OPENAI_API_KEY", "llmman")])
 }
 
 /// Writes codex's `llmman` profile.
@@ -383,8 +378,9 @@ fn launch_aider(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 
 /// copilot: passes COPILOT_PROVIDER_BASE_URL via env.
 fn launch_copilot(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("gh")
-        .ok_or_else(|| anyhow::anyhow!("gh (GitHub CLI) is not installed — https://cli.github.com"))?;
+    let bin = find_on_path("gh").ok_or_else(|| {
+        anyhow::anyhow!("gh (GitHub CLI) is not installed — https://cli.github.com")
+    })?;
 
     let base_url = format!("{SERVER}/v1");
     let mut args = vec!["copilot".to_string()];
@@ -393,17 +389,14 @@ fn launch_copilot(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
     }
     args.extend_from_slice(extra_args);
 
-    exec_with_env(
-        &bin,
-        &args,
-        &[("COPILOT_PROVIDER_BASE_URL", &base_url)],
-    )
+    exec_with_env(&bin, &args, &[("COPILOT_PROVIDER_BASE_URL", &base_url)])
 }
 
 /// gemini: set GOOGLE_GENAI_BASE_URL pointing at our Anthropic-compatible endpoint.
 fn launch_gemini(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
-    let bin = find_on_path("gemini")
-        .ok_or_else(|| anyhow::anyhow!("gemini is not installed — npm install -g @google/gemini-cli"))?;
+    let bin = find_on_path("gemini").ok_or_else(|| {
+        anyhow::anyhow!("gemini is not installed — npm install -g @google/gemini-cli")
+    })?;
 
     let mut args: Vec<String> = Vec::new();
     if !model.is_empty() {
@@ -422,7 +415,12 @@ fn launch_gemini(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
 }
 
 /// Generic launcher: just set OLLAMA_HOST and run the binary.
-fn launch_simple(binary: &str, install_hint: &str, _model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+fn launch_simple(
+    binary: &str,
+    install_hint: &str,
+    _model: &str,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     let bin = find_on_path(binary)
         .ok_or_else(|| anyhow::anyhow!("{binary} is not installed — {install_hint}"))?;
     exec_with_env(&bin, extra_args, &[("OLLAMA_HOST", SERVER)])
@@ -432,11 +430,7 @@ fn launch_simple(binary: &str, install_hint: &str, _model: &str, extra_args: &[S
 // Process execution helper
 // ---------------------------------------------------------------------------
 
-fn exec_with_env(
-    bin: &PathBuf,
-    args: &[String],
-    extra_env: &[(&str, &str)],
-) -> anyhow::Result<()> {
+fn exec_with_env(bin: &PathBuf, args: &[String], extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::inherit());
@@ -451,7 +445,8 @@ fn exec_with_env(
     }
     cmd.envs(&env);
 
-    let status = cmd.status()
+    let status = cmd
+        .status()
         .with_context(|| format!("failed to run {}", bin.display()))?;
 
     std::process::exit(status.code().unwrap_or(1));

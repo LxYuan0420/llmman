@@ -188,7 +188,9 @@ impl RunningModel {
         match &self.process {
             ModelProcess::Local(Engine::LlamaServer, _) => "llama-server (local)".into(),
             ModelProcess::Local(Engine::Vllm, _) => "vllm (local)".into(),
-            ModelProcess::Container(ociman, _) => format!("llama-server (container/{})", ociman.binary()),
+            ModelProcess::Container(ociman, _) => {
+                format!("llama-server (container/{})", ociman.binary())
+            }
         }
     }
 
@@ -590,7 +592,11 @@ const TAIL_LINES: usize = 20;
 /// fact (see `wait_for_ready`) can still report *why*, instead of just
 /// "the process exited" with the actual reason sitting only in a log file
 /// the caller (an HTTP client, ultimately a chat UI) never sees.
-fn spawn_tail_relay(reader: impl AsyncRead + Unpin + Send + 'static, tail: OutputTail, to_stderr: bool) {
+fn spawn_tail_relay(
+    reader: impl AsyncRead + Unpin + Send + 'static,
+    tail: OutputTail,
+    to_stderr: bool,
+) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -662,17 +668,24 @@ async fn spawn_llama_server(
     Ok((child, tail))
 }
 
-async fn spawn_vllm_server(model_dir: &Path, port: u16, model_name: &str) -> anyhow::Result<tokio::process::Child> {
+async fn spawn_vllm_server(
+    model_dir: &Path,
+    port: u16,
+    model_name: &str,
+) -> anyhow::Result<tokio::process::Child> {
     let vllm = which_binary("vllm")?;
     tokio::process::Command::new(&vllm)
         .args([
             "serve",
             model_dir.to_str().context("non-UTF-8 model path")?,
-            "--port", &port.to_string(),
-            "--host", "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--host",
+            "127.0.0.1",
             // Register the model under the same name used in API requests so
             // {"model": "<ref>"} is accepted by vllm's OpenAI-compatible API.
-            "--served-model-name", model_name,
+            "--served-model-name",
+            model_name,
         ])
         .kill_on_drop(true)
         .spawn()
@@ -722,7 +735,9 @@ async fn wait_for_ready(
     let deadline = Instant::now() + Duration::from_secs(600);
     loop {
         if Instant::now() > deadline {
-            return Err(anyhow!("inference server on port {port} did not become ready within 600s"));
+            return Err(anyhow!(
+                "inference server on port {port} did not become ready within 600s"
+            ));
         }
         if !process.is_alive() {
             let detail = stderr_tail.and_then(|t| {
@@ -730,7 +745,9 @@ async fn wait_for_ready(
                 (!lines.is_empty()).then(|| lines.iter().cloned().collect::<Vec<_>>().join(" | "))
             });
             return Err(match detail {
-                Some(detail) => anyhow!("inference server on port {port} exited before becoming ready: {detail}"),
+                Some(detail) => anyhow!(
+                    "inference server on port {port} exited before becoming ready: {detail}"
+                ),
                 None => anyhow!("inference server on port {port} exited before becoming ready"),
             });
         }
@@ -789,7 +806,10 @@ fn keyed_lock(
 
 /// Removes `key` once nothing but `registry` itself still holds a clone —
 /// call after dropping your own clone.
-fn release_keyed_lock(registry: &StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>, key: &str) {
+fn release_keyed_lock(
+    registry: &StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    key: &str,
+) {
     let mut locks = registry.lock().unwrap();
     if let Some(arc) = locks.get(key) {
         if Arc::strong_count(arc) <= 1 {
@@ -839,7 +859,10 @@ impl Drop for LoadLockGuard {
 
 async fn acquire_load_lock(model: &str) -> LoadLockGuard {
     let guard = load_lock(model).lock_owned().await;
-    LoadLockGuard { model: model.to_owned(), guard: Some(guard) }
+    LoadLockGuard {
+        model: model.to_owned(),
+        guard: Some(guard),
+    }
 }
 
 /// Pulls `model` into `layout_dir` if (still, after acquiring model's own
@@ -855,7 +878,10 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
     let lock = model_lock(model);
     let result = (|| {
         let _guard = lock.blocking_lock();
-        if OciStore::open(store_path).and_then(|s| s.find(model)).is_ok() {
+        if OciStore::open(store_path)
+            .and_then(|s| s.find(model))
+            .is_ok()
+        {
             return Ok(()); // someone else already pulled it while we waited
         }
         let layout_dir = store_path
@@ -868,13 +894,17 @@ fn pull_serialized(store_path: &std::path::Path, model: &str) -> anyhow::Result<
     result
 }
 
-/// Resolve a user-supplied model ref to the canonical reference stored in the
-/// OCI index (e.g. "hf.co/repo" → "hf.co/repo:latest").  Using the canonical
-/// form as the map key means "hf.co/repo" and "hf.co/repo:latest" both hit
-/// the same running process rather than spawning a second one.
+/// Resolve a user-supplied model ref to the canonical reference stored in
+/// the OCI index (e.g. "hf.co/repo" → "hf.co/repo:latest"). No-ops before
+/// the model is pulled — `ensure_model` also runs `default_tag` up front
+/// to cover that gap.
 fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
-    let Ok(store) = crate::storage::OciStore::open(store_path) else { return model_ref.to_owned() };
-    let Ok(desc)  = store.find(model_ref)                        else { return model_ref.to_owned() };
+    let Ok(store) = crate::storage::OciStore::open(store_path) else {
+        return model_ref.to_owned();
+    };
+    let Ok(desc) = store.find(model_ref) else {
+        return model_ref.to_owned();
+    };
     desc.annotations
         .as_ref()
         .and_then(|a| a.get("org.opencontainers.image.ref.name"))
@@ -900,6 +930,10 @@ async fn check_running(state: &AppState, model_ref: &str) -> Option<u16> {
 
 async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError> {
     let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
+    // Default the tag before the lock below: otherwise two concurrent
+    // first-pulls of e.g. "gemma4" and "gemma4:latest" take different
+    // locks and both spawn a process for the same model.
+    let model_ref = crate::storage::default_tag(&model_ref);
     let model_ref = canonical_ref(&state.0.store_path, &model_ref);
     let model_ref = model_ref.as_str();
 
@@ -929,12 +963,12 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
             .context("pull failed")?;
     }
 
-    // Re-canonicalise after the pull (tag may now be resolvable).
+    // Re-canonicalise after the pull: default_tag already fixed the lock
+    // key, so this only refines to a more specific stored form.
     let model_ref = canonical_ref(&state.0.store_path, model_ref);
     let model_ref = model_ref.as_str();
 
-    // Re-check under the post-pull name too: a different pre-pull alias
-    // of this same model may have raced us and started it already.
+    // Re-check in case that stored form differs from the key above.
     if let Some(port) = check_running(state, model_ref).await {
         return Ok(port);
     }
@@ -946,10 +980,12 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
     // failure here (e.g. a race with a concurrent `rm`) just means those
     // columns show as empty/zero rather than failing the whole request.
     let (digest, size) = OciStore::open(&state.0.store_path)
-        .and_then(|s| s.find(model_ref).map(|d| {
-            let size = s.total_size(&d);
-            (d.digest, size)
-        }))
+        .and_then(|s| {
+            s.find(model_ref).map(|d| {
+                let size = s.total_size(&d);
+                (d.digest, size)
+            })
+        })
         .unwrap_or_default();
     let port = find_free_port()?;
     eprintln!("[llmman] loading {model_ref} on port {port}");
@@ -960,18 +996,16 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<u16, AppError
     // serve.log, same as before).
     let mut stderr_tail: Option<OutputTail> = None;
     let mut process = match (&model_path, state.0.ociman) {
-        (ModelPath::Gguf(path), Some(ociman)) => {
-            ModelProcess::Container(
+        (ModelPath::Gguf(path), Some(ociman)) => ModelProcess::Container(
+            ociman,
+            crate::container::spawn(
                 ociman,
-                crate::container::spawn(
-                    ociman,
-                    path,
-                    port,
-                    state.0.llama_cpp_version.as_deref(),
-                    state.0.ctx_size,
-                )?,
-            )
-        }
+                path,
+                port,
+                state.0.llama_cpp_version.as_deref(),
+                state.0.ctx_size,
+            )?,
+        ),
         (ModelPath::Gguf(path), None) => {
             let bin = local_llama_server_bin(state).await?;
             let (child, tail) = spawn_llama_server(&bin, path, port, state.0.ctx_size).await?;
@@ -1088,7 +1122,9 @@ async fn collect_completion(
     let raw = resp.bytes().await.context("read llama-server response")?;
     eprintln!("[llmman] llama-server raw {} bytes", raw.len());
     if raw.is_empty() {
-        return Err(AppError(anyhow!("inference backend returned empty response body")));
+        return Err(AppError(anyhow!(
+            "inference backend returned empty response body"
+        )));
     }
 
     let text = String::from_utf8_lossy(&raw);
@@ -1098,7 +1134,10 @@ async fn collect_completion(
             continue;
         };
         match oai_chunk_to_content(payload) {
-            Some((tok, _thinking, true)) => { content.push_str(&tok); break; }
+            Some((tok, _thinking, true)) => {
+                content.push_str(&tok);
+                break;
+            }
             Some((tok, _thinking, false)) => content.push_str(&tok),
             None => {}
         }
@@ -1161,7 +1200,10 @@ fn oai_chunk_to_content(payload: &str) -> Option<(String, Option<String>, bool)>
     let choice = chunk.choices.first()?;
     let content = choice.delta.content.as_deref().unwrap_or("").to_string();
     // Accept both field names: "reasoning_content" (Homebrew llama-server) and "thinking" (git)
-    let thinking = choice.delta.reasoning_content.clone()
+    let thinking = choice
+        .delta
+        .reasoning_content
+        .clone()
         .or_else(|| choice.delta.thinking.clone())
         .filter(|s| !s.is_empty());
     let done = choice
@@ -1180,7 +1222,11 @@ fn oai_chunk_to_content(payload: &str) -> Option<(String, Option<String>, bool)>
 /// a non-2xx status into an AppError carrying the backend's error body.
 /// Shared by every route that streams llama-server's OpenAI-style SSE output
 /// back out in some other shape (stream_ollama, stream_anthropic below).
-async fn post_chat(client: &Client, url: &str, oai_req: &OAIChatRequest) -> Result<reqwest::Response, AppError> {
+async fn post_chat(
+    client: &Client,
+    url: &str,
+    oai_req: &OAIChatRequest,
+) -> Result<reqwest::Response, AppError> {
     let resp = client
         .post(url)
         .json(oai_req)
@@ -1213,7 +1259,8 @@ async fn stream_ollama<T: Serialize + Send + 'static>(
     let resp = post_chat(&client, &url, &oai_req).await?;
 
     let stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
-        let out = line.strip_prefix("data: ")
+        let out = line
+            .strip_prefix("data: ")
             .and_then(|p| oai_chunk_to_content(p))
             .map(|(content, thinking, done)| {
                 let chunk = build_chunk(content, thinking, done);
@@ -1265,9 +1312,10 @@ async fn stream_anthropic(
         )
     };
 
-    let preamble_stream = futures::stream::once(futures::future::ready(
-        Ok::<_, std::convert::Infallible>(Bytes::from(preamble)),
-    ));
+    let preamble_stream =
+        futures::stream::once(futures::future::ready(Ok::<_, std::convert::Infallible>(
+            Bytes::from(preamble),
+        )));
 
     let sse_stream = bytes_to_lines(resp.bytes_stream()).map(move |line| {
         let out = if let Some(payload) = line.strip_prefix("data: ") {
@@ -1456,7 +1504,8 @@ async fn handle_tags(State(state): State<AppState>) -> Result<impl IntoResponse,
             model: img.reference,
             size: img.size,
             digest: img.digest,
-            modified_at: img.modified_at
+            modified_at: img
+                .modified_at
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .and_then(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0))
                 .map(|dt| dt.to_rfc3339())
@@ -1537,7 +1586,9 @@ async fn query_context_length(client: &Client, port: u16) -> Option<u64> {
         .await
         .ok()?;
     let body: serde_json::Value = resp.json().await.ok()?;
-    body.get("default_generation_settings")?.get("n_ctx")?.as_u64()
+    body.get("default_generation_settings")?
+        .get("n_ctx")?
+        .as_u64()
 }
 
 async fn handle_show(
@@ -1546,7 +1597,10 @@ async fn handle_show(
 ) -> Result<impl IntoResponse, AppError> {
     // ollama sends either {"name":"..."} or {"model":"..."} depending on call site;
     // filter out empty strings so we always fall back to whichever field is populated.
-    let model_ref = req.name.as_deref().filter(|s| !s.is_empty())
+    let model_ref = req
+        .name
+        .as_deref()
+        .filter(|s| !s.is_empty())
         .unwrap_or(&req.model);
     // Resolve the same way handle_pull stored it — otherwise a bare name
     // (e.g. "gemma4", pulled and stored as "docker.io/ai/gemma4") would
@@ -1648,7 +1702,10 @@ async fn handle_push(
 
     // Unlike pull, there's nothing sensible to do if the model isn't
     // already in the local store — push has no "fetch it first" fallback.
-    if OciStore::open(&store_path).and_then(|s| s.find(&model)).is_err() {
+    if OciStore::open(&store_path)
+        .and_then(|s| s.find(&model))
+        .is_err()
+    {
         let body = serde_json::json!({"error": format!("model not found: {model}")});
         return (StatusCode::NOT_FOUND, Json(body)).into_response();
     }
@@ -1744,7 +1801,10 @@ async fn handle_delete(
     State(state): State<AppState>,
     Json(req): Json<OllamaDeleteRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let model_ref = req.name.as_deref().filter(|s| !s.is_empty())
+    let model_ref = req
+        .name
+        .as_deref()
+        .filter(|s| !s.is_empty())
         .unwrap_or(&req.model);
     // See handle_show: resolve the same way handle_pull stored it.
     let model_ref = crate::shortnames::resolve_ollama_api(model_ref);
@@ -1759,7 +1819,11 @@ async fn handle_ollama_chat(
     State(state): State<AppState>,
     Json(req): Json<OllamaChatRequest>,
 ) -> Result<Response, AppError> {
-    eprintln!("[llmman] /api/chat model={:?} messages={}", req.model, req.messages.len());
+    eprintln!(
+        "[llmman] /api/chat model={:?} messages={}",
+        req.model,
+        req.messages.len()
+    );
     let port = ensure_model(&state, &req.model).await?;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let oai = OAIChatRequest {
@@ -1780,15 +1844,22 @@ async fn handle_ollama_chat(
         chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
     };
     let model = req.model;
-    stream_ollama(state.0.client.clone(), url, oai, move |content, thinking, done| {
-        OllamaChatChunk {
+    stream_ollama(
+        state.0.client.clone(),
+        url,
+        oai,
+        move |content, thinking, done| OllamaChatChunk {
             model: model.clone(),
             created_at: now_rfc3339(),
-            message: OllamaMessage { role: "assistant".into(), content, thinking },
+            message: OllamaMessage {
+                role: "assistant".into(),
+                content,
+                thinking,
+            },
             done,
             done_reason: done.then_some("stop".into()),
-        }
-    })
+        },
+    )
     .await
 }
 
@@ -1798,11 +1869,20 @@ async fn handle_ollama_generate(
     State(state): State<AppState>,
     Json(req): Json<OllamaGenerateRequest>,
 ) -> Result<Response, AppError> {
-    eprintln!("[llmman] /api/generate model={:?} prompt_len={}", req.model, req.prompt.len());
+    eprintln!(
+        "[llmman] /api/generate model={:?} prompt_len={}",
+        req.model,
+        req.prompt.len()
+    );
 
     // Empty prompt + keep_alive:0 = unload request (ollama server/routes.go:354).
-    let is_unload = req.prompt.is_empty() && req.keep_alive.as_ref()
-        .and_then(|v| v.as_i64()).map(|n| n == 0).unwrap_or(false);
+    let is_unload = req.prompt.is_empty()
+        && req
+            .keep_alive
+            .as_ref()
+            .and_then(|v| v.as_i64())
+            .map(|n| n == 0)
+            .unwrap_or(false);
     if is_unload {
         let resolved = crate::shortnames::resolve_ollama_api(&req.model);
         let canonical = canonical_ref(&state.0.store_path, &resolved);
@@ -1850,16 +1930,19 @@ async fn handle_ollama_generate(
         chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
     };
     let model = req.model;
-    stream_ollama(state.0.client.clone(), url, oai, move |response, thinking, done| {
-        OllamaGenerateChunk {
+    stream_ollama(
+        state.0.client.clone(),
+        url,
+        oai,
+        move |response, thinking, done| OllamaGenerateChunk {
             model: model.clone(),
             created_at: now_rfc3339(),
             response,
             thinking,
             done,
             done_reason: done.then_some("stop".into()),
-        }
-    })
+        },
+    )
     .await
 }
 
@@ -1887,8 +1970,6 @@ async fn handle_openai_models(
         .collect();
     Ok(Json(serde_json::json!({ "object": "list", "data": data })))
 }
-
-
 
 /// Shared body of every plain OpenAI-passthrough route: parse just enough of
 /// the request to find `model`, make sure it's loaded, then proxy the
@@ -2202,8 +2283,12 @@ fn opt_u32(opts: &Option<serde_json::Value>, key: &str) -> Option<u32> {
 /// env-inheritance behavior, and so the exact same list can be reused
 /// as-is by `crate::container::spawn`, whose `docker run`/`podman run`
 /// does *not* inherit the host environment into the container on its own.
-pub const GPU_VISIBLE_DEVICE_VARS: &[&str] =
-    &["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "GGML_VK_VISIBLE_DEVICES"];
+pub const GPU_VISIBLE_DEVICE_VARS: &[&str] = &[
+    "CUDA_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "GGML_VK_VISIBLE_DEVICES",
+];
 
 /// Resolves the `llama-server` binary to run locally (no `--ociman`):
 /// prefers whatever is already on `PATH` untouched, unless
@@ -2286,10 +2371,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         None
     };
     let store_path = default_store(_args.store.as_deref())?;
-    let cache_path = store_path
-        .parent()
-        .unwrap_or(&store_path)
-        .join("cache");
+    let cache_path = store_path.parent().unwrap_or(&store_path).join("cache");
     std::fs::create_dir_all(&cache_path)?;
 
     let state = AppState(Arc::new(Inner {
@@ -2300,7 +2382,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         // Canonicalized now, while the file certainly still exists —
         // resolving later (in the handler) could fail once the install is
         // deleted, exactly the situation /api/version exists to expose.
-        exe: std::env::current_exe().ok().map(|p| p.canonicalize().unwrap_or(p)),
+        exe: std::env::current_exe()
+            .ok()
+            .map(|p| p.canonicalize().unwrap_or(p)),
         ociman: _args.ociman,
         llama_cpp_version: _args.llama_cpp_version.clone(),
         ctx_size: _args.ctx_size,
@@ -2439,9 +2523,18 @@ mod tests {
                     role: "system".into(),
                     content: "leading system prompt\n\na mid-conversation reminder".into(),
                 },
-                OAIMessage { role: "user".into(), content: "hi".into() },
-                OAIMessage { role: "assistant".into(), content: "hello".into() },
-                OAIMessage { role: "user".into(), content: "bye".into() },
+                OAIMessage {
+                    role: "user".into(),
+                    content: "hi".into()
+                },
+                OAIMessage {
+                    role: "assistant".into(),
+                    content: "hello".into()
+                },
+                OAIMessage {
+                    role: "user".into(),
+                    content: "bye".into()
+                },
             ]
         );
     }
@@ -2458,7 +2551,10 @@ mod tests {
 
         assert_eq!(
             messages,
-            vec![OAIMessage { role: "user".into(), content: "hi".into() }]
+            vec![OAIMessage {
+                role: "user".into(),
+                content: "hi".into()
+            }]
         );
     }
 
@@ -2583,16 +2679,23 @@ mod tests {
     fn oai_chunk_to_content_ported_ollama_stream_decoding_cases() {
         // Plain content token, stream not finished.
         assert_eq!(
-            oai_chunk_to_content(r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#),
+            oai_chunk_to_content(
+                r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#
+            ),
             Some(("hi".into(), None, false))
         );
         // finish_reason "stop" marks the stream done.
         assert_eq!(
-            oai_chunk_to_content(r#"{"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}"#),
+            oai_chunk_to_content(
+                r#"{"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}"#
+            ),
             Some((String::new(), None, true))
         );
         // The [DONE] sentinel also marks the stream done.
-        assert_eq!(oai_chunk_to_content("[DONE]"), Some((String::new(), None, true)));
+        assert_eq!(
+            oai_chunk_to_content("[DONE]"),
+            Some((String::new(), None, true))
+        );
         // llama-server's two reasoning field spellings both surface as
         // thinking: "reasoning_content" (Homebrew builds) and "thinking"
         // (git builds).
@@ -2603,7 +2706,9 @@ mod tests {
             Some((String::new(), Some("hmm".into()), false))
         );
         assert_eq!(
-            oai_chunk_to_content(r#"{"choices":[{"delta":{"thinking":"hmm"},"finish_reason":null}]}"#),
+            oai_chunk_to_content(
+                r#"{"choices":[{"delta":{"thinking":"hmm"},"finish_reason":null}]}"#
+            ),
             Some((String::new(), Some("hmm".into()), false))
         );
         // An empty reasoning string is filtered out rather than surfaced.
@@ -2663,8 +2768,14 @@ mod tests {
         assert_eq!(
             messages,
             vec![
-                OAIMessage { role: "system".into(), content: "you are a helpful assistant".into() },
-                OAIMessage { role: "user".into(), content: "hi".into() },
+                OAIMessage {
+                    role: "system".into(),
+                    content: "you are a helpful assistant".into()
+                },
+                OAIMessage {
+                    role: "user".into(),
+                    content: "hi".into()
+                },
             ]
         );
     }
@@ -2716,7 +2827,10 @@ mod tests {
             responses_input_item_text(&serde_json::json!({"type": "function_call", "name": "f"})),
             None
         );
-        assert_eq!(responses_input_item_text(&serde_json::json!({"content": 42})), None);
+        assert_eq!(
+            responses_input_item_text(&serde_json::json!({"content": 42})),
+            None
+        );
     }
 
     /// Ported from ollama's server/routes_options_test.go concept
@@ -2754,7 +2868,10 @@ mod tests {
         assert!(Arc::ptr_eq(&a1, &a2), "same key must return the same lock");
 
         let b = keyed_lock(&registry, "model-b");
-        assert!(!Arc::ptr_eq(&a1, &b), "different keys must not share a lock");
+        assert!(
+            !Arc::ptr_eq(&a1, &b),
+            "different keys must not share a lock"
+        );
 
         // Caller 1 finishes and releases its own clone — but caller 2's
         // clone (a2) is still outstanding, so the entry must survive.
@@ -2778,9 +2895,10 @@ mod tests {
 
         // A different model's load must acquire immediately.
         let other = load_lock("test-load-lock-other-model");
-        let _other_guard = tokio::time::timeout(std::time::Duration::from_millis(200), other.lock())
-            .await
-            .expect("a different model's load must not block on an unrelated one");
+        let _other_guard =
+            tokio::time::timeout(std::time::Duration::from_millis(200), other.lock())
+                .await
+                .expect("a different model's load must not block on an unrelated one");
 
         // The same model's load must not acquire until the first releases.
         let same = load_lock("test-load-lock-slow-model");
@@ -2803,6 +2921,33 @@ mod tests {
         drop(slow);
         release_load_lock("test-load-lock-slow-model");
         release_load_lock("test-load-lock-other-model");
+    }
+
+    /// Regression: aliases of an unpulled model must key into one lock
+    /// (see `ensure_model`'s `default_tag` call).
+    #[test]
+    fn ensure_model_key_pipeline_converges_aliases_before_the_lock() {
+        let tagless = crate::storage::default_tag(&crate::shortnames::resolve_ollama_api(
+            "regression-test-model",
+        ));
+        let tagged = crate::storage::default_tag(&crate::shortnames::resolve_ollama_api(
+            "regression-test-model:latest",
+        ));
+        assert_eq!(
+            tagless, tagged,
+            "tagless and :latest aliases must resolve to one key"
+        );
+
+        let a = load_lock(&tagless);
+        let b = load_lock(&tagged);
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "both aliases must take the same load lock"
+        );
+
+        drop(a);
+        drop(b);
+        release_load_lock(&tagless);
     }
 
     /// Regression: a call site that drops its guard but not its own `Arc`

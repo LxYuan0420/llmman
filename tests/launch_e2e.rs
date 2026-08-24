@@ -122,7 +122,9 @@ static SERIAL: Mutex<()> = Mutex::new(());
 /// and `launch_opencode_with_model` too, hiding whether either of *those*
 /// would have actually passed on their own.
 fn lock_serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Guards `warm_model` so its real (slow, first-time) work happens only
@@ -171,8 +173,10 @@ fn on_path(bin: &str) -> bool {
     };
     if cfg!(windows) {
         const EXTS: &[&str] = &["exe", "cmd", "bat"];
-        std::env::split_paths(&path)
-            .any(|dir| EXTS.iter().any(|ext| dir.join(format!("{bin}.{ext}")).is_file()))
+        std::env::split_paths(&path).any(|dir| {
+            EXTS.iter()
+                .any(|ext| dir.join(format!("{bin}.{ext}")).is_file())
+        })
     } else {
         std::env::split_paths(&path).any(|dir| dir.join(bin).is_file())
     }
@@ -199,9 +203,17 @@ fn fresh_home(label: &str) -> PathBuf {
 /// (The "bytes total" in that marker is really "bytes retained": the
 /// buffer itself is capped — see [`READER_BUF_CAP`].)
 fn tail_str(buf: &VecDeque<u8>, n: usize) -> String {
-    let tail: Vec<u8> = buf.iter().skip(buf.len().saturating_sub(n)).copied().collect();
+    let tail: Vec<u8> = buf
+        .iter()
+        .skip(buf.len().saturating_sub(n))
+        .copied()
+        .collect();
     if buf.len() > n {
-        format!("...<{} bytes total>...{}", buf.len(), String::from_utf8_lossy(&tail))
+        format!(
+            "...<{} bytes total>...{}",
+            buf.len(),
+            String::from_utf8_lossy(&tail)
+        )
     } else {
         String::from_utf8_lossy(&tail).into_owned()
     }
@@ -401,7 +413,9 @@ fn try_spawn_with_timeout(
         cmd.process_group(0);
     }
 
-    let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {description}: {e}"));
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {description}: {e}"));
     // Kept permanently (not removed once the investigation that added it
     // concluded — see this repo's own git history): a real Windows/macOS
     // hang in this file once showed only a bare "still running" heartbeat
@@ -416,7 +430,10 @@ fn try_spawn_with_timeout(
     // up to the very last heartbeat before that happens stays visible
     // even if everything after it is lost — useful for whatever the next
     // one of these turns out to be, not just the one this was built for.
-    eprintln!("[spawn_with_timeout] pid={} spawned: {description}", child.id());
+    eprintln!(
+        "[spawn_with_timeout] pid={} spawned: {description}",
+        child.id()
+    );
     let stdout_pipe = child.stdout.take().expect("child stdout");
     let stderr_pipe = child.stderr.take().expect("child stderr");
     let stdout_buf = Arc::new(Mutex::new(VecDeque::new()));
@@ -459,10 +476,18 @@ fn try_spawn_with_timeout(
             // (which is precisely what the old unconditional join did —
             // see kill_process_tree).
             kill_process_tree(&mut child);
-            let stdout =
-                String::from_utf8_lossy(&collect_reader(stdout_thread, &stdout_buf, Duration::from_secs(5))).into_owned();
-            let stderr =
-                String::from_utf8_lossy(&collect_reader(stderr_thread, &stderr_buf, Duration::from_secs(5))).into_owned();
+            let stdout = String::from_utf8_lossy(&collect_reader(
+                stdout_thread,
+                &stdout_buf,
+                Duration::from_secs(5),
+            ))
+            .into_owned();
+            let stderr = String::from_utf8_lossy(&collect_reader(
+                stderr_thread,
+                &stderr_buf,
+                Duration::from_secs(5),
+            ))
+            .into_owned();
             return Err(TimedOut {
                 message: format!(
                     "{description} did not finish within {timeout:?} — likely a hang\n\
@@ -479,7 +504,11 @@ fn try_spawn_with_timeout(
     // grandchild must not be able to wedge a *successful* run either.
     let stdout = collect_reader(stdout_thread, &stdout_buf, Duration::from_secs(30));
     let stderr = collect_reader(stderr_thread, &stderr_buf, Duration::from_secs(30));
-    Ok(std::process::Output { status, stdout, stderr })
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Forces `MODEL` to be pulled and fully loaded — via `llmman run`, our
@@ -522,7 +551,13 @@ fn warm_model() {
     WARM.call_once(|| {
         eprintln!("[warm_model] starting");
         let mut cmd = Command::new(llmman_bin());
-        cmd.arg("run").arg(MODEL).arg("--think").arg("false").arg("--num-predict").arg("64").arg(PROMPT);
+        cmd.arg("run")
+            .arg(MODEL)
+            .arg("--think")
+            .arg("false")
+            .arg("--num-predict")
+            .arg("64")
+            .arg(PROMPT);
         let output = spawn_with_timeout(cmd, TIMEOUT, "llmman run (model warm-up)");
         eprintln!("[warm_model] done, status={:?}", output.status);
         assert!(
@@ -653,7 +688,11 @@ fn launch_and_assert(integration: &str, extra_args: &[&str]) {
                     "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} timed out \
                      (small-model sampling variance can degenerate into an endless agent \
                      loop — see launch_and_assert's own doc comment); {}\n{}",
-                    if attempt < MAX_ATTEMPTS { "retrying with a fresh HOME" } else { "giving up" },
+                    if attempt < MAX_ATTEMPTS {
+                        "retrying with a fresh HOME"
+                    } else {
+                        "giving up"
+                    },
                     timed_out.message
                 );
                 last_failure = Some(timed_out.message);
@@ -675,7 +714,11 @@ fn launch_and_assert(integration: &str, extra_args: &[&str]) {
             "[test] {integration}: attempt {attempt}/{MAX_ATTEMPTS} succeeded but the reply \
              didn't contain \"pong\" (small-model sampling variance — see launch_and_assert's \
              own doc comment); {}",
-            if attempt < MAX_ATTEMPTS { "retrying with a fresh HOME" } else { "giving up" }
+            if attempt < MAX_ATTEMPTS {
+                "retrying with a fresh HOME"
+            } else {
+                "giving up"
+            }
         );
         last_failure = Some(format!(
             "expected {integration}'s reply to contain \"pong\"\n\
@@ -735,7 +778,10 @@ fn launch_opencode_with_model() {
     // step in one environment during development; keep this on so a CI
     // failure's logs show exactly what opencode was doing right up to a
     // timeout, instead of just the banner and silence.
-    launch_and_assert("opencode", &["run", PROMPT, "--print-logs", "--log-level", "DEBUG"]);
+    launch_and_assert(
+        "opencode",
+        &["run", PROMPT, "--print-logs", "--log-level", "DEBUG"],
+    );
 }
 
 #[test]
@@ -755,4 +801,3 @@ fn launch_codex_with_model() {
     // `exec <prompt>`: codex's non-interactive one-shot mode.
     launch_and_assert("codex", &["exec", PROMPT]);
 }
-

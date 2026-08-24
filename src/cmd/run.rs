@@ -52,7 +52,11 @@ pub struct RunArgs {
     /// passed.
     #[arg(long)]
     pub num_predict: Option<u32>,
-    #[arg(value_name = "PROMPT", trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(
+        value_name = "PROMPT",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
     pub prompt: Vec<String>,
 }
 
@@ -100,7 +104,13 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
     let interactive = prompt.is_empty() && io::stdin().is_terminal();
 
     if interactive {
-        run_interactive_tty(&model, ChatOptions { think: args.think, num_predict: args.num_predict })
+        run_interactive_tty(
+            &model,
+            ChatOptions {
+                think: args.think,
+                num_predict: args.num_predict,
+            },
+        )
     } else {
         let p = if prompt.is_empty() {
             let mut s = String::new();
@@ -119,7 +129,16 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
             // works identically against llmman or a real Ollama install
             // either way (both expose /api/chat).
             let client = chat_client()?;
-            chat_submit(&client, &model, &mut Vec::new(), p, ChatOptions { think: args.think, num_predict: args.num_predict })?;
+            chat_submit(
+                &client,
+                &model,
+                &mut Vec::new(),
+                p,
+                ChatOptions {
+                    think: args.think,
+                    num_predict: args.num_predict,
+                },
+            )?;
         }
         Ok(())
     }
@@ -148,7 +167,10 @@ struct Msg {
 /// actually finished loading. Mirrors daemon::stream_progress's own
 /// `.timeout(None)` for the same reason on the pull/push side.
 fn chat_client() -> anyhow::Result<Client> {
-    Client::builder().timeout(None).build().context("build http client")
+    Client::builder()
+        .timeout(None)
+        .build()
+        .context("build http client")
 }
 
 #[derive(Serialize)]
@@ -204,8 +226,8 @@ fn run_interactive_unix(model: &str, opts: ChatOptions) -> anyhow::Result<()> {
     let mut messages: Vec<Msg> = Vec::new();
     let mut rl = Readline::new()?;
     let mut multiline: Option<String> = None; // Some while inside """
-    // paste_sb accumulates lines while rl.pasting — mirrors ollama's `sb` +
-    // `case scanner.Pasting: fmt.Fprintln(&sb, line); continue`
+                                              // paste_sb accumulates lines while rl.pasting — mirrors ollama's `sb` +
+                                              // `case scanner.Pasting: fmt.Fprintln(&sb, line); continue`
     let mut paste_sb = String::new();
 
     loop {
@@ -313,7 +335,11 @@ fn chat_submit(
     content: String,
     opts: ChatOptions,
 ) -> anyhow::Result<()> {
-    messages.push(Msg { role: "user".into(), content, thinking: None });
+    messages.push(Msg {
+        role: "user".into(),
+        content,
+        thinking: None,
+    });
 
     let resp = client
         .post(&format!("{SERVER}/api/chat"))
@@ -322,7 +348,9 @@ fn chat_submit(
             messages,
             stream: true,
             think: opts.think,
-            options: opts.num_predict.map(|n| ChatReqOptions { num_predict: Some(n) }),
+            options: opts.num_predict.map(|n| ChatReqOptions {
+                num_predict: Some(n),
+            }),
         })
         .send()
         .context("connect to llmman serve")?;
@@ -340,8 +368,12 @@ fn chat_submit(
     let mut thinking_open = false;
     for line in std::io::BufReader::new(resp).lines() {
         let line = line?;
-        if line.is_empty() { continue; }
-        let Ok(chunk) = serde_json::from_str::<ChatChunk>(&line) else { continue };
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(chunk) = serde_json::from_str::<ChatChunk>(&line) else {
+            continue;
+        };
         if let Some(ref msg) = chunk.message {
             if let Some(ref t) = msg.thinking {
                 if !t.is_empty() {
@@ -362,10 +394,16 @@ fn chat_submit(
                 full.push_str(&msg.content);
             }
         }
-        if chunk.done { break; }
+        if chunk.done {
+            break;
+        }
     }
     println!("\n");
-    messages.push(Msg { role: "assistant".into(), content: full, thinking: None });
+    messages.push(Msg {
+        role: "assistant".into(),
+        content: full,
+        thinking: None,
+    });
     Ok(())
 }
 
@@ -379,10 +417,10 @@ mod unix_readline {
     use std::os::unix::io::AsRawFd;
 
     // Character codes — identical to ollama readline/types.go
-    const CHAR_INTERRUPT: u8 = 3;  // Ctrl-C
-    const CHAR_EOF: u8 = 4;        // Ctrl-D
-    const CHAR_CTRL_J: u8 = 10;    // \n  line feed / pasted newline
-    const CHAR_ENTER: u8 = 13;     // \r  keyboard Enter
+    const CHAR_INTERRUPT: u8 = 3; // Ctrl-C
+    const CHAR_EOF: u8 = 4; // Ctrl-D
+    const CHAR_CTRL_J: u8 = 10; // \n  line feed / pasted newline
+    const CHAR_ENTER: u8 = 13; // \r  keyboard Enter
     const CHAR_ESC: u8 = 27;
     const CHAR_ESCAPE_EX: u8 = 91; // '[' — second byte of ESC[
     const CHAR_BACKSPACE: u8 = 127;
@@ -394,9 +432,9 @@ mod unix_readline {
     // CharBracketedPaste = 50 ('2') — third byte of ESC[ sequence;
     // reading 3 more bytes gives "00~" (paste start) or "01~" (paste end).
     // Mirrors ollama readline/types.go: CharBracketedPaste/Start/End.
-    const CHAR_BRACKETED_PASTE: u8 = 50;   // '2'
+    const CHAR_BRACKETED_PASTE: u8 = 50; // '2'
     const PASTE_START: &[u8; 3] = b"00~";
-    const PASTE_END:   &[u8; 3] = b"01~";
+    const PASTE_END: &[u8; 3] = b"01~";
 
     pub struct Readline {
         reader: BufReader<Stdin>,
@@ -421,14 +459,19 @@ mod unix_readline {
 
             let mut raw = orig;
             unsafe {
-                raw.c_iflag &= !(libc::IGNBRK | libc::BRKINT | libc::PARMRK
-                    | libc::ISTRIP | libc::INLCR | libc::IGNCR
-                    | libc::ICRNL  | libc::IXON);
-                raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON
-                    | libc::ISIG | libc::IEXTEN);
+                raw.c_iflag &= !(libc::IGNBRK
+                    | libc::BRKINT
+                    | libc::PARMRK
+                    | libc::ISTRIP
+                    | libc::INLCR
+                    | libc::IGNCR
+                    | libc::ICRNL
+                    | libc::IXON);
+                raw.c_lflag &=
+                    !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
                 raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
                 raw.c_cflag |= libc::CS8;
-                raw.c_cc[libc::VMIN as usize]  = 1;
+                raw.c_cc[libc::VMIN as usize] = 1;
                 raw.c_cc[libc::VTIME as usize] = 0;
                 if libc::tcsetattr(fd, libc::TCSANOW, &raw) < 0 {
                     anyhow::bail!("tcsetattr failed");
@@ -439,7 +482,12 @@ mod unix_readline {
             print!("\x1b[?2004h");
             std::io::stdout().flush().ok();
 
-            Ok(Self { reader: BufReader::new(stdin), orig, fd, pasting: false })
+            Ok(Self {
+                reader: BufReader::new(stdin),
+                orig,
+                fd,
+                pasting: false,
+            })
         }
 
         /// Read one logical line from the terminal.
@@ -514,7 +562,9 @@ mod unix_readline {
                     continue;
                 } else if esc {
                     esc = false;
-                    if r == CHAR_ESCAPE_EX { esc_ex = true; }
+                    if r == CHAR_ESCAPE_EX {
+                        esc_ex = true;
+                    }
                     continue;
                 }
 
@@ -531,7 +581,9 @@ mod unix_readline {
                             return Ok(None);
                         }
                     }
-                    CHAR_ESC => { esc = true; }
+                    CHAR_ESC => {
+                        esc = true;
+                    }
                     CHAR_BACKSPACE => {
                         if !buf.is_empty() {
                             // Remove last complete UTF-8 codepoint
@@ -601,7 +653,9 @@ mod unix_readline {
             // Disable bracketed paste, restore terminal — mirrors ollama's defer
             print!("\x1b[?2004l");
             std::io::stdout().flush().ok();
-            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig); }
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
+            }
         }
     }
 }
@@ -622,12 +676,20 @@ fn run_interactive_cooked(model: &str, opts: ChatOptions) -> anyhow::Result<()> 
         print!("> ");
         io::stdout().flush().ok();
         let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 { break; }
-        let line = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line
+            .trim_end_matches('\n')
+            .trim_end_matches('\r')
+            .to_string();
         match line.trim() {
             "" => continue,
             "/bye" | "/exit" => break,
-            "/clear" => { messages.clear(); continue; }
+            "/clear" => {
+                messages.clear();
+                continue;
+            }
             _ => {}
         }
         if !line.trim().is_empty() {

@@ -37,7 +37,9 @@ pub enum HostGpu {
     /// `cuDriverGetVersion`) — used to decide between llama.cpp's
     /// separately published CUDA 12 vs. CUDA 13 Windows builds (see
     /// `llama_release::asset_query`).
-    Cuda { major: u32 },
+    Cuda {
+        major: u32,
+    },
     Rocm,
     Vulkan,
     /// macOS (Apple Silicon) only.
@@ -93,7 +95,10 @@ fn detect_gpu_api_isolated() -> HostGpu {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn spawn_probe_subprocess() -> Option<HostGpu> {
     let exe = std::env::current_exe().ok()?;
-    let output = std::process::Command::new(exe).arg(PROBE_SUBPROCESS_ARG).output().ok()?;
+    let output = std::process::Command::new(exe)
+        .arg(PROBE_SUBPROCESS_ARG)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -108,7 +113,9 @@ fn spawn_probe_subprocess() -> Option<HostGpu> {
 fn parse_probe_output(stdout: &str) -> Option<HostGpu> {
     let line = stdout.lines().next()?.trim();
     if let Some(major) = line.strip_prefix("cuda:") {
-        return Some(HostGpu::Cuda { major: major.parse().ok()? });
+        return Some(HostGpu::Cuda {
+            major: major.parse().ok()?,
+        });
     }
     match line {
         "rocm" => Some(HostGpu::Rocm),
@@ -205,12 +212,20 @@ fn open_cuda_lib() -> Option<Library> {
 
 #[cfg(target_os = "linux")]
 fn open_cuda_lib() -> Option<Library> {
-    unsafe { Library::new("libcuda.so.1").or_else(|_| Library::new("libcuda.so")).ok() }
+    unsafe {
+        Library::new("libcuda.so.1")
+            .or_else(|_| Library::new("libcuda.so"))
+            .ok()
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn open_hip_lib() -> Option<Library> {
-    unsafe { Library::new("amdhip64_6.dll").or_else(|_| Library::new("amdhip64.dll")).ok() }
+    unsafe {
+        Library::new("amdhip64_6.dll")
+            .or_else(|_| Library::new("amdhip64.dll"))
+            .ok()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -230,7 +245,11 @@ fn open_vulkan_lib() -> Option<Library> {
 
 #[cfg(target_os = "linux")]
 fn open_vulkan_lib() -> Option<Library> {
-    unsafe { Library::new("libvulkan.so.1").or_else(|_| Library::new("libvulkan.so")).ok() }
+    unsafe {
+        Library::new("libvulkan.so.1")
+            .or_else(|_| Library::new("libvulkan.so"))
+            .ok()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -287,13 +306,23 @@ fn detect_cuda() -> Option<HostGpu> {
             if cu_device_get(&mut device, 0) == CUDA_SUCCESS {
                 let mut major: i32 = 0;
                 let mut minor: i32 = 0;
-                cu_device_get_attribute(&mut major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
-                cu_device_get_attribute(&mut minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+                cu_device_get_attribute(
+                    &mut major,
+                    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    device,
+                );
+                cu_device_get_attribute(
+                    &mut minor,
+                    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                    device,
+                );
                 eprintln!("[llmman] CUDA device 0 compute capability: {major}.{minor}");
             }
         }
 
-        Some(HostGpu::Cuda { major: cuda_major_from_driver_version(driver_version) })
+        Some(HostGpu::Cuda {
+            major: cuda_major_from_driver_version(driver_version),
+        })
     }
 }
 
@@ -311,7 +340,9 @@ const HIP_SUCCESS: i32 = 0;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn detect_rocm() -> bool {
-    let Some(lib) = open_hip_lib() else { return false };
+    let Some(lib) = open_hip_lib() else {
+        return false;
+    };
     unsafe {
         let Ok(hip_get_device_count) =
             lib.get::<unsafe extern "C" fn(*mut i32) -> i32>(b"hipGetDeviceCount\0")
@@ -387,7 +418,9 @@ struct RawPhysicalDeviceProperties([u8; 1024]);
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn detect_vulkan() -> bool {
-    let Some(lib) = open_vulkan_lib() else { return false };
+    let Some(lib) = open_vulkan_lib() else {
+        return false;
+    };
     unsafe { detect_vulkan_inner(&lib).unwrap_or(false) }
 }
 
@@ -405,7 +438,9 @@ unsafe fn detect_vulkan_inner(lib: &Library) -> Option<bool> {
         lib.get(b"vkGetPhysicalDeviceProperties\0").ok()?;
     let vk_get_physical_device_queue_family_properties: Symbol<
         unsafe extern "C" fn(VkPhysicalDevice, *mut u32, *mut VkQueueFamilyProperties),
-    > = lib.get(b"vkGetPhysicalDeviceQueueFamilyProperties\0").ok()?;
+    > = lib
+        .get(b"vkGetPhysicalDeviceQueueFamilyProperties\0")
+        .ok()?;
 
     let create_info = VkInstanceCreateInfo {
         s_type: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -423,7 +458,8 @@ unsafe fn detect_vulkan_inner(lib: &Library) -> Option<bool> {
     }
 
     let mut count: u32 = 0;
-    let capable = if vk_enumerate_physical_devices(instance, &mut count, std::ptr::null_mut()) != VK_SUCCESS
+    let capable = if vk_enumerate_physical_devices(instance, &mut count, std::ptr::null_mut())
+        != VK_SUCCESS
         || count == 0
     {
         false
@@ -447,16 +483,25 @@ unsafe fn detect_vulkan_inner(lib: &Library) -> Option<bool> {
                 }
 
                 let mut qcount: u32 = 0;
-                vk_get_physical_device_queue_family_properties(device, &mut qcount, std::ptr::null_mut());
+                vk_get_physical_device_queue_family_properties(
+                    device,
+                    &mut qcount,
+                    std::ptr::null_mut(),
+                );
                 if qcount == 0 {
                     continue;
                 }
                 let mut queues = vec![VkQueueFamilyProperties::default(); qcount as usize];
-                vk_get_physical_device_queue_family_properties(device, &mut qcount, queues.as_mut_ptr());
+                vk_get_physical_device_queue_family_properties(
+                    device,
+                    &mut qcount,
+                    queues.as_mut_ptr(),
+                );
 
-                let has_compute = queues
-                    .iter()
-                    .any(|q| q.queue_flags & VK_QUEUE_COMPUTE_BIT != 0 && q.queue_flags & VK_QUEUE_TRANSFER_BIT != 0);
+                let has_compute = queues.iter().any(|q| {
+                    q.queue_flags & VK_QUEUE_COMPUTE_BIT != 0
+                        && q.queue_flags & VK_QUEUE_TRANSFER_BIT != 0
+                });
                 if has_compute {
                     capable_count += 1;
                 }
@@ -493,8 +538,14 @@ mod tests {
         assert_eq!(parse_probe_output("none\n"), Some(HostGpu::None));
         assert_eq!(parse_probe_output("rocm\n"), Some(HostGpu::Rocm));
         assert_eq!(parse_probe_output("vulkan\n"), Some(HostGpu::Vulkan));
-        assert_eq!(parse_probe_output("cuda:12\n"), Some(HostGpu::Cuda { major: 12 }));
-        assert_eq!(parse_probe_output("cuda:13\n"), Some(HostGpu::Cuda { major: 13 }));
+        assert_eq!(
+            parse_probe_output("cuda:12\n"),
+            Some(HostGpu::Cuda { major: 12 })
+        );
+        assert_eq!(
+            parse_probe_output("cuda:13\n"),
+            Some(HostGpu::Cuda { major: 13 })
+        );
         assert_eq!(parse_probe_output(""), None);
         assert_eq!(parse_probe_output("garbage\n"), None);
         assert_eq!(parse_probe_output("cuda:not-a-number\n"), None);
@@ -513,7 +564,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_failing_subprocess_status_is_not_mistaken_for_a_real_result() {
-        let output = std::process::Command::new("false").output().expect("run `false`");
+        let output = std::process::Command::new("false")
+            .output()
+            .expect("run `false`");
         assert!(!output.status.success());
         // spawn_probe_subprocess's own early `if !output.status.success()
         // { return None; }` is exactly what a real crash (or, here, this

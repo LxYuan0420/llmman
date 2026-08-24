@@ -14,8 +14,11 @@ use serde::Deserialize;
 // ---------------------------------------------------------------------------
 extern "C" {
     fn llmman_free(s: *mut c_char);
-    fn llmman_login(server: *const c_char, username: *const c_char, password: *const c_char)
-        -> *mut c_char;
+    fn llmman_login(
+        server: *const c_char,
+        username: *const c_char,
+        password: *const c_char,
+    ) -> *mut c_char;
     fn llmman_logout(server: *const c_char) -> *mut c_char;
     fn llmman_push(layout_dir: *const c_char, reference: *const c_char) -> *mut c_char;
     fn llmman_pull(reference: *const c_char, layout_dir: *const c_char) -> *mut c_char;

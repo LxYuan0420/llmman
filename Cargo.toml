@@ -2,7 +2,7 @@
 name = "llmman"
 version = "0.1.0"
 edition = "2021"
-description = "LLM model management tool using Docker or Podman transport libraries"
+description = "llmman manages OCI models"
 license = "Apache-2.0"
 
 [[bin]]

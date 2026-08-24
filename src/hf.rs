@@ -36,7 +36,10 @@ pub fn is_hf_host(server: &str) -> bool {
         .next()
         .unwrap_or(server)
         .to_ascii_lowercase();
-    matches!(host.as_str(), "hf.co" | "huggingface.co" | "www.huggingface.co")
+    matches!(
+        host.as_str(),
+        "hf.co" | "huggingface.co" | "www.huggingface.co"
+    )
 }
 
 /// The HuggingFace Hub API base URL, honoring `HF_ENDPOINT` — same
@@ -136,8 +139,7 @@ pub fn login(token: &str) -> anyhow::Result<String> {
     let username = whoami(token)?;
     let path = token_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

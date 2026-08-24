@@ -70,12 +70,18 @@ fn layer_filepath(l: &crate::storage::oci::Descriptor) -> Option<&str> {
 }
 
 fn is_gguf_layer(l: &crate::storage::oci::Descriptor) -> bool {
-    if l.media_type == HF_GGUF_MEDIA_TYPE { return true; }
-    layer_filepath(l).map(|p| p.to_lowercase().ends_with(".gguf")).unwrap_or(false)
+    if l.media_type == HF_GGUF_MEDIA_TYPE {
+        return true;
+    }
+    layer_filepath(l)
+        .map(|p| p.to_lowercase().ends_with(".gguf"))
+        .unwrap_or(false)
 }
 
 fn is_safetensors_layer(l: &crate::storage::oci::Descriptor) -> bool {
-    layer_filepath(l).map(|p| p.to_lowercase().ends_with(".safetensors")).unwrap_or(false)
+    layer_filepath(l)
+        .map(|p| p.to_lowercase().ends_with(".safetensors"))
+        .unwrap_or(false)
 }
 
 // gguf_architecture/gguf_context_length_override (a GGUF metadata reader
@@ -97,7 +103,11 @@ fn is_safetensors_layer(l: &crate::storage::oci::Descriptor) -> bool {
 /// Resolve `model_ref` (already present in the `OciStore` at `store_path`)
 /// to either a `.gguf` file or an extracted safetensors directory, caching
 /// any extraction under `cache_path`.
-pub fn resolve_model(store_path: &Path, cache_path: &Path, model_ref: &str) -> anyhow::Result<ModelPath> {
+pub fn resolve_model(
+    store_path: &Path,
+    cache_path: &Path,
+    model_ref: &str,
+) -> anyhow::Result<ModelPath> {
     let store = OciStore::open(store_path)?;
     let desc = store
         .find(model_ref)
@@ -106,7 +116,9 @@ pub fn resolve_model(store_path: &Path, cache_path: &Path, model_ref: &str) -> a
 
     // ── GGUF → llama-server ────────────────────────────────────────────────
     if let Some(gguf_layer) = manifest.layers.iter().find(|l| is_gguf_layer(l)) {
-        let title = layer_filepath(gguf_layer).unwrap_or("model.gguf").to_owned();
+        let title = layer_filepath(gguf_layer)
+            .unwrap_or("model.gguf")
+            .to_owned();
         let layer_hex = digest_hex(&gguf_layer.digest)?;
 
         // HF blobs are stored as raw GGUF — use directly.
@@ -129,10 +141,12 @@ pub fn resolve_model(store_path: &Path, cache_path: &Path, model_ref: &str) -> a
             }
         }
         std::fs::create_dir_all(&cached_dir)?;
-        let blob = store.read_blob(&gguf_layer.digest)
+        let blob = store
+            .read_blob(&gguf_layer.digest)
             .with_context(|| format!("read blob {}", gguf_layer.digest))?;
         let dest = if blob.len() >= 4 && &blob[..4] == b"GGUF" {
-            let name = Path::new(&title).file_name()
+            let name = Path::new(&title)
+                .file_name()
                 .unwrap_or_else(|| std::ffi::OsStr::new("model.gguf"));
             let p = cached_dir.join(name);
             std::fs::write(&p, &blob)?;
@@ -144,7 +158,8 @@ pub fn resolve_model(store_path: &Path, cache_path: &Path, model_ref: &str) -> a
                 let mut entry = entry?;
                 let ep = entry.path()?.to_path_buf();
                 if ep.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                    let name = ep.file_name()
+                    let name = ep
+                        .file_name()
                         .unwrap_or_else(|| std::ffi::OsStr::new("model.gguf"));
                     let d = cached_dir.join(name);
                     entry.unpack(&d)?;
@@ -159,12 +174,15 @@ pub fn resolve_model(store_path: &Path, cache_path: &Path, model_ref: &str) -> a
 
     // ── safetensors → vllm ────────────────────────────────────────────────
     if manifest.layers.iter().any(|l| is_safetensors_layer(l)) {
-        let model_dir = extract_safetensors_dir(&store, store_path, cache_path, &desc.digest, &manifest)?;
+        let model_dir =
+            extract_safetensors_dir(&store, store_path, cache_path, &desc.digest, &manifest)?;
         return Ok(ModelPath::SafeTensors(model_dir));
     }
 
     // Nothing usable found — report what was present.
-    let exts: std::collections::HashSet<String> = manifest.layers.iter()
+    let exts: std::collections::HashSet<String> = manifest
+        .layers
+        .iter()
         .filter_map(|l| layer_filepath(l))
         .filter_map(|p| Path::new(p).extension()?.to_str().map(|e| e.to_lowercase()))
         .collect();
@@ -195,28 +213,41 @@ fn extract_safetensors_dir(
         let include = matches!(
             layer.media_type.as_str(),
             "application/vnd.cncf.model.weight.config.v1.raw"
-            | "application/vnd.cncf.model.weight.v1.raw"
+                | "application/vnd.cncf.model.weight.v1.raw"
         );
-        if !include { continue; }
+        if !include {
+            continue;
+        }
 
-        let Some(rel_path) = layer_filepath(layer) else { continue };
+        let Some(rel_path) = layer_filepath(layer) else {
+            continue;
+        };
         let dest = cache_dir.join(rel_path);
-        if dest.exists() { continue; }
+        if dest.exists() {
+            continue;
+        }
 
         std::fs::create_dir_all(dest.parent().context("no parent")?)?;
         let layer_hex = digest_hex(&layer.digest)?;
         let blob = store_path.join("blobs").join("sha256").join(layer_hex);
-        std::fs::copy(&blob, &dest)
-            .with_context(|| format!("copy {rel_path} from blob store"))?;
+        std::fs::copy(&blob, &dest).with_context(|| format!("copy {rel_path} from blob store"))?;
         eprintln!("[llmman] extracted {rel_path}");
     }
 
     // Model dir = parent of config.json
     for layer in &manifest.layers {
-        let Some(rel_path) = layer_filepath(layer) else { continue };
-        if Path::new(rel_path).file_name().map(|n| n == "config.json").unwrap_or(false) {
+        let Some(rel_path) = layer_filepath(layer) else {
+            continue;
+        };
+        if Path::new(rel_path)
+            .file_name()
+            .map(|n| n == "config.json")
+            .unwrap_or(false)
+        {
             let config = cache_dir.join(rel_path);
-            return config.parent().map(|p| p.to_path_buf())
+            return config
+                .parent()
+                .map(|p| p.to_path_buf())
                 .ok_or_else(|| anyhow!("config.json has no parent directory"));
         }
     }
@@ -230,7 +261,10 @@ mod tests {
     #[test]
     fn format_matches_variant() {
         assert_eq!(ModelPath::Gguf(PathBuf::from("/x/m.gguf")).format(), "gguf");
-        assert_eq!(ModelPath::SafeTensors(PathBuf::from("/x")).format(), "safetensors");
+        assert_eq!(
+            ModelPath::SafeTensors(PathBuf::from("/x")).format(),
+            "safetensors"
+        );
     }
 
     #[test]
