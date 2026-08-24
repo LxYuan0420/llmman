@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context};
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -175,6 +175,128 @@ fn parse_kv_cache_type(value: Option<&str>) -> Option<String> {
     (!v.is_empty()).then(|| v.to_string())
 }
 
+/// `--split-mode` value requested for every `llama-server` spawn — read
+/// from `LLMMAN_SCHED_SPREAD`, llmman's equivalent of Ollama's
+/// `OLLAMA_SCHED_SPREAD`. Truthy forwards `--split-mode layer` (spread
+/// across every GPU — already llama-server's own default, now explicit);
+/// falsey forwards `--split-mode none` (restrict to one GPU). Unset
+/// leaves llama-server's own default untouched.
+fn sched_spread_from_env() -> Option<&'static str> {
+    parse_sched_spread(std::env::var("LLMMAN_SCHED_SPREAD").ok().as_deref())
+}
+
+/// [`sched_spread_from_env`]'s parsing, split out so it's testable
+/// without mutating the real process environment.
+fn parse_sched_spread(value: Option<&str>) -> Option<&'static str> {
+    let v = value?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    match v.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "layer" => Some("layer"),
+        "0" | "false" | "no" | "off" | "none" => Some("none"),
+        _ => None,
+    }
+}
+
+/// Explicit `--context-shift`/`--no-context-shift` override from
+/// `LLMMAN_CONTEXT_SHIFT`, or `None` if unset/empty/unparseable — in
+/// which case [`supports_context_shift`]'s per-model default applies
+/// instead, same as leaving Ollama's own `--think`-style env vars unset
+/// defers to its per-model `supportsContextShift`.
+fn context_shift_override_from_env() -> Option<bool> {
+    parse_context_shift(std::env::var("LLMMAN_CONTEXT_SHIFT").ok().as_deref())
+}
+
+/// [`context_shift_override_from_env`]'s parsing, split out so it's
+/// testable without mutating the real process environment.
+fn parse_context_shift(value: Option<&str>) -> Option<bool> {
+    let v = value?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    Some(!matches!(
+        v.to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    ))
+}
+
+/// Whether `model_ref` gets `--context-shift` by default, absent an
+/// explicit `LLMMAN_CONTEXT_SHIFT` override. Enabled except for
+/// DeepSeek-family ("deepseek2" architecture) models, mirroring Ollama's
+/// own `supportsContextShift` (`server/sched.go`) — their MLA-compressed
+/// KV cache can't be shifted the way llama-server expects. Ollama
+/// detects that from parsed GGUF metadata; llmman deliberately doesn't
+/// parse GGUF metadata at all (see modelpack.rs's removed
+/// gguf_architecture note), so this is a coarser name-based heuristic
+/// instead.
+fn supports_context_shift(model_ref: &str) -> bool {
+    !model_ref.to_ascii_lowercase().contains("deepseek")
+}
+
+/// Resolves the `--context-shift`/`--no-context-shift` value to spawn
+/// `model_ref` with: `env_override` (see
+/// [`context_shift_override_from_env`]) when set, else
+/// [`supports_context_shift`]'s per-model default.
+fn resolve_context_shift(model_ref: &str, env_override: Option<bool>) -> bool {
+    env_override.unwrap_or_else(|| supports_context_shift(model_ref))
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-memory auto-shrink retry (ensure_model) — mirrors Ollama's
+// reduceAutoNumCtxForLoadOOM: a chosen --ctx-size can still be too big
+// for actual free VRAM, so retry with it halved a few times instead of
+// failing the load outright.
+// ---------------------------------------------------------------------------
+
+/// Max halving retries for an OOM-looking local llama-server load.
+const MAX_CTX_SHRINK_ATTEMPTS: u32 = 4;
+
+/// Floor below which a still-failing load is a hard failure, not
+/// something to keep shrinking.
+const MIN_CTX_SIZE_FOR_RETRY: u32 = 16384;
+
+/// First retry value when `ctx_size` started as `None` (no number to
+/// halve). Matches the top VRAM tier's own default (see
+/// `hostgpu::default_ctx_size_for`) rather than starting below
+/// `MIN_CTX_SIZE_FOR_RETRY`.
+const STARTING_CTX_SIZE_FOR_UNBOUNDED_RETRY: u32 = 32768;
+
+/// Next `--ctx-size` to retry an OOM'd load with, or `None` if shrinking
+/// further wouldn't help (at/under the floor already).
+fn next_ctx_size_after_oom(current: Option<u32>) -> Option<u32> {
+    match current {
+        None => Some(STARTING_CTX_SIZE_FOR_UNBOUNDED_RETRY),
+        Some(n) => {
+            let next = (n / 2).max(MIN_CTX_SIZE_FOR_RETRY);
+            // `next < n`, not just `!=`: below the floor, halving+max
+            // would otherwise suggest a *larger* ctx-size, backwards
+            // after an OOM.
+            (next < n).then_some(next)
+        }
+    }
+}
+
+/// True if `detail` (a failed load's stderr tail, or an error message)
+/// looks like a memory-allocation failure rather than some other startup
+/// error. Matched against known ggml/llama.cpp allocator log phrasings —
+/// deliberately specific rather than one broad substring, since
+/// misclassifying an unrelated failure as OOM would burn several slow
+/// retries before surfacing the real error.
+fn looks_like_oom(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    [
+        "failed to allocate",
+        "out of memory",
+        "not enough memory",
+        "insufficient memory",
+        "cudamalloc failed",
+        "std::bad_alloc",
+    ]
+    .iter()
+    .any(|needle| d.contains(needle))
+}
+
 // ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
@@ -203,6 +325,12 @@ struct Inner {
     // every spawn_llama_server/container::spawn call, local or
     // containerized.
     ctx_size: Option<u32>,
+    // True if `ctx_size` came from an explicit LLMMAN_CONTEXT_LENGTH
+    // rather than hostgpu's VRAM-tiered auto default — see
+    // ensure_model's OOM retry loop, which only auto-shrinks the latter
+    // (mirrors Ollama's own numCtxAuto gate on reduceAutoNumCtxForLoadOOM:
+    // a user's explicit choice shouldn't be silently overridden).
+    ctx_size_explicit: bool,
     // See flash_attention_from_env's doc comment — forwarded verbatim to
     // every spawn_llama_server/container::spawn call, local or
     // containerized.
@@ -211,6 +339,16 @@ struct Inner {
     // every spawn_llama_server/container::spawn call, local or
     // containerized.
     kv_cache_type: Option<String>,
+    // See context_shift_override_from_env's doc comment — resolved
+    // per-model (see resolve_context_shift) rather than forwarded
+    // verbatim, unlike this struct's other passthrough fields.
+    context_shift_override: Option<bool>,
+    // See sched_spread_from_env's doc comment — this is only the
+    // *initial* value passed to spawn_llama_server/container::spawn;
+    // ensure_model's OOM retry loop may relax an explicit `"none"` to
+    // `"layer"` for that one load if the restriction itself looks like
+    // the cause.
+    split_mode: Option<&'static str>,
     store_path: PathBuf,
     cache_path: PathBuf,
     client: Client,
@@ -356,6 +494,38 @@ impl ModelProcess {
         };
         matches!(child.try_wait(), Ok(None))
     }
+
+    /// Stops this process and waits for it to actually exit, unlike this
+    /// same cleanup on `Drop` above: `kill_on_drop`/a bare SIGTERM signal
+    /// is fire-and-forget and doesn't wait for the OS to reap the
+    /// process. Used by `ensure_model`'s OOM retry loop before spawning a
+    /// replacement, so a still-exiting old server can't linger and race
+    /// the new one (each retry also gets its own fresh port as a second
+    /// safety net — see that loop's own comment).
+    async fn stop_and_wait(&mut self) {
+        match self {
+            ModelProcess::Container(_, child) => {
+                if let Some(pid) = child.id() {
+                    crate::container::stop(pid);
+                }
+            }
+            #[cfg(unix)]
+            ModelProcess::Local(Engine::Vllm, _, pid) => {
+                if let Some(pid) = pid {
+                    unsafe { libc::kill(-(*pid as libc::pid_t), libc::SIGKILL) };
+                }
+            }
+            ModelProcess::Local(_, _, _) => {}
+        }
+        // `Child::kill` sends SIGKILL and awaits the exit itself — after
+        // an already-successful graceful stop above, this is a no-op
+        // beyond confirming the process is actually gone.
+        let child = match self {
+            ModelProcess::Local(_, child, _) => child,
+            ModelProcess::Container(_, child) => child,
+        };
+        let _ = child.kill().await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -478,23 +648,28 @@ fn format_to_response_format(format: &Option<serde_json::Value>) -> Option<serde
     }
 }
 
-/// Translates Ollama's own `think` request field into the
-/// `chat_template_kwargs` llama-server's `/v1/chat/completions` expects to
-/// actually toggle a Qwen3-style template's thinking block (verified
-/// directly against a running llama-server: a request-level
-/// `"reasoning_budget"` field, despite mirroring the CLI flag of the same
-/// name, is *not* respected — only `chat_template_kwargs.enable_thinking`
-/// is).
-///
-/// Only handles the plain-boolean case of `think` (`true`/`false`) —
-/// Ollama's documented string thinking levels (`"low"`/`"medium"`/
-/// `"high"`/`"max"`) have no equivalent in `enable_thinking`'s plain
-/// on/off, so those (along with `think` being absent entirely) are left
-/// as a no-op: the template's own default applies, exactly as if this
-/// field didn't exist.
+/// Translates Ollama's `think` request field into the
+/// `chat_template_kwargs` llama-server actually reads. `true`/`false` →
+/// `{"enable_thinking": <bool>}`. A string level (`"low"`/`"medium"`/
+/// `"high"`/`"max"`) → `{"enable_thinking": true, "reasoning_effort":
+/// <level>}`, the jinja variable gpt-oss's and DeepSeek-V4's own
+/// templates read for reasoning depth. Anything else is a no-op.
 fn think_to_chat_template_kwargs(think: &Option<serde_json::Value>) -> Option<serde_json::Value> {
     match think {
         Some(serde_json::Value::Bool(b)) => Some(serde_json::json!({ "enable_thinking": b })),
+        // Only forward the four levels llama-server's own templates
+        // actually understand — an unrecognized level (a typo, a future
+        // Ollama addition, ...) is left a no-op rather than forwarded
+        // verbatim, so the template's own default applies instead of
+        // silently misbehaving on an unsupported reasoning_effort value.
+        Some(serde_json::Value::String(level))
+            if matches!(level.trim(), "low" | "medium" | "high" | "max") =>
+        {
+            Some(serde_json::json!({
+                "enable_thinking": true,
+                "reasoning_effort": level.trim(),
+            }))
+        }
         _ => None,
     }
 }
@@ -1340,10 +1515,13 @@ fn spawn_tail_relay(
 async fn spawn_llama_server(
     bin: &Path,
     model: &Path,
+    mmproj: Option<&Path>,
     port: u16,
     ctx_size: Option<u32>,
     flash_attention: Option<&str>,
     kv_cache_type: Option<&str>,
+    context_shift: bool,
+    split_mode: Option<&str>,
 ) -> anyhow::Result<(tokio::process::Child, OutputTail)> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([
@@ -1354,6 +1532,16 @@ async fn spawn_llama_server(
         "--host",
         "127.0.0.1",
     ]);
+    // See ModelPath::mmproj's doc comment — enables llama-server to
+    // actually act on `images` (vision) and serve
+    // `/v1/audio/transcriptions` (audio) instead of silently ignoring
+    // both.
+    if let Some(mmproj) = mmproj {
+        cmd.args([
+            "--mmproj",
+            mmproj.to_str().context("non-UTF-8 mmproj path")?,
+        ]);
+    }
     // `ctx_size` is already the effective value (see
     // context_length_from_env); `None` leaves --ctx-size unset, falling
     // back to n_ctx_train.
@@ -1369,6 +1557,17 @@ async fn spawn_llama_server(
     // --cache-type-k/-v unset, falling back to llama-server's own `f16`.
     if let Some(t) = kv_cache_type {
         cmd.args(["--cache-type-k", t, "--cache-type-v", t]);
+    }
+    // See context_shift_from_env's doc comment.
+    cmd.arg(if context_shift {
+        "--context-shift"
+    } else {
+        "--no-context-shift"
+    });
+    // See sched_spread_from_env's doc comment; `None` leaves
+    // --split-mode unset, falling back to llama-server's own `layer`.
+    if let Some(mode) = split_mode {
+        cmd.args(["--split-mode", mode]);
     }
     // See GPU_VISIBLE_DEVICE_VARS's own doc comment — already inherited
     // by default, forwarded explicitly here for clarity.
@@ -1671,6 +1870,39 @@ async fn check_running(state: &AppState, model_ref: &str) -> Option<u16> {
     None
 }
 
+/// Evicts every currently-running model other than `model_ref` that
+/// isn't actively serving a request, waiting for each to fully exit (see
+/// `ModelProcess::stop_and_wait`'s own doc comment) so its VRAM is
+/// actually freed before returning — mirrors Ollama's own OOM fallback of
+/// evicting every other loaded model and retrying once
+/// (`server/sched.go`). Skips any model with `in_flight > 0`, same as
+/// `reap_idle_models_once`'s own safety check — freeing memory for a new
+/// load should never mean killing a request that had already begun.
+/// Returns `true` if anything was evicted, so a caller only gained by
+/// this knows whether retrying is actually worth it.
+async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
+    let mut mgr = state.0.manager.lock().await;
+    let other_keys: Vec<String> = mgr
+        .running
+        .iter()
+        .filter(|(k, m)| k.as_str() != model_ref && m.in_flight == 0)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut evicted: Vec<(String, RunningModel)> = Vec::with_capacity(other_keys.len());
+    for key in other_keys {
+        if let Some(running) = mgr.running.remove(&key) {
+            evicted.push((key, running));
+        }
+    }
+    drop(mgr); // release the lock before the (possibly slow) stops below
+    let any = !evicted.is_empty();
+    for (name, mut running) in evicted {
+        eprintln!("[llmman] evicting {name} to free memory before retrying {model_ref}");
+        running.process.stop_and_wait().await;
+    }
+    any
+}
+
 /// Ensures `model_ref` is loaded and returns `(canonical_ref, port)`. The
 /// canonical name is what it's actually registered under with its backend
 /// (`--served-model-name`), which can differ from a tagless `model_ref`
@@ -1737,48 +1969,136 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
             })
         })
         .unwrap_or_default();
-    let port = find_free_port()?;
-    eprintln!("[llmman] loading {model_ref} on port {port}");
-    // Only a local llama-server child gets a captured stderr tail today
-    // (see spawn_llama_server) — container/vllm startup failures still
-    // fail fast via ModelProcess::is_alive below, just without an inline
-    // "here's why" (their own stdio is still inherited straight into
-    // serve.log, same as before).
-    let mut stderr_tail: Option<OutputTail> = None;
-    let mut process = match (&model_path, state.0.ociman) {
-        (ModelPath::Gguf(path), Some(ociman)) => ModelProcess::Container(
-            ociman,
-            crate::container::spawn(
+    let context_shift = resolve_context_shift(model_ref, state.0.context_shift_override);
+    // OOM retry loop — on a local llama-server load that fails with a
+    // memory-allocation-looking error, tries progressively more invasive
+    // fallbacks before giving up (see each branch's own comment for which
+    // Ollama behavior it mirrors). Never mutates state.0.ctx_size, so a
+    // later reload starts fresh. A fresh `port` is picked for every
+    // attempt, not just the first — otherwise a retry's replacement
+    // process could try to bind the same port the previous (failed,
+    // possibly not-yet-fully-exited) one was still holding.
+    let mut ctx_size = state.0.ctx_size;
+    let mut split_mode = state.0.split_mode;
+    let mut shrink_attempts = 0u32;
+    let mut evicted_others = false;
+    let mut split_mode_relaxed = false;
+    let mut process;
+    let mut port = find_free_port()?;
+    loop {
+        eprintln!("[llmman] loading {model_ref} on port {port}");
+        // Only a local llama-server child captures a stderr tail (see
+        // spawn_llama_server) — every retry below only fires for that case.
+        let mut stderr_tail: Option<OutputTail> = None;
+        process = match (&model_path, state.0.ociman) {
+            (ModelPath::Gguf(path, mmproj), Some(ociman)) => ModelProcess::Container(
                 ociman,
-                path,
-                port,
-                state.0.llama_cpp_version.as_deref(),
-                state.0.ctx_size,
-                state.0.flash_attention.as_deref(),
-                state.0.kv_cache_type.as_deref(),
-            )?,
-        ),
-        (ModelPath::Gguf(path), None) => {
-            let bin = local_llama_server_bin(state).await?;
-            let (child, tail) = spawn_llama_server(
-                &bin,
-                path,
-                port,
-                state.0.ctx_size,
-                state.0.flash_attention.as_deref(),
-                state.0.kv_cache_type.as_deref(),
-            )
-            .await?;
-            stderr_tail = Some(tail);
-            ModelProcess::Local(Engine::LlamaServer, child, None)
+                crate::container::spawn(
+                    ociman,
+                    path,
+                    mmproj.as_deref(),
+                    port,
+                    state.0.llama_cpp_version.as_deref(),
+                    ctx_size,
+                    state.0.flash_attention.as_deref(),
+                    state.0.kv_cache_type.as_deref(),
+                    context_shift,
+                    split_mode,
+                )?,
+            ),
+            (ModelPath::Gguf(path, mmproj), None) => {
+                let bin = local_llama_server_bin(state).await?;
+                let (child, tail) = spawn_llama_server(
+                    &bin,
+                    path,
+                    mmproj.as_deref(),
+                    port,
+                    ctx_size,
+                    state.0.flash_attention.as_deref(),
+                    state.0.kv_cache_type.as_deref(),
+                    context_shift,
+                    split_mode,
+                )
+                .await?;
+                stderr_tail = Some(tail);
+                ModelProcess::Local(Engine::LlamaServer, child, None)
+            }
+            (ModelPath::SafeTensors(dir), _) => {
+                let child = spawn_vllm_server(dir, port, model_ref).await?;
+                let pid = child.id();
+                ModelProcess::Local(Engine::Vllm, child, pid)
+            }
+        };
+
+        match wait_for_ready(&state.0.client, port, &mut process, stderr_tail.as_ref()).await {
+            Ok(()) => break,
+            Err(e) => {
+                let looks_oom = stderr_tail.is_some() // local llama-server only
+                    && looks_like_oom(&e.to_string());
+                if !looks_oom {
+                    return Err(e.into());
+                }
+                // See ModelProcess::stop_and_wait's own doc comment.
+                process.stop_and_wait().await;
+
+                // Cheapest fallback first: free memory without changing
+                // anything about how this model itself gets loaded, by
+                // evicting every other idle-but-loaded model (mirrors
+                // Ollama's own "evict all other models and retry once").
+                if !evicted_others {
+                    evicted_others = true;
+                    if evict_other_models(state, model_ref).await {
+                        eprintln!(
+                            "[llmman] {model_ref} failed to load on port {port}, which looks like an out-of-memory error — evicted other loaded models and retrying: {:#}",
+                            e
+                        );
+                        port = find_free_port()?;
+                        continue;
+                    }
+                }
+
+                // A hard LLMMAN_SCHED_SPREAD=0 (--split-mode none)
+                // restriction can itself be why this looks OOM — the
+                // model simply doesn't fit on one GPU at all, which no
+                // amount of ctx-size shrinking below would fix. Lift it
+                // before falling back to shrinking.
+                if !split_mode_relaxed && split_mode == Some("none") {
+                    split_mode_relaxed = true;
+                    split_mode = Some("layer");
+                    eprintln!(
+                        "[llmman] {model_ref} failed to load on port {port} with --split-mode none, which looks like an out-of-memory error — retrying with --split-mode layer (spread across every GPU) instead of failing outright: {:#}",
+                        e
+                    );
+                    port = find_free_port()?;
+                    continue;
+                }
+
+                // Only auto-shrink a ctx-size this daemon picked itself —
+                // silently overriding an explicit LLMMAN_CONTEXT_LENGTH
+                // would ignore the user's own stated choice (mirrors
+                // Ollama's own numCtxAuto gate on
+                // reduceAutoNumCtxForLoadOOM).
+                let can_shrink =
+                    !state.0.ctx_size_explicit && shrink_attempts < MAX_CTX_SHRINK_ATTEMPTS;
+                let Some(next) = can_shrink
+                    .then(|| next_ctx_size_after_oom(ctx_size))
+                    .flatten()
+                else {
+                    return Err(e.into());
+                };
+                eprintln!(
+                    "[llmman] {model_ref} failed to load on port {port}, which looks like an out-of-memory error — retrying with --ctx-size {next} (was {}): {:#}",
+                    ctx_size
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "model default".to_string()),
+                    e
+                );
+                ctx_size = Some(next);
+                shrink_attempts += 1;
+                port = find_free_port()?;
+            }
         }
-        (ModelPath::SafeTensors(dir), _) => {
-            let child = spawn_vllm_server(dir, port, model_ref).await?;
-            let pid = child.id();
-            ModelProcess::Local(Engine::Vllm, child, pid)
-        }
-    };
-    wait_for_ready(&state.0.client, port, &mut process, stderr_tail.as_ref()).await?;
+    }
     eprintln!("[llmman] {model_ref} ready on port {port}");
 
     state.0.manager.lock().await.running.insert(
@@ -1845,7 +2165,11 @@ async fn proxy(
     body: Bytes,
     activity: ActivityGuard,
 ) -> Result<Response, AppError> {
-    let mut req = client.post(url).body(body.to_vec());
+    // `Bytes` clones are refcounted, not copies — passing `body` straight
+    // through (reqwest::Body: From<Bytes>) avoids an extra full-size
+    // allocation that `body.to_vec()` would add on top of it, which
+    // matters most for large multipart audio uploads.
+    let mut req = client.post(url).body(body);
     if let Some(ct) = headers.get("content-type") {
         req = req.header("content-type", ct);
     }
@@ -2876,6 +3200,68 @@ async fn handle_openai_embeddings(
     proxy_openai(&state, &headers, body, "/v1/embeddings").await
 }
 
+// -- OpenAI Audio Transcriptions API (/v1/audio/transcriptions) -------------
+//
+// llama-server has its own native implementation (requires the model to
+// be loaded with mtmd audio support via a companion --mmproj — see
+// ModelPath::mmproj), so this is a plain pass-through like
+// handle_openai_responses. The request body is multipart/form-data, not
+// JSON, so proxy_openai's "parse as JSON to find model" doesn't apply —
+// multipart_text_field below extracts just the model field instead.
+
+/// Axum's own default `DefaultBodyLimit` (2 MiB) is well under a typical
+/// audio file's size — real recordings routinely run tens of MiB — so
+/// both transcription routes below opt out of it in favor of this
+/// higher cap instead of disabling it outright.
+const TRANSCRIPTION_BODY_LIMIT_BYTES: usize = 200 * 1024 * 1024;
+
+/// Extracts a top-level form field's text value from a
+/// `multipart/form-data` body, or `None` if not multipart / no boundary /
+/// field not found.
+async fn multipart_text_field(
+    body: &Bytes,
+    headers: &HeaderMap,
+    field_name: &str,
+) -> Option<String> {
+    let content_type = headers.get("content-type")?.to_str().ok()?;
+    let boundary = multer::parse_boundary(content_type).ok()?;
+    // Single-chunk stream over a cheap Bytes clone — the body is already
+    // fully buffered, so there's nothing to actually stream.
+    let stream = futures::stream::once(async { Ok::<_, std::io::Error>(body.clone()) });
+    let mut multipart = multer::Multipart::new(stream, boundary);
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some(field_name) {
+            return field.text().await.ok();
+        }
+    }
+    None
+}
+
+async fn handle_openai_transcriptions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let Some(model) = multipart_text_field(&body, &headers, "model")
+        .await
+        .filter(|m| !m.is_empty())
+    else {
+        // A malformed request, not a server-side failure — matches
+        // handle_pull's own "missing required field" convention instead
+        // of AppError's blanket 500.
+        let body = serde_json::json!({
+            "error": "transcription request is missing a required \"model\" form field"
+        });
+        return Ok((StatusCode::BAD_REQUEST, Json(body)).into_response());
+    };
+    let (model, port) = ensure_model(&state, &model).await?;
+    // No `keep_alive` field on this API surface either — see
+    // proxy_openai's own comment on the same choice.
+    let activity = begin_activity(&state, &model, None).await;
+    let url = format!("http://127.0.0.1:{port}/v1/audio/transcriptions");
+    proxy(&state.0.client, &url, &headers, body, activity).await
+}
+
 // -- OpenAI Responses API (/v1/responses) ------------------------------------
 //
 // llama-server (llama.cpp) has its own native /v1/responses implementation
@@ -3234,11 +3620,16 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     let store_path = default_store(_args.store.as_deref())?;
     let cache_path = store_path.parent().unwrap_or(&store_path).join("cache");
     std::fs::create_dir_all(&cache_path)?;
+    // See storage::repair's own doc comment — matches Ollama's own
+    // unconditional `fixBlobs(blobsDir)` at the top of `server.Serve`,
+    // before it starts listening.
+    crate::storage::repair::repair_store(&store_path)?;
 
     // See context_length_from_env's doc comment. spawn_blocking: like
     // resolve_llama_server above, the VRAM probe fallback spawns a
     // subprocess and must not block this async fn's executor thread.
-    let ctx_size = match context_length_from_env() {
+    let ctx_size_explicit = context_length_from_env();
+    let ctx_size = match ctx_size_explicit {
         Some(n) => Some(n),
         None => tokio::task::spawn_blocking(crate::hostgpu::default_ctx_size)
             .await
@@ -3259,8 +3650,11 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         ociman: _args.ociman,
         llama_cpp_version: _args.llama_cpp_version.clone(),
         ctx_size,
+        ctx_size_explicit: ctx_size_explicit.is_some(),
         flash_attention: flash_attention_from_env(),
         kv_cache_type: kv_cache_type_from_env(),
+        context_shift_override: context_shift_override_from_env(),
+        split_mode: sched_spread_from_env(),
         store_path,
         cache_path,
         client: Client::new(),
@@ -3290,6 +3684,16 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         .route("/v1/chat/completions", post(handle_openai_chat))
         .route("/v1/completions", post(handle_openai_completions))
         .route("/v1/embeddings", post(handle_openai_embeddings))
+        .route(
+            "/v1/audio/transcriptions",
+            post(handle_openai_transcriptions)
+                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/audio/transcriptions",
+            post(handle_openai_transcriptions)
+                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
+        )
         .route("/v1/responses", post(handle_openai_responses))
         .route(
             "/v1/responses/input_tokens",
@@ -3781,8 +4185,11 @@ mod tests {
             ociman: None,
             llama_cpp_version: None,
             ctx_size: None,
+            ctx_size_explicit: false,
             flash_attention: None,
             kv_cache_type: None,
+            context_shift_override: None,
+            split_mode: None,
             store_path: std::env::temp_dir(),
             cache_path: std::env::temp_dir(),
             client: Client::new(),
@@ -3873,6 +4280,57 @@ mod tests {
             mgr.running.contains_key("not-yet-expired"),
             "a model whose keep_alive deadline hasn't passed yet must survive"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evict_other_models_evicts_everything_except_the_target_and_in_flight_models() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "the-model-being-loaded".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+            mgr.running.insert(
+                "idle-other-model".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+            mgr.running.insert(
+                "busy-other-model".into(),
+                running_model_fixture(None, Duration::from_secs(0), 1),
+            );
+        }
+
+        let evicted_anything = evict_other_models(&state, "the-model-being-loaded").await;
+        assert!(evicted_anything);
+
+        let mgr = state.0.manager.lock().await;
+        assert!(
+            mgr.running.contains_key("the-model-being-loaded"),
+            "the model ensure_model is trying to load isn't itself an eviction target"
+        );
+        assert!(
+            !mgr.running.contains_key("idle-other-model"),
+            "an idle other model should be evicted to free memory"
+        );
+        assert!(
+            mgr.running.contains_key("busy-other-model"),
+            "a model with an in-flight request must survive eviction, same as reap_idle_models"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evict_other_models_reports_nothing_evicted_when_nothing_is_evictable() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "the-model-being-loaded".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+        }
+
+        assert!(!evict_other_models(&state, "the-model-being-loaded").await);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4026,6 +4484,125 @@ mod tests {
         assert_eq!(parse_kv_cache_type(Some("   ")), None);
     }
 
+    #[test]
+    fn parse_sched_spread_maps_truthy_and_falsey_spellings_to_split_mode() {
+        for truthy in ["1", "true", "yes", "on", "layer", " ON \n"] {
+            assert_eq!(
+                parse_sched_spread(Some(truthy)),
+                Some("layer"),
+                "input {truthy:?}"
+            );
+        }
+        for falsey in ["0", "false", "no", "off", "none", " OFF \n"] {
+            assert_eq!(
+                parse_sched_spread(Some(falsey)),
+                Some("none"),
+                "input {falsey:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_sched_spread_leaves_llama_servers_own_default_untouched_when_unset_or_unparseable() {
+        assert_eq!(parse_sched_spread(None), None);
+        assert_eq!(parse_sched_spread(Some("")), None);
+        assert_eq!(parse_sched_spread(Some("   ")), None);
+        assert_eq!(parse_sched_spread(Some("garbage")), None);
+    }
+
+    #[test]
+    fn parse_context_shift_is_unset_when_absent_or_empty() {
+        // No explicit override — resolve_context_shift's per-model
+        // default applies instead. See context_shift_override_from_env's
+        // doc comment.
+        assert_eq!(parse_context_shift(None), None);
+        assert_eq!(parse_context_shift(Some("")), None);
+        assert_eq!(parse_context_shift(Some("   ")), None);
+        // An unrecognized-but-non-empty value is still an explicit
+        // override, same as the old bool-returning parser — it just
+        // isn't one of the recognized falsey spellings below.
+        assert_eq!(parse_context_shift(Some("garbage")), Some(true));
+    }
+
+    #[test]
+    fn parse_context_shift_recognizes_every_falsey_spelling() {
+        assert_eq!(parse_context_shift(Some("0")), Some(false));
+        assert_eq!(parse_context_shift(Some("false")), Some(false));
+        assert_eq!(parse_context_shift(Some("no")), Some(false));
+        assert_eq!(parse_context_shift(Some("off")), Some(false));
+        // Case-insensitive, whitespace-tolerant.
+        assert_eq!(parse_context_shift(Some(" FALSE \n")), Some(false));
+    }
+
+    #[test]
+    fn parse_context_shift_recognizes_explicit_truthy_spellings_too() {
+        assert_eq!(parse_context_shift(Some("1")), Some(true));
+        assert_eq!(parse_context_shift(Some("true")), Some(true));
+        assert_eq!(parse_context_shift(Some("on")), Some(true));
+        assert_eq!(parse_context_shift(Some("yes")), Some(true));
+    }
+
+    #[test]
+    fn supports_context_shift_disables_only_for_deepseek_family_models() {
+        assert!(!supports_context_shift("deepseek-v3:latest"));
+        assert!(!supports_context_shift("deepseek-r1:70b"));
+        assert!(!supports_context_shift("DeepSeek-V2.5:latest")); // case-insensitive
+        assert!(supports_context_shift("qwen3.5:latest"));
+        assert!(supports_context_shift("gpt-oss:20b"));
+    }
+
+    #[test]
+    fn resolve_context_shift_lets_an_explicit_override_win_over_the_model_default() {
+        // An explicit LLMMAN_CONTEXT_SHIFT always wins, even against a
+        // deepseek model that would otherwise default to disabled.
+        assert!(resolve_context_shift("deepseek-v3:latest", Some(true)));
+        assert!(!resolve_context_shift("qwen3.5:latest", Some(false)));
+        // No override — falls back to the per-model default.
+        assert!(!resolve_context_shift("deepseek-v3:latest", None));
+        assert!(resolve_context_shift("qwen3.5:latest", None));
+    }
+
+    #[test]
+    fn next_ctx_size_after_oom_halves_from_the_vram_tiered_default_down_to_the_floor() {
+        // The default_ctx_size_for(<=46GiB) tier — see hostgpu.rs.
+        assert_eq!(next_ctx_size_after_oom(Some(32768)), Some(16384));
+        // At (or below) the floor, no further shrink is offered.
+        assert_eq!(next_ctx_size_after_oom(Some(16384)), None);
+        assert_eq!(next_ctx_size_after_oom(Some(8192)), None);
+    }
+
+    #[test]
+    fn next_ctx_size_after_oom_starts_an_unbounded_ctx_size_at_an_explicit_ceiling() {
+        // ctx_size: None means "defer to the model's own trained
+        // context" (see hostgpu::default_ctx_size) — nothing to halve,
+        // so the first retry pins an explicit starting point instead.
+        assert_eq!(next_ctx_size_after_oom(None), Some(32768));
+    }
+
+    #[test]
+    fn looks_like_oom_matches_known_allocation_failure_phrasings() {
+        for msg in [
+            "ggml_backend_alloc_ctx_tensors_from_buft: failed to allocate CUDA0 buffer of size 123",
+            "llama_kv_cache: failed to allocate buffer for kv cache",
+            "CUDA error: out of memory",
+            "terminate called after throwing an instance of 'std::bad_alloc'",
+            "cudaMalloc failed: out of memory",
+        ] {
+            assert!(looks_like_oom(msg), "expected OOM match for {msg:?}");
+        }
+    }
+
+    #[test]
+    fn looks_like_oom_does_not_flag_unrelated_startup_failures() {
+        for msg in [
+            "error while loading shared libraries: libcuda.so.1: cannot open shared object file",
+            "error loading model: unknown architecture 'not-a-real-arch'",
+            "error: unknown argument: --not-a-real-flag",
+        ] {
+            assert!(!looks_like_oom(msg), "unexpected OOM match for {msg:?}");
+        }
+    }
+
     /// Regression test for the Claude Code bug described on
     /// `build_anthropic_messages`'s own doc comment: a `system`-role
     /// message anywhere in `messages` (not just the top-level `system`
@@ -4161,14 +4738,13 @@ mod tests {
     // differ; each test's doc comment calls out any such adaptation.
 
     /// Ported from ollama's openai/openai_test.go
-    /// (TestFromChatRequest_ReasoningEffort), adapted to llmman's narrower
-    /// mapping: only the plain-boolean `think` forms have an equivalent in
-    /// llama-server's `chat_template_kwargs.enable_thinking`; ollama's
-    /// string thinking levels ("low"/"medium"/"high"/"max") have no
-    /// counterpart there and are deliberately a no-op (None), as is an
-    /// absent `think` — the template's own default then applies.
+    /// (TestFromChatRequest_ReasoningEffort): a boolean `think` maps to
+    /// `enable_thinking`, and a string thinking level
+    /// ("low"/"medium"/"high"/"max") additionally maps to
+    /// `reasoning_effort` — the jinja variable gpt-oss's and
+    /// DeepSeek-V4's own chat templates read.
     #[test]
-    fn think_to_chat_template_kwargs_maps_booleans_and_ignores_levels() {
+    fn think_to_chat_template_kwargs_maps_booleans_and_reasoning_levels() {
         assert_eq!(
             think_to_chat_template_kwargs(&Some(serde_json::json!(true))),
             Some(serde_json::json!({ "enable_thinking": true }))
@@ -4177,14 +4753,31 @@ mod tests {
             think_to_chat_template_kwargs(&Some(serde_json::json!(false))),
             Some(serde_json::json!({ "enable_thinking": false }))
         );
-        for level in ["low", "medium", "high", "max", "minimal", "none"] {
+        for level in ["low", "medium", "high", "max"] {
             assert_eq!(
                 think_to_chat_template_kwargs(&Some(serde_json::json!(level))),
+                Some(serde_json::json!({
+                    "enable_thinking": true,
+                    "reasoning_effort": level,
+                })),
+                "string level {level:?}"
+            );
+        }
+        // Anything other than the four known levels is a no-op — an
+        // unrecognized value shouldn't be forwarded to the template
+        // verbatim (see think_to_chat_template_kwargs's own comment).
+        for not_a_level in ["", "  ", "verbose", "LOW"] {
+            assert_eq!(
+                think_to_chat_template_kwargs(&Some(serde_json::json!(not_a_level))),
                 None,
-                "string level {level:?} must be a no-op"
+                "string {not_a_level:?}"
             );
         }
         assert_eq!(think_to_chat_template_kwargs(&None), None);
+        assert_eq!(
+            think_to_chat_template_kwargs(&Some(serde_json::Value::Null)),
+            None
+        );
     }
 
     /// Ported from ollama's api/client_test.go (TestClientStream /
@@ -4531,5 +5124,82 @@ mod tests {
                 .expect("a name-only body must still deserialize");
         assert_eq!(req.model, "");
         assert_eq!(req.name, "docker.io/ai/gemma4:E2B");
+    }
+
+    // -- multipart_text_field (/v1/audio/transcriptions) ----------------------
+
+    /// Builds a `multipart/form-data` body + matching `content-type`
+    /// header out of `fields` (name, value) pairs — a hand-rolled encoder
+    /// rather than a dependency, just enough to exercise
+    /// `multipart_text_field` against real (if minimal) multipart wire
+    /// format.
+    fn multipart_body(fields: &[(&str, &str)]) -> (Bytes, HeaderMap) {
+        let boundary = "llmman-test-boundary";
+        let mut body = String::new();
+        for (name, value) in fields {
+            body.push_str(&format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        body.push_str(&format!("--{boundary}--\r\n"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}")
+                .parse()
+                .unwrap(),
+        );
+        (Bytes::from(body), headers)
+    }
+
+    #[tokio::test]
+    async fn multipart_text_field_finds_a_named_field_among_several() {
+        let (body, headers) = multipart_body(&[
+            ("language", "en"),
+            ("model", "docker.io/ai/whisper:latest"),
+            ("response_format", "json"),
+        ]);
+        assert_eq!(
+            multipart_text_field(&body, &headers, "model").await,
+            Some("docker.io/ai/whisper:latest".to_string())
+        );
+        assert_eq!(
+            multipart_text_field(&body, &headers, "language").await,
+            Some("en".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_text_field_leaves_the_original_body_untouched() {
+        // Regression: multipart_text_field parses a *clone* of the body
+        // for the field it wants — the original `Bytes` handed to
+        // `proxy` afterward must still be the exact, complete multipart
+        // payload (file bytes included), not something already partially
+        // consumed by this lookup.
+        let (body, headers) = multipart_body(&[("model", "m"), ("prompt", "hello")]);
+        let before = body.clone();
+        let _ = multipart_text_field(&body, &headers, "model").await;
+        assert_eq!(body, before);
+    }
+
+    #[tokio::test]
+    async fn multipart_text_field_is_none_for_a_missing_field_or_non_multipart_body() {
+        let (body, headers) = multipart_body(&[("language", "en")]);
+        assert_eq!(multipart_text_field(&body, &headers, "model").await, None);
+
+        let plain_body = Bytes::from_static(b"{\"model\":\"m\"}");
+        let mut json_headers = HeaderMap::new();
+        json_headers.insert("content-type", "application/json".parse().unwrap());
+        assert_eq!(
+            multipart_text_field(&plain_body, &json_headers, "model").await,
+            None
+        );
+
+        // No content-type header at all.
+        assert_eq!(
+            multipart_text_field(&plain_body, &HeaderMap::new(), "model").await,
+            None
+        );
     }
 }
