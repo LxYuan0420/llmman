@@ -218,14 +218,25 @@ pub fn pull_image(ociman: ContainerManager, llama_cpp_version: Option<&str>) -> 
 /// same way as `--flash-attn <mode>` and `--cache-type-k`/`--cache-type-v
 /// <type>` respectively — see `cmd::serve::flash_attention_from_env` and
 /// `cmd::serve::kv_cache_type_from_env`'s doc comments.
+///
+/// `context_shift` forwards `--context-shift`/`--no-context-shift`.
+///
+/// `split_mode`, when given, forwards `--split-mode <mode>`.
+///
+/// `mmproj_path`, when given, forwards `--mmproj <path>`, mounted as its
+/// own `/mmproj` read-only volume (it's extracted into a different cache
+/// directory than `model_path`, so it can't share that mount).
 pub fn spawn(
     ociman: ContainerManager,
     model_path: &Path,
+    mmproj_path: Option<&Path>,
     port: u16,
     llama_cpp_version: Option<&str>,
     ctx_size: Option<u32>,
     flash_attention: Option<&str>,
     kv_cache_type: Option<&str>,
+    context_shift: bool,
+    split_mode: Option<&str>,
 ) -> Result<tokio::process::Child> {
     let backend = detect_backend();
     let image = backend.image_ref(llama_cpp_version);
@@ -257,6 +268,19 @@ pub fn spawn(
         "-v".into(),
         format!("{model_dir_str}:/models:ro"),
     ];
+    let mmproj_file = mmproj_path
+        .map(|p| -> Result<&str> {
+            let dir = p.parent().context("mmproj path has no parent directory")?;
+            let dir_str = dir
+                .to_str()
+                .context("mmproj directory is not valid UTF-8")?;
+            args.push("-v".into());
+            args.push(format!("{dir_str}:/mmproj:ro"));
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .context("mmproj path has no valid UTF-8 filename")
+        })
+        .transpose()?;
     args.extend(backend.engine_args());
     // Unlike a local llama-server child process, `docker run`/`podman run`
     // does not inherit the host's environment into the container on its
@@ -279,6 +303,10 @@ pub fn spawn(
         "--host".into(),
         "0.0.0.0".into(),
     ]);
+    if let Some(mmproj_file) = mmproj_file {
+        args.push("--mmproj".into());
+        args.push(format!("/mmproj/{mmproj_file}"));
+    }
     if let Some(n) = ctx_size {
         args.push("--ctx-size".into());
         args.push(n.to_string());
@@ -292,6 +320,18 @@ pub fn spawn(
         args.push(t.to_string());
         args.push("--cache-type-v".into());
         args.push(t.to_string());
+    }
+    args.push(
+        if context_shift {
+            "--context-shift"
+        } else {
+            "--no-context-shift"
+        }
+        .into(),
+    );
+    if let Some(mode) = split_mode {
+        args.push("--split-mode".into());
+        args.push(mode.to_string());
     }
 
     tokio::process::Command::new(ociman.binary())

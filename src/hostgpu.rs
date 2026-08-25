@@ -356,6 +356,12 @@ fn cuda_major_from_driver_version(driver_version: i32) -> u32 {
     (driver_version / 1000).max(0) as u32
 }
 
+/// `Some((kind, total_vram_bytes))` if at least one CUDA device is
+/// present. Sums every visible device's memory (via
+/// `cuDeviceTotalMem_v2`), not just device 0's, so a multi-GPU host's
+/// combined VRAM sizes `--ctx-size` correctly (see
+/// `default_ctx_size_for`) — matching `detect_vulkan_inner`'s existing
+/// multi-device summation below.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn detect_cuda() -> Option<(HostGpu, u64)> {
     let lib = open_cuda_lib()?;
@@ -383,8 +389,14 @@ fn detect_cuda() -> Option<(HostGpu, u64)> {
             lib.get::<unsafe extern "C" fn(*mut i32, i32) -> i32>(b"cuDeviceGet\0"),
             lib.get::<unsafe extern "C" fn(*mut i32, i32, i32) -> i32>(b"cuDeviceGetAttribute\0"),
         ) {
-            let mut device: i32 = 0;
-            if cu_device_get(&mut device, 0) == CUDA_SUCCESS {
+            let cu_device_total_mem = lib
+                .get::<unsafe extern "C" fn(*mut u64, i32) -> i32>(b"cuDeviceTotalMem_v2\0")
+                .ok();
+            for index in 0..count {
+                let mut device: i32 = 0;
+                if cu_device_get(&mut device, index) != CUDA_SUCCESS {
+                    continue;
+                }
                 let mut major: i32 = 0;
                 let mut minor: i32 = 0;
                 cu_device_get_attribute(
@@ -397,14 +409,12 @@ fn detect_cuda() -> Option<(HostGpu, u64)> {
                     CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
                     device,
                 );
-                eprintln!("[llmman] CUDA device 0 compute capability: {major}.{minor}");
+                eprintln!("[llmman] CUDA device {index} compute capability: {major}.{minor}");
 
-                if let Ok(cu_device_total_mem) =
-                    lib.get::<unsafe extern "C" fn(*mut u64, i32) -> i32>(b"cuDeviceTotalMem_v2\0")
-                {
+                if let Some(cu_device_total_mem) = &cu_device_total_mem {
                     let mut bytes: u64 = 0;
                     if cu_device_total_mem(&mut bytes, device) == CUDA_SUCCESS {
-                        vram = bytes;
+                        vram += bytes;
                     }
                 }
             }
@@ -431,8 +441,9 @@ fn detect_cuda() -> Option<(HostGpu, u64)> {
 
 const HIP_SUCCESS: i32 = 0;
 
-/// `Some(total_vram_bytes)` if a HIP device is present (0 if its memory
-/// couldn't be read), `None` if not.
+/// `Some(total_vram_bytes)` if at least one HIP device is present, `None`
+/// if not. Sums every device's memory rather than just device 0's — see
+/// `detect_cuda`'s doc comment.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn detect_rocm() -> Option<u64> {
     let lib = open_hip_lib()?;
@@ -450,10 +461,14 @@ fn detect_rocm() -> Option<u64> {
             lib.get::<unsafe extern "C" fn(i32) -> i32>(b"hipSetDevice\0"),
             lib.get::<unsafe extern "C" fn(*mut u64, *mut u64) -> i32>(b"hipMemGetInfo\0"),
         ) {
-            hip_set_device(0);
-            let (mut free, mut total): (u64, u64) = (0, 0);
-            if hip_mem_get_info(&mut free, &mut total) == HIP_SUCCESS {
-                vram = total;
+            for index in 0..count {
+                if hip_set_device(index) != HIP_SUCCESS {
+                    continue;
+                }
+                let (mut free, mut total): (u64, u64) = (0, 0);
+                if hip_mem_get_info(&mut free, &mut total) == HIP_SUCCESS {
+                    vram += total;
+                }
             }
         }
         Some(vram)

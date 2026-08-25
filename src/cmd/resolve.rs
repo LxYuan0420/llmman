@@ -16,9 +16,12 @@
 //! {"reference":"ghcr.io/org/model:tag","path":"/abs/path","format":"safetensors"}
 //! ```
 //! `format` is either `"safetensors"` (a directory containing
-//! `config.json`) or `"gguf"` (a single `.gguf` file). Any diagnostic
-//! output (pull progress, extraction notes) goes to stderr, same as every
-//! other `llmman` subcommand, so stdout stays parseable.
+//! `config.json`) or `"gguf"` (a single `.gguf` file); a `"gguf"` result
+//! additionally carries `"mmproj":"/abs/path"` when a companion
+//! multimodal projector file (see `modelpack::ModelPath::mmproj`'s doc
+//! comment) was found alongside it, omitted entirely otherwise. Any
+//! diagnostic output (pull progress, extraction notes) goes to stderr,
+//! same as every other `llmman` subcommand, so stdout stays parseable.
 //!
 //! On failure, nothing is printed to stdout, an error is printed to
 //! stderr, and the process exits non-zero — the same convention `main`
@@ -60,6 +63,12 @@ struct ResolveOutput<'a> {
     reference: &'a str,
     path: String,
     format: &'static str,
+    /// A companion `--mmproj` multimodal projector file resolved
+    /// alongside a GGUF model (see
+    /// `modelpack::ModelPath::mmproj`'s doc comment), if any. Always
+    /// absent for `format: "safetensors"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mmproj: Option<String>,
 }
 
 pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
@@ -98,6 +107,7 @@ pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
         reference: &reference,
         path: resolved.path().to_string_lossy().into_owned(),
         format: resolved.format(),
+        mmproj: resolved.mmproj().map(|p| p.to_string_lossy().into_owned()),
     };
     println!("{}", serde_json::to_string(&out)?);
     Ok(())
