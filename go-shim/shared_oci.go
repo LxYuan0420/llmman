@@ -157,13 +157,31 @@ func readIndex(layoutDir string) (ocispec.Index, error) {
 	return idx, json.Unmarshal(data, &idx)
 }
 
+func readIndexLocked(layoutDir string) (ocispec.Index, error) {
+	lock, err := lockIndex(layoutDir)
+	if err != nil {
+		return ocispec.Index{}, err
+	}
+	defer lock.release()
+	return readIndex(layoutDir)
+}
+
 // writeIndex writes index.json to an OCI layout directory.
 func writeIndex(layoutDir string, idx ocispec.Index) error {
 	data, err := json.MarshalIndent(idx, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(layoutDir, "index.json"), data, 0o644)
+	path := filepath.Join(layoutDir, "index.json")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // ensureLayout initialises the OCI layout marker files if not present.

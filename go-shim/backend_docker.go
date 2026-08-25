@@ -428,7 +428,7 @@ func llmman_push(cLayoutDir, cRef *C.char) *C.char {
 // the last one).
 func pushToRegistry(ctx context.Context, layoutDir, ref string) (changed bool, err error) {
 	// Locate the manifest in the local index
-	idx, err := readIndex(layoutDir)
+	idx, err := readIndexLocked(layoutDir)
 	if err != nil {
 		return false, fmt.Errorf("read OCI index: %w", err)
 	}

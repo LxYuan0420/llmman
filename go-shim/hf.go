@@ -681,7 +681,7 @@ func parseHFRef(ref string) (host, owner, repo, tag string, err error) {
 // cachedLayerName returns the GGUF filename for ref if it is fully cached in
 // the local OCI store (manifest blob + all layer blobs present), or "" if not.
 func cachedLayerName(layoutDir, ref string) string {
-	idx, err := readIndex(layoutDir)
+	idx, err := readIndexLocked(layoutDir)
 	if err != nil {
 		return ""
 	}
