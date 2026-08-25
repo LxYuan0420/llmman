@@ -11,7 +11,6 @@ Models are packaged as standard OCI artifacts and stored in any compatible regis
 | `serve`   | Start an inference server (Ollama / OpenAI / Anthropic APIs) |
 | `launch`  | Launch an integration (Claude Code, OpenCode, …) |
 | `run`     | Run a model interactively or with a one-shot prompt |
-| `bench`   | Measure prefill/decode throughput for one or more served models |
 | `pull`    | Pull a model from a registry or HuggingFace |
 | `resolve` | Pull (if needed) and print the local path of a model, as JSON — for other tools to consume |
 | `list`    | List locally stored models |
@@ -110,10 +109,11 @@ Daemon-wide `llama-server` tuning, set before `llmman serve` starts:
 
 ### Benchmark
 
-Measure prefill/decode throughput for one or more models already reachable through `llmman serve` (starting the daemon if needed, same as `run`):
+`llmman-bench` is a separate binary (`cargo build --bin llmman-bench`), the llmman equivalent of Ollama's own standalone `ollama-bench` tool — not a subcommand of `llmman`, and it doesn't start `llmman serve` for you either; start that first:
 
 ```
-llmman bench -m gemma4 --epochs 5
+llmman serve &
+llmman-bench -m gemma4 --epochs 5
 ```
 
 ```
@@ -121,7 +121,7 @@ MODEL   PREFILL tok/s  DECODE tok/s  TTFT   TOTAL  PROMPT tok  COMPLETION tok
 gemma4         1302.3         241.0  0.02s  1.26s          24             300
 ```
 
-Compare multiple models in one run with a comma-separated list (`-m gemma4,qwen3`), control the generated response length with `--max-tokens`, and target a specific prompt length with `--prompt-tokens` instead of the default story prompt. `--format csv` prints machine-readable output instead of the table above.
+Compare multiple models in one run with a comma-separated list (`-m gemma4,qwen3`), control the generated response length with `--max-tokens`, and target a specific prompt length with `--prompt-tokens` instead of the default story prompt. `--format csv` prints machine-readable output instead of the table above, and `--output <file>` writes results to a file instead of stdout. `--seed`, `--warmup`, `--epochs` (default 6), `-v`/`--verbose`, and `--debug` mirror `ollama-bench`, including retrying a timed epoch that comes back short of `--max-tokens` and varying the prompt on every request so the backend's KV-cache can't turn a "cold" prefill measurement into a cache hit. Each benchmarked model is unloaded once its run finishes, same as `ollama-bench`.
 
 ### Launch an integration
 

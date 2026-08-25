@@ -1,22 +1,5 @@
-#![recursion_limit = "256"]
-
-mod cmd;
-mod container;
-mod daemon;
-mod ffi;
-mod fmt;
-mod hf;
-mod hostgpu;
-mod llama_release;
-mod modelpack;
-mod oauth;
-mod shortnames;
-mod storage;
-pub mod webui;
-
-use std::path::{Path, PathBuf};
-
 use clap::{Parser, Subcommand};
+use llmman::{cmd, daemon, ffi, hostgpu};
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -36,8 +19,6 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Measure prefill/decode throughput for one or more served models
-    Bench(cmd::bench::BenchArgs),
     /// Launch an integration
     Launch(cmd::launch::LaunchArgs),
     /// Run a model interactively or with a one-shot prompt
@@ -110,7 +91,6 @@ fn main() {
 
     let cli = Cli::parse();
     let result = match &cli.command {
-        Commands::Bench(a) => cmd::bench::run(a),
         Commands::Launch(a) => cmd::launch::run(a),
         Commands::Run(a) => cmd::run::run(a),
         Commands::Build(a) => cmd::build::run(a),
@@ -131,27 +111,4 @@ fn main() {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-/// Return the path to the default local OCI store, or a caller-supplied override.
-///
-/// Linux and macOS both use `~/.local/share/llmman/store`.
-/// Windows uses `%LOCALAPPDATA%\llmman\store`.
-pub fn default_store(override_path: Option<&Path>) -> anyhow::Result<PathBuf> {
-    if let Some(p) = override_path {
-        return Ok(p.to_path_buf());
-    }
-    #[cfg(not(target_os = "windows"))]
-    let base = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-        .join(".local")
-        .join("share");
-    #[cfg(target_os = "windows")]
-    let base = dirs::data_local_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not determine local data directory"))?;
-    Ok(base.join("llmman").join("store"))
 }

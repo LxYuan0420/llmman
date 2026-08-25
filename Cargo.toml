@@ -5,6 +5,10 @@ edition = "2021"
 description = "llmman manages OCI models"
 license = "Apache-2.0"
 
+[lib]
+name = "llmman"
+path = "src/lib.rs"
+
 [[bin]]
 name = "llmman"
 path = "src/main.rs"
