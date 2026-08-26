@@ -42,6 +42,17 @@ fn models_dir_from_env() -> Option<PathBuf> {
     parse_env_path(std::env::var("LLMMAN_MODELS").ok().as_deref())
 }
 
+/// Path to the extracted-model cache — a sibling of the store
+/// (`<store>/../cache`), matching what `llmman serve` (the long-running
+/// server that extracts most models) uses. The single canonical answer for
+/// "where is the cache", so extraction and the GC sweep agree on it rather
+/// than one command writing to `<store>/cache` and another cleaning
+/// `<store>/../cache`.
+pub fn default_cache() -> anyhow::Result<PathBuf> {
+    let store = default_store()?;
+    Ok(store.parent().unwrap_or(&store).join("cache"))
+}
+
 /// Split out from [`models_dir_from_env`] for testing without touching
 /// the real environment. Blank values count as unset.
 fn parse_env_path(value: Option<&str>) -> Option<PathBuf> {

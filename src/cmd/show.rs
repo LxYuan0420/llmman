@@ -49,7 +49,7 @@ pub fn run(args: &ShowArgs) -> anyhow::Result<()> {
     let desc = store.find(&reference)?;
     let manifest = store.read_manifest(&desc.digest)?;
 
-    let cache_path = store_path.join("cache");
+    let cache_path = crate::default_cache()?;
     std::fs::create_dir_all(&cache_path).ok();
     let resolved = resolve_model(&store_path, &cache_path, &reference)?;
 

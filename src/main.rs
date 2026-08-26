@@ -46,7 +46,8 @@ enum Commands {
     Ps(cmd::ps::PsArgs),
     /// Copy a local image to a new reference
     Cp(cmd::cp::CpArgs),
-    /// Remove a local image
+    /// Remove a local image, freeing its blobs and extracted cache no
+    /// longer referenced by any other model (set LLMMAN_NOPRUNE to skip)
     Rm(cmd::rm::RmArgs),
     /// Stop (unload) a running model
     Stop(cmd::stop::StopArgs),

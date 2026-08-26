@@ -70,7 +70,8 @@ pub fn run(args: &ResolveArgs) -> anyhow::Result<()> {
     let cache_path = args
         .cache
         .clone()
-        .unwrap_or_else(|| store_path.join("cache"));
+        .map(Ok)
+        .unwrap_or_else(crate::default_cache)?;
     std::fs::create_dir_all(&store_path)
         .with_context(|| format!("creating store dir {}", store_path.display()))?;
     std::fs::create_dir_all(&cache_path)

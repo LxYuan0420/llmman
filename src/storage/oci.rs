@@ -201,11 +201,26 @@ impl OciStore {
     /// `org.opencontainers.image.ref.name` annotation. A single
     /// unreadable or unparsable entry is skipped rather than failing the
     /// whole walk.
-    fn list_refs(&self) -> Vec<Descriptor> {
+    pub(crate) fn list_refs(&self) -> Vec<Descriptor> {
         let root = self.root.join("manifests");
         let mut out = Vec::new();
         collect_refs(&root, &mut out);
         out
+    }
+
+    /// Like [`list_refs`], but aborts on the first unreadable subtree or
+    /// unparsable pointer file instead of silently skipping it. Required by
+    /// the destructive GC path ([`crate::storage::gc::referenced_digests`]):
+    /// a reference dropped by the lossy `list_refs` would make that model's
+    /// blobs look unreferenced and get swept, so GC must instead refuse to
+    /// run at all when it can't enumerate every surviving reference. A
+    /// missing `manifests/` directory (a fresh store) is an empty list, not
+    /// an error.
+    pub(crate) fn list_refs_strict(&self) -> anyhow::Result<Vec<Descriptor>> {
+        let root = self.root.join("manifests");
+        let mut out = Vec::new();
+        collect_refs_strict(&root, &mut out)?;
+        Ok(out)
     }
 
     // ------------------------------------------------------------------
@@ -661,7 +676,39 @@ fn collect_refs(dir: &Path, out: &mut Vec<Descriptor>) {
     }
 }
 
-/// Appends `:latest` to `reference` if it has no tag, so a tag-less
+/// Strict counterpart to [`collect_refs`] for the GC path: any error that
+/// `collect_refs` would swallow (an unreadable directory, an unreadable or
+/// unparsable pointer file) is propagated instead, so an incomplete
+/// enumeration can never be mistaken for "these blobs are unreferenced". A
+/// non-existent `dir` (a store with no `manifests/` yet) is treated as
+/// empty — that's a genuinely empty reference set, not a read failure.
+fn collect_refs_strict(dir: &Path, out: &mut Vec<Descriptor>) -> anyhow::Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", path.display()))?;
+        if file_type.is_dir() {
+            collect_refs_strict(&path, out)?;
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+            continue; // an in-progress or abandoned write — see write_ref
+        }
+        let data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let desc = serde_json::from_slice::<Descriptor>(&data)
+            .with_context(|| format!("parse manifest ref {}", path.display()))?;
+        out.push(desc);
+    }
+    Ok(())
+}
+
 /// reference and its `:latest` spelling are one string wherever a
 /// reference is used as a map/lock key. A no-op on anything that isn't a
 /// taggable registry reference — a URI-scheme source (`s3://`, `ngc://`,

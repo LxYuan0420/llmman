@@ -109,6 +109,7 @@ Daemon-wide settings, set before `llmman serve` starts:
 | `LLMMAN_KV_CACHE_TYPE` | KV-cache quantization (`--cache-type-k`/`--cache-type-v`), e.g. `f16` (default), `q8_0`, `q4_0` — trades output quality for memory at long context lengths, matching Ollama's `OLLAMA_KV_CACHE_TYPE`. |
 | `LLMMAN_MODELS` | Local store directory, overriding the default below — matching Ollama's `OLLAMA_MODELS`. `pull`/`push`/`run`/etc. go through the daemon and always use whichever store it was started with. |
 | `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root — matching Ollama's `OLLAMA_TMPDIR`. |
+| `LLMMAN_NOPRUNE` | When set (to anything other than `0`/`false`/`no`/`off`), skips the garbage-collection sweep that `llmman rm` and `llmman serve` startup otherwise run to delete blobs and extracted-cache entries no longer referenced by any local model. Note this is broader than skipping the daemon-startup catch-all: it also stops `llmman rm` itself from ever freeing disk space, so a removed model's (possibly multi-GB) weights stay on disk until a later sweep runs without this set. Useful for a shared/read-mostly store, or scripts that `rm` in a loop and prune once at the end. |
 
 ### Launch an integration
 
