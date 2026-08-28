@@ -58,33 +58,54 @@ func insecurePolicy() (*signature.PolicyContext, error) {
 //
 //export llmman_login
 func llmman_login(cServer, cUsername, cPassword *C.char) *C.char {
-	server := C.GoString(cServer)
-	username := C.GoString(cUsername)
-	password := C.GoString(cPassword)
+	if err := podmanLogin(context.Background(), C.GoString(cServer), C.GoString(cUsername), C.GoString(cPassword)); err != nil {
+		return errResp(err)
+	}
+	return okResp("")
+}
 
+// podmanLogin is llmman_login's implementation, factored out so a test
+// can reach it — Go forbids cgo in _test.go files.
+//
+// Stdout must be set: commonauth.Login writes to it unchecked on the
+// success path, so leaving it nil panicked *after* the credentials were
+// already written. io.Discard, not os.Stdout, because the Rust caller
+// (src/cmd/login.rs) prints its own success line.
+func podmanLogin(ctx context.Context, server, username, password string) error {
 	sys := &types.SystemContext{}
 	opts := &commonauth.LoginOptions{
 		Username: username,
 		Password: password,
+		Stdout:   io.Discard,
 	}
-	if err := commonauth.Login(context.Background(), sys, opts, []string{server}); err != nil {
-		return errResp(fmt.Errorf("login: %w", err))
+	if err := commonauth.Login(ctx, sys, opts, []string{server}); err != nil {
+		return fmt.Errorf("login: %w", err)
 	}
-	return okResp("")
+	return nil
 }
 
 // llmman_logout removes credentials for a registry.
 //
 //export llmman_logout
 func llmman_logout(cServer *C.char) *C.char {
-	server := C.GoString(cServer)
-
-	sys := &types.SystemContext{}
-	opts := &commonauth.LogoutOptions{All: false}
-	if err := commonauth.Logout(sys, opts, []string{server}); err != nil {
-		return errResp(fmt.Errorf("logout: %w", err))
+	if err := podmanLogout(C.GoString(cServer)); err != nil {
+		return errResp(err)
 	}
 	return okResp("")
+}
+
+// podmanLogout is llmman_logout's implementation. Factored out, and
+// needing Stdout set, for the same reasons as podmanLogin above.
+func podmanLogout(server string) error {
+	sys := &types.SystemContext{}
+	opts := &commonauth.LogoutOptions{
+		All:    false,
+		Stdout: io.Discard,
+	}
+	if err := commonauth.Logout(sys, opts, []string{server}); err != nil {
+		return fmt.Errorf("logout: %w", err)
+	}
+	return nil
 }
 
 // llmman_push pushes an image from a local OCI layout to a registry.
@@ -743,6 +764,3 @@ func llmman_transfer(cSource, cDestination *C.char) *C.char {
 	}
 	return okResp(transferStatusUnchanged)
 }
-
-// Ensure io is used (imported via shared helpers but referenced here for the build)
-var _ = io.Discard

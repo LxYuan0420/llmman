@@ -136,6 +136,16 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
+      # Both builds share an output path (same package, same triple, only
+      # feature flags differ), so the podman build below overwrites this
+      # one — which shipped every non-Windows release asset as a podman
+      # binary labelled as docker. Copy it out of reach first.
+      - name: Stage docker binary
+        shell: bash
+        run: |
+          mkdir -p dist-docker
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist-docker/${{ matrix.binary }}"
+
       # ── Build (Podman backend) ────────────────────────────────────────────
       # Skipped on Windows: containers/image has no Windows support.
       - name: Build (podman backend)
@@ -143,6 +153,25 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --no-default-features --features podman
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+
+      # Fail rather than ship a mislabelled binary if those paths ever
+      # collide again. Go embeds each function's source path, and the two
+      # backends' build tags are mutually exclusive, so this checks the
+      # artifact itself rather than the flags meant to build it.
+      # grep -a, not strings(1): Git Bash on Windows ships no strings.
+      - name: Verify staged binary is the docker backend
+        shell: bash
+        run: |
+          bin="dist-docker/${{ matrix.binary }}"
+          if ! grep -aq "go-shim/backend_docker.go" "$bin"; then
+            echo "::error::$bin is not a docker-backend build (no backend_docker.go symbols)"
+            exit 1
+          fi
+          if grep -aq "go-shim/backend_podman.go" "$bin"; then
+            echo "::error::$bin contains podman-backend symbols; the podman build clobbered it"
+            exit 1
+          fi
+          echo "OK: $bin is a docker-backend build"
 
       # ── Diagnostics: inspect the Go shim library on Windows ARM64 ───────────
       - name: Inspect shim library (Windows aarch64)
@@ -163,7 +192,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: llmman-docker-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          path: dist-docker/${{ matrix.binary }}
           if-no-files-found: error
 
   # --------------------------------------------------------------------------

@@ -1,3 +1,8 @@
+// hfGetBytes lives in transfer_docker.go, which is itself !podman —
+// without a matching tag this package's tests fail to compile under
+// -tags podman ("undefined: hfGetBytes").
+//go:build !podman
+
 package main
 
 import (
