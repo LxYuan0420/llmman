@@ -605,15 +605,19 @@ impl Drop for ModelProcess {
 impl ModelProcess {
     /// True if the underlying child process hasn't exited on its own since
     /// this model was marked running. Nothing else ever tells `mgr.running`
-    /// about a process exiting unexpectedly (the only place that removes an
-    /// entry today is the explicit Ollama unload signal in
-    /// `handle_ollama_generate`) — a crash, an OOM kill, or anything else
-    /// that takes `llama-server`/vllm down on its own would otherwise keep
+    /// about a process exiting unexpectedly: every other removal is a
+    /// deliberate one — the Ollama unload signal, in both
+    /// `handle_ollama_generate` and `handle_ollama_chat`; the idle reaper
+    /// (`reap_idle_models_once`); and eviction under
+    /// `LLMMAN_MAX_LOADED_MODELS` (`evict_other_models`) — and none of them
+    /// fires on a crash. So a crash, an OOM kill, or anything else that
+    /// takes `llama-server`/vllm down on its own would otherwise keep
     /// handing out that now-dead port forever, indistinguishable from a
     /// real live one until whichever caller's request to it fails with a
-    /// bare connection error. `try_wait` is non-blocking either way: `Ok(None)`
-    /// (still running) is the overwhelmingly common case this needs to stay
-    /// cheap for.
+    /// bare connection error; `check_running` is what drops the entry, the
+    /// moment this returns false. `try_wait` is non-blocking either way:
+    /// `Ok(None)` (still running) is the overwhelmingly common case this
+    /// needs to stay cheap for.
     fn is_alive(&mut self) -> bool {
         let child = match self {
             ModelProcess::Local(_, child, _) => child,
@@ -4335,6 +4339,23 @@ async fn handle_delete(
 
 // -- Ollama /api/chat ---------------------------------------------------------
 
+/// The body ollama answers a message-less `/api/chat` with. `Default` for
+/// the rest of `OllamaMessage`, not explicit `None`s: every other field is
+/// `skip_serializing_if`, so this reaches the wire as the bare
+/// `{"role":"assistant","content":""}` ollama 0.32.6 sends.
+fn empty_chat_chunk(model: String, done_reason: &str) -> OllamaChatChunk {
+    OllamaChatChunk {
+        model,
+        created_at: now_rfc3339(),
+        message: OllamaMessage {
+            role: "assistant".into(),
+            ..Default::default()
+        },
+        done: true,
+        done_reason: Some(done_reason.into()),
+    }
+}
+
 async fn handle_ollama_chat(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4345,6 +4366,30 @@ async fn handle_ollama_chat(
         req.model,
         req.messages.len()
     );
+
+    // Empty messages are ollama's unload request when paired with
+    // `keep_alive: 0`, and its load-only request on their own — the same
+    // two short-circuits `handle_ollama_generate` already implements for
+    // an empty `prompt`, which cites ollama's own `server/routes.go` for
+    // both; its `ChatHandler` carries the pair as well. Without them an
+    // empty `messages` array reaches `stream_ollama`, which asks the
+    // backend to continue from nothing: the caller gets a real, arbitrary
+    // generation and `done_reason: "stop"` where ollama answers with an
+    // empty message, and a `keep_alive: 0` never unloads anything.
+    if req.messages.is_empty() {
+        if resolve_keep_alive(&req.keep_alive) == Some(Duration::ZERO) {
+            let resolved = crate::shortnames::resolve_ollama_api(&req.model);
+            let canonical = canonical_ref(&state.0.store_path, &resolved);
+            let _guard = acquire_load_lock(&canonical).await;
+            state.0.manager.lock().await.running.remove(&canonical);
+            return Ok(Json(empty_chat_chunk(req.model, "unload")).into_response());
+        }
+
+        let (_model, _target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
+        refresh_activity(guard, resolve_keep_alive(&req.keep_alive)).await;
+        return Ok(Json(empty_chat_chunk(req.model, "load")).into_response());
+    }
+
     let (model, target, guard) = ensure_model(&state, &req.model, Some(&headers)).await?;
     let keep_alive = resolve_keep_alive(&req.keep_alive);
     let activity = begin_activity(guard, Some(keep_alive)).await;
@@ -7112,6 +7157,129 @@ mod tests {
         assert_eq!(
             mgr.running["preloaded"].keep_alive, None,
             "a pre-loaded model must be pinned to never unload, not left at the daemon default"
+        );
+    }
+
+    // -- /api/chat's message-less load/unload idiom ---------------------------
+
+    /// Deserialized, not struct-literal, so `stream` picks up its serde
+    /// default of `true` — both branches must answer with a single JSON
+    /// object even then.
+    fn chat_request(body: serde_json::Value) -> OllamaChatRequest {
+        serde_json::from_value(body).expect("valid OllamaChatRequest")
+    }
+
+    async fn chat_response_json(resp: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Pins the wire shape against ollama 0.32.6, which answers both
+    /// message-less forms with exactly this body. The `message` object must
+    /// carry `role` and `content` and nothing else — `thinking`, `images`,
+    /// `tool_calls` and `tool_name` are all `skip_serializing_if`, and a
+    /// client comparing against ollama's reply would see any extra key.
+    #[test]
+    fn empty_chat_chunk_matches_ollamas_message_less_reply() {
+        let value = serde_json::to_value(empty_chat_chunk("m:latest".into(), "load")).unwrap();
+
+        assert_eq!(value["model"], "m:latest");
+        assert_eq!(value["done"], true);
+        assert_eq!(value["done_reason"], "load");
+        assert_eq!(value["message"]["role"], "assistant");
+        assert_eq!(value["message"]["content"], "");
+        assert_eq!(
+            value["message"].as_object().unwrap().len(),
+            2,
+            "ollama's message-less reply carries only role and content"
+        );
+        assert!(value.get("created_at").is_some());
+    }
+
+    /// `{"messages": [], "keep_alive": 0}` is ollama's unload idiom — see
+    /// `handle_ollama_chat` for what the request did before this branch
+    /// existed. Asserts both halves of the contract that regressed: the
+    /// reply names the unload, and the model actually leaves the manager.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ollama_chat_with_no_messages_and_keep_alive_zero_unloads_the_model() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "docker.io/ai/m:latest".into(),
+                running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+            );
+        }
+
+        let resp = handle_ollama_chat(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(chat_request(serde_json::json!({
+                "model": "docker.io/ai/m:latest",
+                "messages": [],
+                "keep_alive": 0,
+            }))),
+        )
+        .await
+        .expect("unload must not error");
+
+        let value = chat_response_json(resp).await;
+        assert_eq!(value["done_reason"], "unload");
+        assert_eq!(value["message"]["content"], "");
+        assert!(
+            !state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("docker.io/ai/m:latest"),
+            "keep_alive: 0 with no messages must actually unload the model"
+        );
+    }
+
+    /// `{"messages": []}` alone is ollama's pre-load idiom: load the model,
+    /// answer with an empty message, generate nothing. `ensure_model` short-
+    /// circuits at `check_running` for the already-running fixture, so this
+    /// exercises the handler branch without a backend. Before this branch
+    /// existed the same request returned arbitrary generated prose with
+    /// `done_reason: "stop"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ollama_chat_with_no_messages_loads_without_generating() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "docker.io/ai/m:latest".into(),
+                running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+            );
+        }
+
+        let resp = handle_ollama_chat(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(chat_request(serde_json::json!({
+                "model": "docker.io/ai/m:latest",
+                "messages": [],
+            }))),
+        )
+        .await
+        .expect("pre-load must not error");
+
+        let value = chat_response_json(resp).await;
+        assert_eq!(value["done_reason"], "load");
+        assert_eq!(value["message"]["content"], "");
+        assert!(
+            state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("docker.io/ai/m:latest"),
+            "a pre-load must leave the model loaded"
         );
     }
 
