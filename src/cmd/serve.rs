@@ -1380,6 +1380,20 @@ fn resolve_keep_alive(value: &Option<serde_json::Value>) -> Option<Duration> {
         .unwrap_or_else(default_keep_alive)
 }
 
+/// True only when the request itself spells `keep_alive: 0` — Ollama's
+/// unload sentinel, in any of the zero forms `parse_keep_alive_value`
+/// accepts. Deliberately not [`resolve_keep_alive`], which falls back to
+/// [`default_keep_alive`] when the field is absent: under
+/// `LLMMAN_KEEP_ALIVE=0` that fallback made a message-less preload
+/// naming no `keep_alive` of its own resolve to zero and answer
+/// `"unload"`, so a caller asking to warm a model got it evicted
+/// instead. An unparseable value stays a non-unload
+/// here for the same reason it stays one in `resolve_keep_alive` — the
+/// daemon default decides how long to keep it, not whether to keep it.
+fn is_explicit_unload(keep_alive: &Option<serde_json::Value>) -> bool {
+    keep_alive.as_ref().and_then(parse_keep_alive_value) == Some(Some(Duration::ZERO))
+}
+
 /// `None` = couldn't parse `v` as a keep_alive value at all (caller falls
 /// back to the daemon default). `Some(None)` = "never unload" (a negative
 /// number). `Some(Some(d))` = "unload after `d` of inactivity".
@@ -2144,6 +2158,25 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
         .and_then(|a| a.get("org.opencontainers.image.ref.name"))
         .cloned()
         .unwrap_or_else(|| model_ref.to_owned())
+}
+
+/// The `mgr.running` key an unload request names, resolved through the
+/// same three steps `ensure_model` uses to build the key it inserts
+/// under: `resolve_ollama_api`, then `default_tag`, then `canonical_ref`.
+///
+/// `default_tag` is the step the unload paths used to skip, on the
+/// assumption that `canonical_ref` would supply the tag from the store
+/// index. It only does so while the model is still *in* the store: once
+/// `find` misses — the model was removed after it was loaded, the index
+/// is unreadable — `canonical_ref` returns the reference untouched, so a
+/// tagless unload looked for `docker.io/ai/m` while the model ran under
+/// `docker.io/ai/m:latest`. `remove` missed, and the reply still said
+/// `"unload"`, leaving the caller believing a model it can still see in
+/// `llmman ps` had been evicted.
+fn unload_key(state: &AppState, model: &str) -> String {
+    let resolved = crate::shortnames::resolve_ollama_api(model);
+    let tagged = crate::storage::default_tag(&resolved);
+    canonical_ref(&state.0.store_path, &tagged)
 }
 
 /// Is `model_ref` already running and alive? See `ModelProcess::is_alive`.
@@ -4387,9 +4420,8 @@ async fn handle_ollama_chat(
     // generation and `done_reason: "stop"` where ollama answers with an
     // empty message, and a `keep_alive: 0` never unloads anything.
     if req.messages.is_empty() {
-        if resolve_keep_alive(&req.keep_alive) == Some(Duration::ZERO) {
-            let resolved = crate::shortnames::resolve_ollama_api(&req.model);
-            let canonical = canonical_ref(&state.0.store_path, &resolved);
+        if is_explicit_unload(&req.keep_alive) {
+            let canonical = unload_key(&state, &req.model);
             let _guard = acquire_load_lock(&canonical).await;
             state.0.manager.lock().await.running.remove(&canonical);
             return Ok(Json(empty_chat_chunk(req.model, "unload")).into_response());
@@ -4471,15 +4503,13 @@ async fn handle_ollama_generate(
     );
 
     // Empty prompt + keep_alive:0 = unload request (ollama server/routes.go:354).
-    // resolve_keep_alive (not a bare `.as_i64() == Some(0)` check) so every
-    // zero form it accepts — the JSON number 0, but also "0"/"0s"/etc as a
-    // string — is treated as the unload sentinel, matching how the very
-    // same value is interpreted everywhere else keep_alive is read.
-    let is_unload =
-        req.prompt.is_empty() && resolve_keep_alive(&req.keep_alive) == Some(Duration::ZERO);
+    // is_explicit_unload, not resolve_keep_alive: it still accepts every
+    // zero form — the JSON number 0, but also "0"/"0s"/etc as a string —
+    // without treating an absent field as one, which under
+    // `LLMMAN_KEEP_ALIVE=0` turned a plain preload into an eviction.
+    let is_unload = req.prompt.is_empty() && is_explicit_unload(&req.keep_alive);
     if is_unload {
-        let resolved = crate::shortnames::resolve_ollama_api(&req.model);
-        let canonical = canonical_ref(&state.0.store_path, &resolved);
+        let canonical = unload_key(&state, &req.model);
         // Wait for an in-flight load of this model to publish itself first,
         // so it can't race ahead of this remove.
         let _guard = acquire_load_lock(&canonical).await;
@@ -7247,6 +7277,78 @@ mod tests {
                 .running
                 .contains_key("docker.io/ai/m:latest"),
             "keep_alive: 0 with no messages must actually unload the model"
+        );
+    }
+
+    /// `test_state`'s store path is an empty temp dir, so `canonical_ref`
+    /// finds nothing and returns the reference untouched — the same
+    /// position a real daemon is in once the model has been removed from
+    /// the store while still running. `default_tag` has to supply the
+    /// `:latest` on its own, or the remove looks up `docker.io/ai/m` and
+    /// misses the entry entirely while still reporting `"unload"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tagless_unload_still_finds_a_model_running_under_latest() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "docker.io/ai/m:latest".into(),
+                running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+            );
+        }
+
+        let resp = handle_ollama_chat(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(chat_request(serde_json::json!({
+                "model": "docker.io/ai/m",
+                "messages": [],
+                "keep_alive": 0,
+            }))),
+        )
+        .await
+        .expect("unload must not error");
+
+        assert_eq!(chat_response_json(resp).await["done_reason"], "unload");
+        assert!(
+            !state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("docker.io/ai/m:latest"),
+            "a tagless unload must reach the model stored under :latest"
+        );
+    }
+
+    /// Pins which requests name the unload sentinel: every zero form
+    /// `parse_keep_alive_value` accepts, and nothing else — an absent
+    /// field least of all, since that is what a message-less preload
+    /// sends and what `LLMMAN_KEEP_ALIVE=0` used to turn into an eviction.
+    ///
+    /// This pins the contract, not the regression. The old and new
+    /// predicates differ only in whether they consult
+    /// `default_keep_alive`, which reads a process-wide environment
+    /// variable the `resolve_keep_alive` tests in this module read too;
+    /// telling them apart in-process would mean mutating it underneath
+    /// those tests. The regression itself was reproduced against a real
+    /// daemon started with `LLMMAN_KEEP_ALIVE=0`.
+    #[test]
+    fn only_a_keep_alive_the_request_actually_carries_means_unload() {
+        assert!(
+            !is_explicit_unload(&None),
+            "an absent field is not an unload"
+        );
+        assert!(is_explicit_unload(&Some(serde_json::json!(0))));
+        assert!(is_explicit_unload(&Some(serde_json::json!("0"))));
+        assert!(is_explicit_unload(&Some(serde_json::json!("0s"))));
+        assert!(!is_explicit_unload(&Some(serde_json::json!(300))));
+        assert!(!is_explicit_unload(&Some(serde_json::json!(-1))));
+        assert!(
+            !is_explicit_unload(&Some(serde_json::json!("garbage"))),
+            "an unparseable value leaves the daemon default deciding how long \
+             to keep the model, not whether to keep it"
         );
     }
 
