@@ -59,6 +59,7 @@ Environment Variables:
       LLMMAN_TMPDIR                  Staging directory for llama-server release downloads
       LLAMA_ARG_FIT                  Enable llama.cpp automatic fit of unset memory options (default \"on\")
       LLAMA_ARG_FIT_TARGET           Target free VRAM margin per device for llama.cpp fit (MiB)
+      LLAMA_ARG_THREADS              Thread count for llama-server (default: llama-server autodetection, overridden by a binding CPU quota/affinity limit)
 ";
 
 #[derive(Args, Debug)]
@@ -236,6 +237,69 @@ fn num_parallel_from_env() -> Option<u32> {
 fn parse_num_parallel(value: Option<&str>) -> Option<u32> {
     let n: u32 = value?.trim().parse().ok()?;
     (n != 0).then_some(n)
+}
+
+/// `--threads <n>` for local `llama-server` spawns, `Some` only when a
+/// CPU limit binds. llama-server's own autodetection
+/// (`cpu_get_num_math()`) already picks the physical/math cores, so an
+/// unconstrained host passes nothing and leaves that choice alone. The
+/// derived value only corrects the case autodetection cannot see: a
+/// cgroup CPU quota, or a narrowed affinity mask, both carried by
+/// `std::thread::available_parallelism` (std walks /proc/self/cgroup
+/// and the ancestor chain itself, v1 and v2). A limit binds when
+/// `available_parallelism` is below the online CPU count; then that
+/// smaller value is passed. Accepted tradeoff: a quota between the
+/// physical-core and SMT-thread counts (e.g. --cpus=12 on an
+/// 8-core/16-thread host) passes 12 where autodetection would pick 8.
+/// Any read or parse failure returns `None`: fail closed to
+/// autodetection. `LLAMA_ARG_THREADS` set in the environment wins:
+/// llama-server reads it itself via plain env inheritance, so `None`
+/// here keeps that explicit choice untouched.
+fn threads_from_env_or_host() -> Option<u32> {
+    if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let allowed = std::thread::available_parallelism().ok()?.get() as u32;
+        let online = online_cpu_count()?;
+        (allowed < online).then_some(allowed)
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// Online CPUs from /sys/devices/system/cpu/online, the baseline
+/// `available_parallelism` is compared against to decide whether a
+/// quota or affinity limit binds. `None` when the file is unreadable
+/// or malformed.
+#[cfg(target_os = "linux")]
+fn online_cpu_count() -> Option<u32> {
+    cpu_list_count(&std::fs::read_to_string("/sys/devices/system/cpu/online").ok()?)
+}
+
+/// CPU count from a kernel CPU list such as /sys/devices/system/cpu/online:
+/// comma-separated single IDs or inclusive ranges (`0-15`, `0,4-7`).
+/// `None` on empty or malformed content.
+#[cfg(target_os = "linux")]
+fn cpu_list_count(list: &str) -> Option<u32> {
+    let mut count: u32 = 0;
+    for part in list.trim().split(',') {
+        match part.split_once('-') {
+            Some((lo, hi)) => {
+                let (lo, hi): (u32, u32) = (lo.trim().parse().ok()?, hi.trim().parse().ok()?);
+                if lo > hi {
+                    return None;
+                }
+                count = count.checked_add(hi.checked_sub(lo)?.checked_add(1)?)?;
+            }
+            None => {
+                let _: u32 = part.trim().parse().ok()?;
+                count = count.checked_add(1)?;
+            }
+        }
+    }
+    (count > 0).then_some(count)
 }
 
 /// The `--ctx-size` value to actually forward to llama-server: `ctx_size`
@@ -441,6 +505,11 @@ struct Inner {
     split_mode: Option<&'static str>,
     // See num_parallel_from_env's doc comment.
     num_parallel: Option<u32>,
+    // See threads_from_env_or_host's doc comment. Resolved once at
+    // startup (this daemon's cgroup doesn't change per load) and passed
+    // to every *local* spawn_llama_server call from ensure_model's OOM
+    // retry loop.
+    threads: Option<u32>,
     // See max_queue_from_env's doc comment; enforced by try_admit.
     max_queue: usize,
     // See max_loaded_models_from_env's doc comment.
@@ -1720,6 +1789,7 @@ async fn spawn_llama_server(
         context_shift,
         split_mode,
         num_parallel,
+        threads,
     } = opts;
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([
@@ -1770,6 +1840,11 @@ async fn spawn_llama_server(
     // See num_parallel_from_env's doc comment.
     if let Some(n) = num_parallel {
         cmd.args(["--parallel", &n.to_string()]);
+    }
+    // See threads_from_env_or_host's doc comment; `None` leaves
+    // --threads unset, falling back to llama-server's own autodetection.
+    if let Some(n) = threads {
+        cmd.args(["--threads", &n.to_string()]);
     }
     // See GPU_VISIBLE_DEVICE_VARS's own doc comment — already inherited
     // by default, forwarded explicitly here for clarity.
@@ -2862,11 +2937,14 @@ async fn ensure_model(
             context_shift,
             split_mode,
             num_parallel,
+            threads: state.0.threads,
         };
         // Only a local llama-server child captures a stderr tail (see
         // spawn_llama_server) — every retry below only fires for that case.
         let mut stderr_tail: Option<OutputTail> = None;
         process = match (&model_path, state.0.ociman) {
+            // container::spawn ignores llama_opts.threads; see that
+            // field's doc comment.
             (ModelPath::Gguf(path, mmproj), Some(ociman)) => ModelProcess::Container(
                 ociman,
                 crate::container::spawn(
@@ -5354,7 +5432,8 @@ pub const GPU_VISIBLE_DEVICE_VARS: &[&str] = &[
 /// llama.cpp's own env-configurable arguments (`common/arg.cpp`'s
 /// `set_env`), forwarded the same way as [`GPU_VISIBLE_DEVICE_VARS`] —
 /// llama-server reads these itself, llmman just makes sure they reach it.
-pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] = &["LLAMA_ARG_FIT", "LLAMA_ARG_FIT_TARGET"];
+pub const LLAMA_CPP_ENV_PASSTHROUGH_VARS: &[&str] =
+    &["LLAMA_ARG_FIT", "LLAMA_ARG_FIT_TARGET", "LLAMA_ARG_THREADS"];
 
 /// Resolves the `llama-server` binary to run locally (no `--ociman`):
 /// prefers whatever is already on `PATH` untouched, unless
@@ -5475,6 +5554,20 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
             .context("hostgpu probe task panicked")?,
     };
 
+    // See threads_from_env_or_host's doc comment. Resolved once here
+    // rather than per load, and logged so a surprising thread count is
+    // explainable from the startup output. Only the local spawn path
+    // consumes the derived value, so don't log it under --ociman (the
+    // container arm deliberately ignores it).
+    let threads = threads_from_env_or_host();
+    if let Some(n) = threads {
+        if _args.ociman.is_none() {
+            eprintln!("[llmman] llama-server gets --threads {n} (CPU quota/affinity limit below the online CPU count)");
+        }
+    } else if std::env::var_os("LLAMA_ARG_THREADS").is_some() {
+        eprintln!("[llmman] LLAMA_ARG_THREADS set: leaving llama-server thread count to it");
+    }
+
     let state = AppState(Arc::new(Inner {
         manager: Mutex::new(ModelManager {
             running: HashMap::new(),
@@ -5495,6 +5588,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         kv_cache_type: kv_cache_type_from_env(),
         split_mode: sched_spread_from_env(),
         num_parallel: num_parallel_from_env(),
+        threads,
         max_queue: max_queue_from_env(),
         max_loaded_models: max_loaded_models_from_env(),
         store_path,
@@ -6462,6 +6556,7 @@ mod tests {
             kv_cache_type: None,
             split_mode: None,
             num_parallel: None,
+            threads: None,
             // usize::MAX, not 0 — 0 now means "admit almost nothing"
             // (see try_admit_against's doc comment), and no test here
             // calls ensure_model (the only caller of try_admit) directly
@@ -7472,6 +7567,32 @@ mod tests {
         assert_eq!(parse_num_parallel(Some("")), None);
         assert_eq!(parse_num_parallel(Some("-1")), None);
         assert_eq!(parse_num_parallel(Some("garbage")), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_list_count_counts_ids_and_inclusive_ranges() {
+        // (kernel CPU list, expected count)
+        let cases = [
+            ("0-15\n", Some(16)),
+            ("0", Some(1)),
+            ("0,4-7\n", Some(5)),
+            ("0-3,8-11\n", Some(8)),
+            // Malformed or empty content fails closed: the caller then
+            // passes no --threads and llama-server autodetects.
+            ("", None),
+            ("\n", None),
+            ("3-1", None),
+            ("0-x", None),
+            ("a", None),
+            ("0,,2", None),
+            // Range length would overflow u32; no kernel emits this.
+            ("0-4294967295", None),
+            ("0-4294967295,4", None),
+        ];
+        for (list, expected) in &cases {
+            assert_eq!(&cpu_list_count(list), expected, "list={list:?}");
+        }
     }
 
     #[test]
