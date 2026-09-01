@@ -38,8 +38,7 @@ def test_resolve_parses_successful_json_output(tmp_path):
         tmp_path / "llmman",
         """
 import sys, json
-assert sys.argv[1] == "resolve"
-assert sys.argv[2] == "ghcr.io/org/model:tag"
+assert sys.argv[1:] == ["resolve", "ghcr.io/org/model:tag"]
 print(json.dumps({"reference": sys.argv[2], "path": "/local/dir", "format": "safetensors"}))
 """,
     )
@@ -51,16 +50,16 @@ print(json.dumps({"reference": sys.argv[2], "path": "/local/dir", "format": "saf
     }
 
 
-def test_resolve_passes_store_and_cache_flags(tmp_path):
+def test_resolve_passes_cache_flag(tmp_path):
     fake = _write_fake_llmman(
         tmp_path / "llmman",
         """
 import sys, json
-assert "--store" in sys.argv and "--cache" in sys.argv
-print(json.dumps({"reference": sys.argv[-1], "path": "/x", "format": "gguf"}))
+assert sys.argv[1:] == ["resolve", "m", "--cache", "/cache"]
+print(json.dumps({"reference": "m", "path": "/x", "format": "gguf"}))
 """,
     )
-    result = resolve("m", store="/store", cache="/cache", binary=fake)
+    result = resolve("m", cache="/cache", binary=fake)
     assert result["format"] == "gguf"
 
 
