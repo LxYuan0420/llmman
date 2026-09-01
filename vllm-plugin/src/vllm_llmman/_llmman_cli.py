@@ -39,7 +39,6 @@ def llmman_binary() -> str:
 def resolve(
     reference: str,
     *,
-    store: str | None = None,
     cache: str | None = None,
     binary: str | None = None,
 ) -> dict:
@@ -55,8 +54,6 @@ def resolve(
     isn't the expected single line of JSON.
     """
     cmd = [binary or llmman_binary(), "resolve", reference]
-    if store:
-        cmd += ["--store", store]
     if cache:
         cmd += ["--cache", cache]
 
