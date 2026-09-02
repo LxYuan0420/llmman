@@ -40,7 +40,7 @@ const SERVE_ENV_HELP: &str = "\
 Environment Variables:
       LLMMAN_DEBUG                   Show additional debug information (e.g. LLMMAN_DEBUG=1)
       LLMMAN_HOST                    [host][:port] to bind (default \"127.0.0.1:17434\")
-      LLMMAN_CONTEXT_LENGTH          Context length to use unless otherwise specified (default: VRAM-tiered)
+      LLMMAN_CONTEXT_LENGTH          Positive context size for llama-server/vLLM when set (defaults are backend-specific)
       LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
       LLMMAN_MAX_LOADED_MODELS       Maximum number of loaded models (default: unbounded)
       LLMMAN_MAX_TRANSFER_STREAMS    Maximum parallel transfer streams for safetensors model pulls (default 4)
