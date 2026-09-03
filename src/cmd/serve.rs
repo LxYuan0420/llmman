@@ -8,9 +8,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context};
-use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
+// `HttpBody` is axum's re-export of the `http_body::Body` trait, in
+// scope only for `size_hint` in `track_metrics`.
+use axum::body::{Body, Bytes, HttpBody as _};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Path as UrlPath, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -23,6 +26,7 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 
 use crate::default_store;
+use crate::metrics::{self, UnloadReason};
 use crate::modelpack::{resolve_model, ModelPath};
 use crate::providers::PLACEHOLDER_API_KEY;
 use crate::storage::OciStore;
@@ -348,6 +352,27 @@ fn parse_max_queue(value: Option<&str>) -> usize {
     }
 }
 
+/// Whether to serve `GET /metrics` at all, from `LLMMAN_METRICS`. Off
+/// unless the operator asked for it: the router has no authentication,
+/// `LLMMAN_HOST` can bind it beyond loopback, and a scrape reports
+/// version, route mix, model names and model churn. None of that should
+/// start answering because llmman was upgraded.
+fn metrics_enabled_from_env() -> bool {
+    parse_metrics_enabled(std::env::var("LLMMAN_METRICS").ok().as_deref())
+}
+
+/// [`metrics_enabled_from_env`]'s parsing, split out so it's testable
+/// without mutating the real process environment. `1` is what the README
+/// documents; the rest of the truthy set is here because every other
+/// boolean env var in this file accepts it, and a `LLMMAN_METRICS=true`
+/// that silently did nothing would be worse than the extra branch.
+fn parse_metrics_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 /// Maximum number of models [`ensure_model`] keeps loaded at once, from
 /// `LLMMAN_MAX_LOADED_MODELS` (mirrors Ollama's `OLLAMA_MAX_LOADED_MODELS`,
 /// but as one flat daemon-wide total, not per-GPU — llmman has no
@@ -598,6 +623,20 @@ impl RunningModel {
         match &self.process {
             ModelProcess::Local(_, child, _) => child.id(),
             ModelProcess::Container(_, child) => child.id(),
+        }
+    }
+
+    /// The `engine` label on `llmman_model_up`. Deliberately not
+    /// [`RunningModel::processor`]: that is prose for `/api/ps`, and its
+    /// container form carries the runtime binary, which would put
+    /// `docker` and `podman` in a label for the same engine. A container
+    /// runs llama-server (see `container::spawn`), so it reports as one.
+    fn engine_label(&self) -> &'static str {
+        match &self.process {
+            ModelProcess::Local(Engine::LlamaServer, _, _) => "llama-server",
+            ModelProcess::Local(Engine::Vllm, _, _) => "vllm",
+            ModelProcess::Local(Engine::Mlx, _, _) => "mlx",
+            ModelProcess::Container(_, _) => "llama-server",
         }
     }
 }
@@ -1731,8 +1770,22 @@ async fn reap_idle_models_once(state: &AppState) {
         })
         .collect();
     for name in expired {
-        eprintln!("[llmman] unloading {name}: idle past its keep_alive deadline");
-        mgr.running.remove(&name);
+        // Report what actually happened, not what woke the reaper.
+        // `check_running` only notices a dead backend when a request
+        // arrives for that model; one that died and was then never asked
+        // for again reaches its keep_alive deadline looking exactly like a
+        // healthy idle model. Calling that idle would leave `Crashed` at
+        // zero on the daemon whose backends are dying, and would put this
+        // log line and its metric at odds about the same unload.
+        if let Some(mut running) = mgr.running.remove(&name) {
+            if running.process.is_alive() {
+                eprintln!("[llmman] unloading {name}: idle past its keep_alive deadline");
+                metrics::record_model_unload(&name, UnloadReason::Idle);
+            } else {
+                eprintln!("[llmman] unloading {name}: its backend had already exited");
+                metrics::record_model_unload(&name, UnloadReason::Crashed);
+            }
+        }
     }
 }
 
@@ -2380,6 +2433,7 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
         .remove(&canonical)
         .is_some()
     {
+        metrics::record_model_unload(&canonical, UnloadReason::Requested);
         return Ok(());
     }
     // Nothing was loaded under that key. A provider-routed model never is,
@@ -2447,6 +2501,7 @@ async fn check_running(state: &AppState, model_ref: &str) -> Option<(u16, Activi
             m.port
         );
         mgr.running.remove(model_ref);
+        metrics::record_model_unload(model_ref, UnloadReason::Crashed);
     }
     None
 }
@@ -2513,6 +2568,7 @@ async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
     let mut evicted: Vec<(String, RunningModel)> = Vec::with_capacity(other_keys.len());
     for key in other_keys {
         if let Some(running) = mgr.running.remove(&key) {
+            metrics::record_model_unload(&key, UnloadReason::Oom);
             evicted.push((key, running));
         }
     }
@@ -2528,9 +2584,28 @@ async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
 /// Releases a `pending_loads` reservation on drop — see
 /// [`enforce_max_loaded_models`]. Mirrors [`ActivityGuard`]'s
 /// Drop-can't-be-async workaround.
+///
+/// Prefer [`PendingLoadGuard::release_into`] on the path that succeeds.
+/// Drop can only spawn the decrement, so between a load's
+/// `running.insert` and that task running, the model is in `running`
+/// *and* still reserved — a window `llmman_models_loading` would report
+/// as a load still in progress. Releasing under the same lock as the
+/// insert closes it; Drop stays as the release for every path that never
+/// inserts.
 struct PendingLoadGuard {
     state: AppState,
     armed: bool,
+}
+
+impl PendingLoadGuard {
+    /// Releases the reservation immediately, under a lock the caller
+    /// already holds, and disarms so `Drop` doesn't release it twice.
+    fn release_into(&mut self, mgr: &mut ModelManager) {
+        if !std::mem::take(&mut self.armed) {
+            return;
+        }
+        mgr.pending_loads = mgr.pending_loads.saturating_sub(1);
+    }
 }
 
 impl std::fmt::Debug for PendingLoadGuard {
@@ -2575,9 +2650,14 @@ async fn enforce_max_loaded_models(
     max_loaded: usize,
 ) -> Result<PendingLoadGuard, AppError> {
     if max_loaded == 0 {
+        // Nothing to enforce, but the reservation is still taken: it is
+        // what `llmman_models_loading` counts, and unbounded is the
+        // default, so an unarmed guard here would leave that gauge
+        // reading zero on almost every daemon.
+        state.0.manager.lock().await.pending_loads += 1;
         return Ok(PendingLoadGuard {
             state: state.clone(),
-            armed: false,
+            armed: true,
         });
     }
     loop {
@@ -2621,6 +2701,7 @@ async fn enforce_max_loaded_models(
             .running
             .remove(&victim)
             .expect("victim key was just looked up under this same lock");
+        metrics::record_model_unload(&victim, UnloadReason::Evicted);
         drop(mgr); // release the lock before the (possibly slow) stop below
         eprintln!(
             "[llmman] evicting {victim} to free a loaded-model slot (LLMMAN_MAX_LOADED_MODELS={max_loaded})"
@@ -2688,7 +2769,14 @@ fn try_admit_against(
 }
 
 fn try_admit(max_queue: usize) -> Result<QueueGuard, AppError> {
-    try_admit_against(&PENDING_REQUESTS, max_queue)
+    // Counted here rather than in `try_admit_against`, which the tests
+    // drive against a counter of their own — a rejection there is a test
+    // fixture, not a saturated daemon.
+    let admitted = try_admit_against(&PENDING_REQUESTS, max_queue);
+    if admitted.is_err() {
+        metrics::record_scheduling_rejection();
+    }
+    admitted
 }
 
 /// If `model_ref` would be served by `Engine::Mlx` were it loaded right
@@ -3071,6 +3159,14 @@ async fn ensure_model(
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
+    // The cold-start clock. It starts here rather than at the spawn
+    // because everything from here on is time the caller waits for a
+    // model it hasn't got: admission, the load lock, the pull, an
+    // eviction, the spawn and `wait_for_ready`. Only the path that
+    // reaches the `running.insert` below records, so this pairs exactly
+    // with `llmman_model_loads_total`.
+    let load_started = Instant::now();
+
     // See try_admit's doc comment — held for the rest of this function.
     let _queue_guard = try_admit(state.0.max_queue)?;
 
@@ -3132,7 +3228,8 @@ async fn ensure_model(
     let context_shift = supports_context_shift(model_ref);
     // See enforce_max_loaded_models's doc comment — held for the rest
     // of this function.
-    let _pending_load_guard = enforce_max_loaded_models(state, state.0.max_loaded_models).await?;
+    let mut pending_load_guard =
+        enforce_max_loaded_models(state, state.0.max_loaded_models).await?;
     // OOM retry loop — on a local llama-server load that fails with a
     // memory-allocation-looking error, tries progressively more invasive
     // fallbacks before giving up (see each branch's own comment for which
@@ -3232,6 +3329,7 @@ async fn ensure_model(
                 if !evicted_others {
                     evicted_others = true;
                     if evict_other_models(state, model_ref).await {
+                        metrics::record_oom_retry(model_ref, metrics::OomRetry::EvictOthers);
                         eprintln!(
                             "[llmman] {model_ref} failed to load on port {port}, which looks like an out-of-memory error — evicted other loaded models and retrying: {:#}",
                             e
@@ -3249,6 +3347,7 @@ async fn ensure_model(
                 if !split_mode_relaxed && split_mode == Some("none") {
                     split_mode_relaxed = true;
                     split_mode = Some("layer");
+                    metrics::record_oom_retry(model_ref, metrics::OomRetry::SplitMode);
                     eprintln!(
                         "[llmman] {model_ref} failed to load on port {port} with --split-mode none, which looks like an out-of-memory error — retrying with --split-mode layer (spread across every GPU) instead of failing outright: {:#}",
                         e
@@ -3279,6 +3378,7 @@ async fn ensure_model(
                 );
                 ctx_size = Some(next);
                 shrink_attempts += 1;
+                metrics::record_oom_retry(model_ref, metrics::OomRetry::CtxShrink);
                 port = find_free_port()?;
             }
         }
@@ -3295,7 +3395,8 @@ async fn ensure_model(
         _ => None,
     };
 
-    state.0.manager.lock().await.running.insert(
+    let mut mgr = state.0.manager.lock().await;
+    mgr.running.insert(
         model_ref.to_string(),
         RunningModel {
             process,
@@ -3311,6 +3412,11 @@ async fn ensure_model(
             in_flight: 1,
         },
     );
+    // Same locked step as the insert, so this load is never both in
+    // `running` and still reserved — see `PendingLoadGuard::release_into`.
+    pending_load_guard.release_into(&mut mgr);
+    drop(mgr);
+    metrics::record_model_load(model_ref, load_started.elapsed());
     Ok((
         model_ref.to_string(),
         Target::Local(port),
@@ -5846,11 +5952,236 @@ fn resolve_llama_server(pinned_version: Option<&str>) -> anyhow::Result<PathBuf>
 }
 
 // ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+/// Records every response this router produces into [`crate::metrics`].
+///
+/// The route label is axum's `MatchedPath` — the route template
+/// (`/llmman/providers/:id`), never the path the client asked for. That
+/// is what bounds the label set to the router below instead of to
+/// traffic. An unmatched request carries no `MatchedPath` and is not
+/// counted: there is no route to attribute it to, and labelling by the
+/// requested path is how a metrics endpoint acquires unbounded
+/// cardinality. A flood of 404s to unknown paths is therefore invisible
+/// here.
+///
+/// Two clocks, because on the streaming routes (`/api/chat`,
+/// `/v1/chat/completions`, ...) they measure different things and only
+/// one of them is latency. `llmman_http_request_ttfb_seconds` stops when
+/// the response *headers* are ready — that is what moves when a load
+/// stalls or the queue backs up. `llmman_http_request_duration_seconds`
+/// stops when the body ends, which mostly tracks how many tokens were
+/// asked for; graphing that as latency would make every long completion
+/// look like a regression, and graphing only TTFB would hide a stream
+/// that stalls after its first byte.
+///
+/// The body outlives this function, so the second clock is stopped by a
+/// guard moved into the stream — the same idiom `proxy` already uses to
+/// hold an `ActivityGuard` until a completion finishes. A client that
+/// disconnects early drops the stream, so that records too: the request
+/// did end. Only a body of unknown length is wrapped that way; see the
+/// comment on the size-hint branch for what wrapping the rest would cost.
+///
+/// The scrape route is instrumented like any other, so
+/// `route="/metrics"` reports what a scrape costs. Exclude that
+/// label when the question is application latency.
+async fn track_metrics(req: Request, next: Next) -> Response {
+    // Cloned, not copied into a `String`: `MatchedPath` is a handle around
+    // an `Arc<str>`, and `record_request` only takes ownership of a route
+    // the first time it sees one. The clone is needed at all because
+    // `next.run` consumes the request.
+    let route = req.extensions().get::<MatchedPath>().cloned();
+    let started = Instant::now();
+    let response = next.run(req).await;
+    let Some(route) = route else {
+        return response;
+    };
+    metrics::record_request(
+        route.as_str(),
+        response.status().as_u16(),
+        started.elapsed(),
+    );
+
+    let (parts, body) = response.into_parts();
+    if body.size_hint().exact().is_some() {
+        // A body already in memory when the headers go out has no
+        // generation left to time, so the second clock would read the
+        // same as the first — and wrapping it would cost the response
+        // its `Content-Length`, which hyper derives from the size hint a
+        // wrapped stream no longer has. Every JSON reply on the daemon
+        // would become chunked to measure nothing. The bodies with no
+        // exact size are the streaming ones, already chunked either way.
+        metrics::record_response_body(route.as_str(), started.elapsed());
+        return Response::from_parts(parts, body);
+    }
+
+    let timer = ResponseBodyTimer {
+        route: route.as_str().to_string(),
+        started,
+    };
+    let body = Body::from_stream(body.into_data_stream().map(move |chunk| {
+        // Borrowed, not used: this is what moves `timer` into the stream
+        // so it drops with the body rather than at the end of this
+        // function. Same trick as `proxy`'s `ActivityGuard`.
+        let _timer = &timer;
+        chunk
+    }));
+    Response::from_parts(parts, body)
+}
+
+/// Stops [`track_metrics`]'s second clock when a response body ends —
+/// see that function's own doc comment. Drop rather than the end of the
+/// stream, so a client that disconnects mid-completion is recorded too.
+struct ResponseBodyTimer {
+    route: String,
+    started: Instant,
+}
+
+impl Drop for ResponseBodyTimer {
+    fn drop(&mut self) {
+        metrics::record_response_body(&self.route, self.started.elapsed());
+    }
+}
+
+/// Prometheus scrape target. See `crate::metrics`'s module doc comment
+/// for what this exposes, and for why per-token counters are llama-server's
+/// own `/metrics` to serve rather than llmman's.
+async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let (models_loaded, models_loading, models) = {
+        let mut mgr = state.0.manager.lock().await;
+        let models = mgr
+            .running
+            .iter_mut()
+            .map(|(model, m)| metrics::ModelState {
+                model: model.clone(),
+                engine: m.engine_label(),
+                // The one thing no other metric here can show: llmman
+                // only notices a dead backend when a request arrives for
+                // that model, so `models_loaded` counts it until then.
+                up: m.process.is_alive(),
+            })
+            .collect();
+        (mgr.running.len() as u64, mgr.pending_loads as u64, models)
+    };
+    let snapshot = metrics::Snapshot {
+        version: env!("LLMMAN_VERSION").to_string(),
+        start_time_seconds: metrics::process_start_seconds(),
+        scheduling_requests_in_flight: PENDING_REQUESTS.load(std::sync::atomic::Ordering::SeqCst)
+            as u64,
+        // `.max(1)` rather than the raw setting: see the field's own doc.
+        scheduling_capacity: state.0.max_queue.max(1) as u64,
+        models_loaded,
+        models_loading,
+        models,
+    };
+    (
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        metrics::render(&snapshot),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     tokio::runtime::Runtime::new()?.block_on(serve_async(args))
+}
+
+/// The daemon's routes and the layers over them, split out of
+/// [`serve_async`] so `the_scrape_endpoint_is_outside_the_cors_layer` can
+/// assert against the real router instead of a copy of this layering.
+fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
+    let app = Router::new()
+        // Web UI
+        .route("/", get(handle_root))
+        .route("/bundle.js", get(handle_bundle_js))
+        .route("/bundle.css", get(handle_bundle_css))
+        .route("/loading.html", get(handle_loading_html))
+        // llama.cpp-compatible props endpoint (router mode)
+        .route("/props", get(handle_props))
+        // llmman's own API — see handle_llmman_providers
+        .route("/llmman/providers", get(handle_llmman_providers))
+        .route("/llmman/providers/:id", get(handle_llmman_provider))
+        // Ollama API
+        .route("/api/version", get(handle_version))
+        .route("/api/tags", get(handle_tags))
+        .route("/api/ps", get(handle_ps))
+        .route("/api/show", post(handle_show))
+        .route("/api/pull", post(handle_pull))
+        .route("/api/push", post(handle_push))
+        .route("/api/delete", delete(handle_delete))
+        .route("/api/chat", post(handle_ollama_chat))
+        .route("/api/generate", post(handle_ollama_generate))
+        // OpenAI API
+        .route("/v1/models", get(handle_openai_models))
+        .route("/v1/chat/completions", post(handle_openai_chat))
+        .route("/v1/completions", post(handle_openai_completions))
+        .route("/v1/embeddings", post(handle_openai_embeddings))
+        .route(
+            "/v1/audio/transcriptions",
+            post(handle_openai_transcriptions)
+                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/audio/transcriptions",
+            post(handle_openai_transcriptions)
+                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
+        )
+        .route("/v1/responses", post(handle_openai_responses))
+        .route(
+            "/v1/responses/input_tokens",
+            post(handle_openai_responses_input_tokens),
+        )
+        // Anthropic API
+        .route("/v1/messages", post(handle_anthropic_messages));
+
+    // Applied only when the operator asked for metrics. Nothing can read
+    // the store while the endpoint is absent — enabling it needs a
+    // restart — so instrumenting a disabled daemon would buy a registry
+    // lock and a map write on every request, and a `model` label set that
+    // grows for the life of the process, in exchange for numbers no one
+    // can scrape. Off means off, not hidden.
+    //
+    // Innermost of the two, so what it times is the handler rather than
+    // the CORS layer's own header work. CORS therefore answers a
+    // preflight OPTIONS before this layer runs, so preflights are not
+    // counted — they are the browser's negotiation, not a request the
+    // daemon did any work for.
+    let app = if metrics_enabled {
+        app.layer(middleware::from_fn(track_metrics))
+    } else {
+        app
+    };
+
+    app.layer(cors_layer())
+        .merge(metrics_router(metrics_enabled))
+        .with_state(app_state)
+}
+
+/// `GET /metrics`, or nothing at all when `LLMMAN_METRICS` is unset —
+/// see [`metrics_enabled_from_env`]. Absent means a 404, the same answer
+/// as any other path this daemon does not serve, so a disabled endpoint
+/// is not distinguishable from a build without one.
+///
+/// Merged into [`build_router`] after `.layer(cors_layer())` rather than
+/// routed above it, so the scrape endpoint answers without an
+/// Access-Control-Allow-Origin header. `default_allowed_origins` is
+/// appended unconditionally, so any page on any localhost port is an
+/// allowed origin — one could otherwise read version, route mix, model
+/// names and model churn out of every daemon it can reach. Nothing in a
+/// browser scrapes a metrics endpoint, so it gives up nothing to leave
+/// the layer out. Taking the parameter rather than reading the
+/// environment here is what lets both answers be tested against a real
+/// router.
+fn metrics_router(enabled: bool) -> Router<AppState> {
+    if !enabled {
+        return Router::new();
+    }
+    Router::new()
+        .route("/metrics", get(handle_metrics))
+        .layer(middleware::from_fn(track_metrics))
 }
 
 async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
@@ -5984,52 +6315,11 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         client: Client::new(),
     }));
 
-    let app_state = state.clone();
-    let app = Router::new()
-        // Web UI
-        .route("/", get(handle_root))
-        .route("/bundle.js", get(handle_bundle_js))
-        .route("/bundle.css", get(handle_bundle_css))
-        .route("/loading.html", get(handle_loading_html))
-        // llama.cpp-compatible props endpoint (router mode)
-        .route("/props", get(handle_props))
-        // llmman's own API — see handle_llmman_providers
-        .route("/llmman/providers", get(handle_llmman_providers))
-        .route("/llmman/providers/:id", get(handle_llmman_provider))
-        // Ollama API
-        .route("/api/version", get(handle_version))
-        .route("/api/tags", get(handle_tags))
-        .route("/api/ps", get(handle_ps))
-        .route("/api/show", post(handle_show))
-        .route("/api/pull", post(handle_pull))
-        .route("/api/push", post(handle_push))
-        .route("/api/delete", delete(handle_delete))
-        .route("/api/chat", post(handle_ollama_chat))
-        .route("/api/generate", post(handle_ollama_generate))
-        // OpenAI API
-        .route("/v1/models", get(handle_openai_models))
-        .route("/v1/chat/completions", post(handle_openai_chat))
-        .route("/v1/completions", post(handle_openai_completions))
-        .route("/v1/embeddings", post(handle_openai_embeddings))
-        .route(
-            "/v1/audio/transcriptions",
-            post(handle_openai_transcriptions)
-                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
-        )
-        .route(
-            "/audio/transcriptions",
-            post(handle_openai_transcriptions)
-                .layer(DefaultBodyLimit::max(TRANSCRIPTION_BODY_LIMIT_BYTES)),
-        )
-        .route("/v1/responses", post(handle_openai_responses))
-        .route(
-            "/v1/responses/input_tokens",
-            post(handle_openai_responses_input_tokens),
-        )
-        // Anthropic API
-        .route("/v1/messages", post(handle_anthropic_messages))
-        .layer(cors_layer())
-        .with_state(app_state);
+    let app = build_router(state.clone(), metrics_enabled_from_env());
+
+    // Before the listener binds, so uptime counts from the daemon coming
+    // up rather than from whenever something first scraped it.
+    metrics::mark_process_start();
 
     let addr = crate::daemon::bind_addr();
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -7096,9 +7386,9 @@ mod tests {
     }
 
     /// Like `running_model_fixture`, but with a caller-chosen `Engine`
-    /// and `backend_model_path` — used only by `backend_wire_model`'s
-    /// own tests below, which need to distinguish an `Engine::Mlx`
-    /// backend from every other one.
+    /// and `backend_model_path` — used by `backend_wire_model`'s own
+    /// tests below, which need to distinguish an `Engine::Mlx` backend
+    /// from every other one, and by the `engine_label` test.
     fn running_model_fixture_with_engine(
         engine: Engine,
         backend_model_path: Option<&str>,
@@ -7114,6 +7404,22 @@ mod tests {
             backend_model_path: backend_model_path.map(|s| s.to_string()),
             keep_alive: None,
             in_flight: 0,
+        }
+    }
+
+    /// The container arm reports the engine it runs, not the runtime that
+    /// runs it. `tokio::test` because the fixture spawns a real child.
+    #[tokio::test]
+    async fn the_engine_label_names_the_engine_not_the_runtime() {
+        for (engine, expected) in [
+            (Engine::LlamaServer, "llama-server"),
+            (Engine::Vllm, "vllm"),
+            (Engine::Mlx, "mlx"),
+        ] {
+            assert_eq!(
+                running_model_fixture_with_engine(engine, None).engine_label(),
+                expected
+            );
         }
     }
 
@@ -7233,6 +7539,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn reap_idle_models_unloads_only_idle_expired_models_not_in_flight_or_forever() {
+        // Holds the counter lock: this unloads through the production
+        // path, so its increment must not land inside another test's
+        // before/after window (see `metrics::GLOBAL_COUNTER_TEST_LOCK`).
+        let _serialised = metrics::GLOBAL_COUNTER_TEST_LOCK.lock().await;
         let state = test_state();
         {
             let mut mgr = state.0.manager.lock().await;
@@ -7277,6 +7587,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn evict_other_models_evicts_everything_except_the_target_and_in_flight_models() {
+        // Holds the counter lock: this unloads through the production
+        // path, so its increment must not land inside another test's
+        // before/after window (see `metrics::GLOBAL_COUNTER_TEST_LOCK`).
+        let _serialised = metrics::GLOBAL_COUNTER_TEST_LOCK.lock().await;
         let state = test_state();
         {
             let mut mgr = state.0.manager.lock().await;
@@ -7505,8 +7819,10 @@ mod tests {
         assert!(origins.iter().any(|o| o == "http://localhost:*"));
     }
 
+    /// Unbounded is the default, so skipping the reservation here would
+    /// leave `llmman_models_loading` reading zero on almost every daemon.
     #[tokio::test(flavor = "multi_thread")]
-    async fn enforce_max_loaded_models_is_a_no_op_when_unbounded() {
+    async fn enforce_max_loaded_models_evicts_nothing_but_still_reserves_when_unbounded() {
         let state = test_state();
         {
             let mut mgr = state.0.manager.lock().await;
@@ -7515,8 +7831,54 @@ mod tests {
                 running_model_fixture(None, Duration::from_secs(0), 0),
             );
         }
-        assert!(enforce_max_loaded_models(&state, 0).await.is_ok());
-        assert_eq!(state.0.manager.lock().await.running.len(), 1);
+        let mut guard = enforce_max_loaded_models(&state, 0)
+            .await
+            .expect("unbounded admits every load");
+        {
+            let mut mgr = state.0.manager.lock().await;
+            assert_eq!(mgr.running.len(), 1, "nothing was evicted");
+            assert_eq!(mgr.pending_loads, 1, "the load is still counted as loading");
+            guard.release_into(&mut mgr);
+            assert_eq!(mgr.pending_loads, 0);
+        }
+    }
+
+    /// `Drop` can only *spawn* the decrement, so a load released that way
+    /// is briefly in `running` and still reserved. `release_into` puts the
+    /// release in the same locked step as the insert.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn releasing_a_reservation_into_the_lock_leaves_no_double_counted_window() {
+        let state = test_state();
+        let mut guard = enforce_max_loaded_models(&state, 0).await.unwrap();
+
+        let mut mgr = state.0.manager.lock().await;
+        mgr.running.insert(
+            "just-loaded".into(),
+            running_model_fixture(None, Duration::from_secs(0), 1),
+        );
+        guard.release_into(&mut mgr);
+        assert_eq!(mgr.running.len(), 1);
+        assert_eq!(mgr.pending_loads, 0);
+        drop(mgr);
+
+        // And Drop must not release it a second time.
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(state.0.manager.lock().await.pending_loads, 0);
+    }
+
+    #[test]
+    fn parse_metrics_enabled_accepts_the_truthy_spellings_and_nothing_else() {
+        for on in ["1", "true", "TRUE", "yes", "on", " 1 "] {
+            assert!(parse_metrics_enabled(Some(on)), "{on:?} should enable");
+        }
+        for off in ["0", "false", "no", "off", "", "  ", "2", "enabled"] {
+            assert!(!parse_metrics_enabled(Some(off)), "{off:?} should not");
+        }
+        assert!(
+            !parse_metrics_enabled(None),
+            "unset is the default, and the default is off"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -9753,5 +10115,318 @@ mod tests {
             .collect();
         assert_eq!(joined, "Hello, world");
         assert_eq!(chunks.last().unwrap()["done"], true);
+    }
+
+    /// The process-wide registry against placeholder gauges.
+    fn rendered_registry() -> String {
+        metrics::render(&metrics::Snapshot {
+            version: "test".into(),
+            start_time_seconds: 0,
+            scheduling_requests_in_flight: 0,
+            scheduling_capacity: 1,
+            models_loaded: 0,
+            models_loading: 0,
+            models: Vec::new(),
+        })
+    }
+
+    /// One model's unload counter from the process-wide registry; `0`
+    /// while the series does not exist yet.
+    fn unload_count(model: &str, reason: &str) -> u64 {
+        let rendered = rendered_registry();
+        let needle =
+            format!("llmman_model_unloads_total{{model=\"{model}\",reason=\"{reason}\"}} ");
+        rendered
+            .lines()
+            .find_map(|l| l.strip_prefix(needle.as_str()))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// `oom` cannot be provoked against a real daemon without genuine
+    /// memory exhaustion, so the eviction path is driven directly.
+    #[tokio::test]
+    async fn evicting_for_an_oom_retry_counts_every_model_it_freed() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "loading-now".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+            mgr.running.insert(
+                "evictable-a".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+            mgr.running.insert(
+                "evictable-b".into(),
+                running_model_fixture(None, Duration::from_secs(0), 0),
+            );
+            // In flight, so it must be left alone and not counted.
+            mgr.running.insert(
+                "busy".into(),
+                running_model_fixture(None, Duration::from_secs(0), 1),
+            );
+        }
+
+        let evicted = evict_other_models(&state, "loading-now").await;
+
+        assert!(evicted, "two idle models were evictable");
+        // Model names unique to this test, so these are absolute counts.
+        assert_eq!(unload_count("evictable-a", "oom"), 1);
+        assert_eq!(unload_count("evictable-b", "oom"), 1);
+        assert_eq!(
+            unload_count("busy", "oom"),
+            0,
+            "the in-flight model was left alone, so it must not be counted"
+        );
+
+        let mgr = state.0.manager.lock().await;
+        assert!(mgr.running.contains_key("loading-now"));
+        assert!(mgr.running.contains_key("busy"));
+        assert!(!mgr.running.contains_key("evictable-a"));
+        assert!(!mgr.running.contains_key("evictable-b"));
+    }
+
+    /// `check_running` only inspects a process when a request arrives for
+    /// it, so a backend that died and was never asked for again reaches
+    /// its keep_alive deadline looking exactly like a healthy idle model.
+    #[tokio::test]
+    async fn the_reaper_labels_an_already_dead_backend_crashed_not_idle() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            let mut dead =
+                running_model_fixture(Some(Duration::from_secs(1)), Duration::from_secs(10), 0);
+            match &mut dead.process {
+                ModelProcess::Local(_, child, _) | ModelProcess::Container(_, child) => {
+                    child.kill().await.expect("kill the placeholder process")
+                }
+            }
+            mgr.running.insert("died-then-expired".into(), dead);
+        }
+
+        reap_idle_models_once(&state).await;
+
+        assert_eq!(
+            unload_count("died-then-expired", "crashed"),
+            1,
+            "a backend already dead when the reaper reached it must count as crashed"
+        );
+        assert_eq!(
+            unload_count("died-then-expired", "idle"),
+            0,
+            "and must not also be counted idle"
+        );
+        assert!(
+            !state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("died-then-expired"),
+            "it must still be unloaded"
+        );
+    }
+
+    /// A label taken from the raw URI grows a series per distinct path,
+    /// without bound. Against a real router, because what makes this true
+    /// is axum inserting `MatchedPath` before the layer runs.
+    #[tokio::test]
+    async fn the_metrics_route_label_is_the_template_not_the_request_path() {
+        let app = Router::new()
+            .route(
+                "/test-matched-path/:id",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(middleware::from_fn(track_metrics));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        Client::new()
+            .get(format!(
+                "http://127.0.0.1:{}/test-matched-path/abc123",
+                addr.port()
+            ))
+            .send()
+            .await
+            .expect("request reaches the test router");
+
+        // Route template unique to this test, so this is an absolute count.
+        let rendered = rendered_registry();
+        assert!(
+            rendered.contains(
+                "llmman_http_requests_total{route=\"/test-matched-path/:id\",status=\"204\"} 1\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("abc123"), "{rendered}");
+    }
+
+    /// Any localhost page is an allowed origin, so one that can reach the
+    /// daemon could otherwise read a scrape out of a browser. What makes
+    /// this true is `/metrics` being merged *after* `.layer(cors_layer())`
+    /// in [`build_router`]; an edit moving it up compiles.
+    #[tokio::test]
+    async fn the_scrape_endpoint_is_outside_the_cors_layer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(test_state(), true);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let get = |path: &'static str| {
+            let url = format!("http://127.0.0.1:{}{path}", addr.port());
+            async move {
+                Client::new()
+                    .get(url)
+                    .header("origin", "http://localhost:3000")
+                    .send()
+                    .await
+                    .expect("request reaches the test router")
+            }
+        };
+
+        // The control: the same origin on an ordinary route *is* allowed.
+        let version = get("/api/version").await;
+        assert_eq!(
+            version
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:3000"),
+            "a page served from localhost is meant to be an allowed origin"
+        );
+
+        let scrape = get("/metrics").await;
+        assert_eq!(scrape.status(), StatusCode::OK, "the scrape route answers");
+        assert!(
+            !scrape.headers().contains_key("access-control-allow-origin"),
+            "a browser page can read the scrape endpoint"
+        );
+    }
+
+    /// A 404 rather than a 403, so a disabled endpoint is indistinguishable
+    /// from a build that never had one; and nothing is recorded either.
+    #[tokio::test]
+    async fn the_scrape_endpoint_is_absent_unless_the_operator_enabled_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(test_state(), false);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        let scrape = Client::new()
+            .get(format!("{url}/metrics"))
+            .send()
+            .await
+            .expect("request reaches the test router");
+        assert_eq!(scrape.status(), StatusCode::NOT_FOUND);
+
+        // The control: the rest of the daemon is unaffected.
+        let version = Client::new()
+            .get(format!("{url}/api/version"))
+            .send()
+            .await
+            .expect("request reaches the test router");
+        assert_eq!(version.status(), StatusCode::OK);
+
+        // Off means off — see `build_router`. `/loading.html` because the
+        // registry is process-wide and this asserts an absence: no other
+        // test requests it, so the series exists only if this disabled
+        // router wrote it, whatever status the handler returned.
+        Client::new()
+            .get(format!("{url}/loading.html"))
+            .send()
+            .await
+            .expect("request reaches the test router");
+        assert!(
+            !rendered_registry().contains("route=\"/loading.html\""),
+            "a router built with metrics disabled must not write to the registry"
+        );
+    }
+
+    /// Hyper derives `Content-Length` from the body's size hint, and a
+    /// wrapped stream has none: wrapping every body made every JSON reply
+    /// chunked. Nothing but a live response proves the header survived.
+    #[tokio::test]
+    async fn timing_a_response_does_not_cost_it_its_content_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(test_state(), true);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        for route in ["/api/version", "/metrics"] {
+            let response = Client::new()
+                .get(format!("{url}{route}"))
+                .send()
+                .await
+                .expect("request reaches the test router");
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            assert!(
+                response.headers().contains_key("content-length"),
+                "{route} lost its content-length: {:?}",
+                response.headers()
+            );
+            assert!(
+                !response.headers().contains_key("transfer-encoding"),
+                "{route} was made chunked: {:?}",
+                response.headers()
+            );
+        }
+    }
+
+    /// A wrapper that recorded at header time would make this equal to
+    /// TTFB, which is the conflation the split exists to end.
+    #[tokio::test]
+    async fn the_total_duration_clock_stops_at_the_end_of_the_body_not_the_headers() {
+        let app = Router::new()
+            .route(
+                "/test-slow-body",
+                get(|| async {
+                    // Headers immediately, body 200ms later.
+                    Body::from_stream(futures::stream::once(async {
+                        sleep(Duration::from_millis(200)).await;
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"done"))
+                    }))
+                }),
+            )
+            .layer(middleware::from_fn(track_metrics));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let body = Client::new()
+            .get(format!("http://127.0.0.1:{}/test-slow-body", addr.port()))
+            .send()
+            .await
+            .expect("request reaches the test router")
+            .text()
+            .await
+            .expect("the body arrives in full");
+        assert_eq!(body, "done");
+
+        let rendered = rendered_registry();
+        // TTFB landed in the fastest bucket; total duration did not.
+        assert!(
+            rendered.contains(
+                "llmman_http_request_ttfb_seconds_bucket{route=\"/test-slow-body\",le=\"0.05\"} 1\n"
+            ),
+            "headers were ready immediately:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "llmman_http_request_duration_seconds_bucket{route=\"/test-slow-body\",le=\"0.05\"} 0\n"
+            ),
+            "the body took 200ms, so total duration cannot be under 50ms:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "llmman_http_request_duration_seconds_count{route=\"/test-slow-body\"} 1\n"
+            ),
+            "the body ended, so it was recorded exactly once:\n{rendered}"
+        );
     }
 }
