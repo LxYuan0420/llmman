@@ -1895,7 +1895,10 @@ async fn spawn_llama_server(
     Ok((child, tail))
 }
 
-/// vLLM should only override its model-derived default for explicit user input.
+/// vLLM should only override its model-derived default for explicit
+/// positive user input. This deliberately skips backend_ctx_size's
+/// num_parallel scaling because vLLM's limit is per request, not split
+/// across llama-server-style request slots.
 fn vllm_max_model_len(ctx_size: Option<u32>, ctx_size_explicit: bool) -> Option<u32> {
     ctx_size.filter(|n| ctx_size_explicit && *n > 0)
 }
