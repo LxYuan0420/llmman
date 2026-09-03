@@ -4551,8 +4551,10 @@ async fn handle_push(
         .and_then(|s| s.find(&model))
         .is_err()
     {
-        let body = serde_json::json!({"error": format!("model not found: {model}")});
-        return Ok((StatusCode::NOT_FOUND, Json(body)).into_response());
+        return Err(AppError::status(
+            StatusCode::NOT_FOUND,
+            format!("model not found: {model}"),
+        ));
     }
 
     // See MODEL_LOCKS' doc comment: a push shares the same Go-side
@@ -8977,6 +8979,20 @@ mod tests {
         };
         let resp = handle_push(State(state), Json(req)).await.into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// /api/push has no "fetch it first" fallback: a valid ref that isn't
+    /// already in the local store returns a 404 through AppError, not a
+    /// hand-built body.
+    #[tokio::test]
+    async fn handle_push_returns_404_for_a_model_not_in_the_store() {
+        let state = test_state();
+        let req = OllamaPushRequest {
+            model: "hf.co/does-not-exist/nowhere".to_string(),
+            name: String::new(),
+        };
+        let resp = handle_push(State(state), Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// /api/delete resolves (and so validates) the client ref before it ever
