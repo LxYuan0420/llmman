@@ -40,7 +40,7 @@ const SERVE_ENV_HELP: &str = "\
 Environment Variables:
       LLMMAN_DEBUG                   Show additional debug information (e.g. LLMMAN_DEBUG=1)
       LLMMAN_HOST                    [host][:port] to bind (default \"127.0.0.1:17434\")
-      LLMMAN_CONTEXT_LENGTH          Context length to use unless otherwise specified (default: VRAM-tiered)
+      LLMMAN_CONTEXT_LENGTH          Context size for llama-server/vLLM when set (defaults are backend-specific)
       LLMMAN_KEEP_ALIVE              The duration that models stay loaded in memory (default \"5m\")
       LLMMAN_MAX_LOADED_MODELS       Maximum number of loaded models (default: unbounded)
       LLMMAN_MAX_TRANSFER_STREAMS    Maximum parallel transfer streams for safetensors model pulls (default 4)
@@ -127,16 +127,18 @@ pub struct ServeArgs {
     pub pull_bin: bool,
 }
 
-/// Context tokens requested for every `llama-server` this daemon spawns —
-/// read from `LLMMAN_CONTEXT_LENGTH` (an env var, not a `llmman serve`
-/// flag). A ceiling, not a guarantee: llama-server caps it back down to
-/// a model's own trained context (`n_ctx_train`) when that's smaller,
-/// with a warning, since serving positions past a model's trained
-/// length risks incoherent/NaN output.
+/// Context tokens requested for every backend this daemon spawns — read
+/// from `LLMMAN_CONTEXT_LENGTH` (an env var, not a `llmman serve` flag).
+/// For llama-server, this is a ceiling, not a guarantee: llama-server
+/// caps it back down to a model's own trained context (`n_ctx_train`)
+/// when that's smaller, with a warning, since serving positions past a
+/// model's trained length risks incoherent/NaN output.
 ///
 /// Unset or unparseable, this falls back to
 /// [`crate::hostgpu::default_ctx_size`]: a VRAM-tiered value (see that
-/// function's doc comment).
+/// function's doc comment). A value of 0 is preserved for llama-server,
+/// where it means "use the model's trained context", but is not
+/// forwarded to vLLM.
 fn context_length_from_env() -> Option<u32> {
     parse_context_length(std::env::var("LLMMAN_CONTEXT_LENGTH").ok().as_deref())
 }
@@ -479,9 +481,8 @@ struct Inner {
     exe: Option<PathBuf>,
     ociman: Option<crate::container::ContainerManager>,
     llama_cpp_version: Option<String>,
-    // See context_length_from_env's doc comment — forwarded verbatim to
-    // every spawn_llama_server/container::spawn call, local or
-    // containerized.
+    // See context_length_from_env's doc comment — forwarded to
+    // backends that expose a context-size flag.
     ctx_size: Option<u32>,
     // True if `ctx_size` came from an explicit LLMMAN_CONTEXT_LENGTH
     // rather than hostgpu's VRAM-tiered auto default — see
@@ -1894,25 +1895,54 @@ async fn spawn_llama_server(
     Ok((child, tail))
 }
 
+/// vLLM should only override its model-derived default for explicit
+/// positive user input. This deliberately skips backend_ctx_size's
+/// num_parallel scaling because vLLM's limit is per request, not split
+/// across llama-server-style request slots.
+fn vllm_max_model_len(ctx_size: Option<u32>, ctx_size_explicit: bool) -> Option<u32> {
+    ctx_size.filter(|n| ctx_size_explicit && *n > 0)
+}
+
+/// argv after the `vllm` binary, kept separate so context forwarding is testable.
+fn vllm_serve_args(
+    model_dir: &str,
+    port: u16,
+    model_name: &str,
+    max_model_len: Option<u32>,
+) -> Vec<String> {
+    let mut args = vec![
+        "serve".into(),
+        model_dir.into(),
+        "--port".into(),
+        port.to_string(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        // Register the model under the same name used in API requests so
+        // {"model": "<ref>"} is accepted by vllm's OpenAI-compatible API.
+        "--served-model-name".into(),
+        model_name.into(),
+    ];
+    if let Some(n) = max_model_len {
+        args.push("--max-model-len".into());
+        args.push(n.to_string());
+    }
+    args
+}
+
 async fn spawn_vllm_server(
     model_dir: &Path,
     port: u16,
     model_name: &str,
+    max_model_len: Option<u32>,
 ) -> anyhow::Result<tokio::process::Child> {
     let vllm = which_binary("vllm")?;
     let mut cmd = tokio::process::Command::new(&vllm);
-    cmd.args([
-        "serve",
+    cmd.args(vllm_serve_args(
         model_dir.to_str().context("non-UTF-8 model path")?,
-        "--port",
-        &port.to_string(),
-        "--host",
-        "127.0.0.1",
-        // Register the model under the same name used in API requests so
-        // {"model": "<ref>"} is accepted by vllm's OpenAI-compatible API.
-        "--served-model-name",
+        port,
         model_name,
-    ]);
+        max_model_len,
+    ));
     // Own process group so ModelProcess's Drop impl can kill vllm's whole
     // worker tree, not just this one pid, without also killing ourselves.
     #[cfg(unix)]
@@ -3040,7 +3070,8 @@ async fn ensure_model(
                 ModelProcess::Local(Engine::Mlx, child, pid)
             }
             (ModelPath::SafeTensors(dir), _) => {
-                let child = spawn_vllm_server(dir, port, model_ref).await?;
+                let max_model_len = vllm_max_model_len(ctx_size, state.0.ctx_size_explicit);
+                let child = spawn_vllm_server(dir, port, model_ref, max_model_len).await?;
                 let pid = child.id();
                 ModelProcess::Local(Engine::Vllm, child, pid)
             }
@@ -7984,6 +8015,7 @@ mod tests {
     fn parse_context_length_accepts_a_plain_number_and_rejects_everything_else() {
         assert_eq!(parse_context_length(Some("32768")), Some(32768));
         assert_eq!(parse_context_length(Some(" 32768 \n")), Some(32768));
+        assert_eq!(parse_context_length(Some("0")), Some(0));
         assert_eq!(parse_context_length(None), None);
         assert_eq!(parse_context_length(Some("")), None);
         assert_eq!(parse_context_length(Some("not-a-number")), None);
@@ -8082,6 +8114,36 @@ mod tests {
         ];
         for (list, expected) in &cases {
             assert_eq!(&cpu_list_count(list), expected, "list={list:?}");
+        }
+    }
+
+    #[test]
+    fn vllm_max_model_len_uses_only_explicit_ctx_size() {
+        assert_eq!(vllm_max_model_len(Some(4096), true), Some(4096));
+        assert_eq!(vllm_max_model_len(Some(0), true), None);
+        assert_eq!(vllm_max_model_len(Some(65536), false), None);
+        assert_eq!(vllm_max_model_len(None, true), None);
+        assert_eq!(vllm_max_model_len(None, false), None);
+    }
+
+    #[test]
+    fn vllm_serve_args_handles_max_model_len() {
+        for (max_model_len, expected) in [
+            (Some(256), Some("256")),
+            (Some(1024), Some("1024")),
+            (Some(4096), Some("4096")),
+            (None, None),
+        ] {
+            let args = vllm_serve_args("/models/qwen", 8000, "qwen3.5:0.8b", max_model_len);
+            let pos = args.iter().position(|arg| arg == "--max-model-len");
+
+            match expected {
+                Some(value) => {
+                    let i = pos.expect("--max-model-len should be present");
+                    assert_eq!(args.get(i + 1).map(String::as_str), Some(value));
+                }
+                None => assert!(pos.is_none()),
+            }
         }
     }
 
