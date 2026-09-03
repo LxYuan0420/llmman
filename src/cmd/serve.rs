@@ -127,8 +127,18 @@ pub struct ServeArgs {
     pub pull_bin: bool,
 }
 
-/// Explicit context tokens from `LLMMAN_CONTEXT_LENGTH`.
-/// Unset, unparseable, or zero returns `None`; serve startup applies any fallback.
+/// Context tokens requested for every backend this daemon spawns — read
+/// from `LLMMAN_CONTEXT_LENGTH` (an env var, not a `llmman serve` flag).
+/// For llama-server, this is a ceiling, not a guarantee: llama-server
+/// caps it back down to a model's own trained context (`n_ctx_train`)
+/// when that's smaller, with a warning, since serving positions past a
+/// model's trained length risks incoherent/NaN output.
+///
+/// Unset or unparseable, this falls back to
+/// [`crate::hostgpu::default_ctx_size`]: a VRAM-tiered value (see that
+/// function's doc comment). A value of 0 is preserved for llama-server,
+/// where it means "use the model's trained context", but is not
+/// forwarded to vLLM.
 fn context_length_from_env() -> Option<u32> {
     parse_context_length(std::env::var("LLMMAN_CONTEXT_LENGTH").ok().as_deref())
 }
@@ -471,7 +481,8 @@ struct Inner {
     exe: Option<PathBuf>,
     ociman: Option<crate::container::ContainerManager>,
     llama_cpp_version: Option<String>,
-    // Forwarded to backends that expose a context-size flag.
+    // See context_length_from_env's doc comment — forwarded to
+    // backends that expose a context-size flag.
     ctx_size: Option<u32>,
     // True if `ctx_size` came from an explicit LLMMAN_CONTEXT_LENGTH
     // rather than hostgpu's VRAM-tiered auto default — see
