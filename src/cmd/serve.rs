@@ -136,7 +136,7 @@ fn context_length_from_env() -> Option<u32> {
 /// [`context_length_from_env`]'s parsing, split out so it's testable
 /// without mutating the real process environment.
 fn parse_context_length(value: Option<&str>) -> Option<u32> {
-    value?.trim().parse::<u32>().ok().filter(|n| *n > 0)
+    value?.trim().parse().ok()
 }
 
 /// Flash Attention mode requested for every `llama-server` this daemon
@@ -1886,7 +1886,7 @@ async fn spawn_llama_server(
 
 /// vLLM should only override its model-derived default for explicit user input.
 fn vllm_max_model_len(ctx_size: Option<u32>, ctx_size_explicit: bool) -> Option<u32> {
-    ctx_size.filter(|_| ctx_size_explicit)
+    ctx_size.filter(|n| ctx_size_explicit && *n > 0)
 }
 
 /// argv after the `vllm` binary, kept separate so context forwarding is testable.
@@ -7999,9 +7999,9 @@ mod tests {
     fn parse_context_length_accepts_a_plain_number_and_rejects_everything_else() {
         assert_eq!(parse_context_length(Some("32768")), Some(32768));
         assert_eq!(parse_context_length(Some(" 32768 \n")), Some(32768));
+        assert_eq!(parse_context_length(Some("0")), Some(0));
         assert_eq!(parse_context_length(None), None);
         assert_eq!(parse_context_length(Some("")), None);
-        assert_eq!(parse_context_length(Some("0")), None);
         assert_eq!(parse_context_length(Some("not-a-number")), None);
         assert_eq!(parse_context_length(Some("-1")), None);
     }
@@ -8104,6 +8104,7 @@ mod tests {
     #[test]
     fn vllm_max_model_len_uses_only_explicit_ctx_size() {
         assert_eq!(vllm_max_model_len(Some(4096), true), Some(4096));
+        assert_eq!(vllm_max_model_len(Some(0), true), None);
         assert_eq!(vllm_max_model_len(Some(65536), false), None);
         assert_eq!(vllm_max_model_len(None, true), None);
         assert_eq!(vllm_max_model_len(None, false), None);
