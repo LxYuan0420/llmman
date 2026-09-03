@@ -691,8 +691,9 @@ impl ModelProcess {
     /// takes `llama-server`/vllm down on its own would otherwise keep
     /// handing out that now-dead port forever, indistinguishable from a
     /// real live one until whichever caller's request to it fails with a
-    /// bare connection error; `check_running` is what drops the entry, the
-    /// moment this returns false. `try_wait` is non-blocking either way:
+    /// bare connection error; `check_running` and `check_running_by_digest`
+    /// are what drop the entry, the moment this returns false. `try_wait`
+    /// is non-blocking either way:
     /// `Ok(None)` (still running) is the overwhelmingly common case this
     /// needs to stay cheap for.
     fn is_alive(&mut self) -> bool {
@@ -2287,18 +2288,61 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
 /// reference the pull recorded. A lock key that moved with it would let a
 /// caller resolving in that window take a different lock from the loader
 /// still holding the old one. `default_tag` alone is stable, and already
-/// folds the tagless and `:latest` spellings together, which is all the
-/// lock needs.
+/// folds the tagless and `:latest` spellings together.
+///
+/// A `@digest` suffix is dropped from the key, and only from the key: the
+/// reference the store is asked about keeps it, so `find` can match it by
+/// content. `default_tag` sees the `:` inside `sha256:…` as a tag and
+/// leaves such a reference alone, so `m@sha256:…` and `m:latest` for one
+/// stored model took two locks and could both load. Which tag the content
+/// sits under is the store's to say, so for a digest reference the store
+/// is read once here, before the lock (`stored_tag_for_digest`): content
+/// stored as `m:v9` locks as `m:v9`, alongside a load of that tag, and
+/// content the store lacks, or holds only under a digest-named entry of
+/// its own, folds onto `:latest`. That is the one read of the store this
+/// key allows itself, and a pull by digest does not move it: what such a
+/// pull writes is a digest-named entry, which folds the same way as the
+/// nothing there before. A pull by tag landing the same content while a
+/// load of its digest is in flight does move it; the load that then
+/// takes the other lock pulls the same bytes again and, on finding the
+/// process the first started (`check_running_by_digest`), uses that.
 ///
 /// A provider-routed reference comes back untouched, as `ensure_model`
 /// returns it before any of this applies. Nothing observable depends on
 /// that today, since a remote target never enters `running`.
-fn load_identity(model: &str) -> Result<String, crate::shortnames::InvalidReference> {
+fn load_identity(
+    store_path: &std::path::Path,
+    model: &str,
+) -> Result<String, crate::shortnames::InvalidReference> {
     if crate::providers::is_remote_ref(model) {
         return Ok(model.to_string());
     }
     let resolved = crate::shortnames::resolve_ollama_api(model)?;
-    Ok(crate::storage::default_tag(&resolved))
+    let (without_digest, digest) = crate::storage::split_ref_digest(&resolved);
+    if digest.is_some() {
+        if let Some(tag) = stored_tag_for_digest(store_path, &resolved) {
+            return Ok(tag);
+        }
+    }
+    Ok(crate::storage::default_tag(without_digest))
+}
+
+/// The tag the store holds `reference`'s content under, for a reference
+/// carrying a digest: `m:v9` for `m@sha256:…` stored as `m:v9`. `None`
+/// otherwise: no digest, nothing stored, or stored only as the
+/// digest-named entry a pull by digest records. See `load_identity` for
+/// what the distinction is for.
+fn stored_tag_for_digest(store_path: &std::path::Path, reference: &str) -> Option<String> {
+    crate::storage::split_ref_digest(reference).1?;
+    let desc = OciStore::open(store_path).ok()?.find(reference).ok()?;
+    let stored = desc
+        .annotations
+        .as_ref()?
+        .get("org.opencontainers.image.ref.name")?;
+    crate::storage::split_ref_digest(stored)
+        .1
+        .is_none()
+        .then(|| crate::storage::default_tag(stored))
 }
 
 /// Drops `model` from `running`, or reports a 404 when llmman has no such
@@ -2309,16 +2353,23 @@ fn load_identity(model: &str) -> Result<String, crate::shortnames::InvalidRefere
 /// against ollama 0.32.6). The local store is what separates those two
 /// cases here. A model removed from the store while still loaded stays
 /// unloadable, since the `running` entry is authoritative and is consulted
-/// first.
+/// first: by its key, and by the digest it records when the key cannot be
+/// had from the store any more.
 async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
-    let lock_key = load_identity(model).map_err(AppError::bad_request)?;
+    let lock_key = load_identity(&state.0.store_path, model).map_err(AppError::bad_request)?;
     let _guard = acquire_load_lock(&lock_key).await;
     // Only now, with any load of this model excluded: the running key is
     // the store's spelling, which a load in flight may just have changed.
+    // Resolved from the reference with its `@digest` kept, the two steps
+    // `ensure_model` takes before its own `canonical_ref`, and not from
+    // the lock key: that has folded the digest onto `:latest`, which is
+    // not where the store holds a model tagged otherwise.
     let canonical = if crate::providers::is_remote_ref(model) {
         lock_key
     } else {
-        canonical_ref(&state.0.store_path, &lock_key)
+        let resolved =
+            crate::shortnames::resolve_ollama_api(model).map_err(AppError::bad_request)?;
+        canonical_ref(&state.0.store_path, &crate::storage::default_tag(&resolved))
     };
     if state
         .0
@@ -2337,10 +2388,44 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
     if crate::providers::is_remote_ref(model) {
         return Ok(());
     }
-    let store = OciStore::open(&state.0.store_path)?;
-    store
-        .find(&canonical)
-        .map_err(|_| AppError(anyhow!("model '{model}' not found"), StatusCode::NOT_FOUND))?;
+    // The key may not be the one the content runs under. The store may
+    // have lost the tag since the load (`rm` on a loaded model), so that
+    // `canonical_ref` handed the reference back as given, digest and all;
+    // or the content may run under the digest-named key a load by digest
+    // registered (see `check_running_by_digest`) while this spelling is
+    // the tag. Either way the digest names the content, from the
+    // reference itself or from the store's entry for it, and each
+    // `running` entry records its own, so the one with that digest in
+    // the same repository is it, the spelled tag first when several hold
+    // it.
+    let stored = OciStore::open(&state.0.store_path)?.find(&canonical).ok();
+    let (base, digest) = crate::storage::split_ref_digest(&canonical);
+    let digest = digest
+        .map(str::to_owned)
+        .or_else(|| stored.as_ref().map(|d| d.digest.clone()));
+    if let Some(digest) = digest {
+        let spelled = crate::storage::default_tag(base);
+        let mut mgr = state.0.manager.lock().await;
+        let key = mgr
+            .running
+            .iter()
+            .filter(|(key, m)| {
+                m.digest.eq_ignore_ascii_case(&digest)
+                    && crate::storage::repo_name(key) == crate::storage::repo_name(base)
+            })
+            .map(|(key, _)| key.clone())
+            .min_by_key(|key| *key != spelled);
+        if let Some(key) = key {
+            mgr.running.remove(&key);
+            return Ok(());
+        }
+    }
+    if stored.is_none() {
+        return Err(AppError(
+            anyhow!("model '{model}' not found"),
+            StatusCode::NOT_FOUND,
+        ));
+    }
     Ok(())
 }
 
@@ -2364,6 +2449,47 @@ async fn check_running(state: &AppState, model_ref: &str) -> Option<(u16, Activi
         mgr.running.remove(model_ref);
     }
     None
+}
+
+/// `check_running` by content rather than by key: the entry in
+/// `model_ref`'s repository whose manifest digest is `digest`, claimed
+/// the same way, with its own key returned so the caller answers under
+/// the name the process is registered by.
+///
+/// The order this is for: from an empty store, a load by digest takes
+/// the shared lock first (see `load_identity`), pulls, and registers
+/// under the digest-named reference that pull records; the load by tag
+/// waiting on the lock then wakes with its own key, finds nothing under
+/// it, pulls the same manifest again under the tag, and without this
+/// would start a second server for content already served. The other
+/// order, tag first, is what `load_identity` settles by reading the
+/// store before the lock.
+async fn check_running_by_digest(
+    state: &AppState,
+    model_ref: &str,
+    digest: &str,
+) -> Option<(String, u16, ActivityGuard)> {
+    let repo = crate::storage::repo_name(model_ref);
+    let mut mgr = state.0.manager.lock().await;
+    let key = mgr
+        .running
+        .iter()
+        .find(|(key, m)| {
+            crate::storage::repo_name(key) == repo && m.digest.eq_ignore_ascii_case(digest)
+        })
+        .map(|(key, _)| key.clone())?;
+    let m = mgr.running.get_mut(&key)?;
+    if !m.process.is_alive() {
+        eprintln!(
+            "[llmman] {key} was marked running on port {} but its process has exited — reloading",
+            m.port
+        );
+        mgr.running.remove(&key);
+        return None;
+    }
+    m.in_flight += 1;
+    let port = m.port;
+    Some((key.clone(), port, ActivityGuard::new(state, &key)))
 }
 
 /// Evicts every currently-running model other than `model_ref` that
@@ -2919,18 +3045,20 @@ async fn ensure_model(
         ));
     }
 
+    // The key the load lock below is taken on, fixed before `canonical_ref`
+    // reads the store: it has to be the same string for the whole of a
+    // load even though the pull below changes what `canonical_ref`
+    // returns. See `load_identity`, which `unload_model` locks on for the
+    // same reason; the two have to agree, or an unload by one spelling
+    // passes a load by another.
+    let load_id = load_identity(&state.0.store_path, model_ref).map_err(AppError::bad_request)?;
     let model_ref =
         crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
-    // Default the tag before the lock below: otherwise two concurrent
-    // first-pulls of e.g. "gemma4" and "gemma4:latest" take different
-    // locks and both spawn a process for the same model.
+    // Default the tag before the store lookups: otherwise "gemma4" and
+    // "gemma4:latest" reach the store, and the pull, as two spellings. A
+    // `@digest` stays on, unlike in the lock key, so `find` can resolve
+    // it to whatever tag holds that content.
     let model_ref = crate::storage::default_tag(&model_ref);
-    // Kept from before `canonical_ref`, which reads the store: this is
-    // the key the load lock is taken on, and it has to be the same string
-    // for the whole of a load even though the pull below changes what
-    // `canonical_ref` returns. See `load_identity`, which `unload_model`
-    // locks on for the same reason.
-    let load_id = model_ref.clone();
     let model_ref = canonical_ref(&state.0.store_path, &model_ref);
     let model_ref = model_ref.as_str();
 
@@ -2978,12 +3106,11 @@ async fn ensure_model(
         return Ok((model_ref.to_string(), Target::Local(port), guard));
     }
 
-    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
-        .with_context(|| format!("resolve model {model_ref}"))?;
-    // Best-effort — used only to populate `llmman ps`'s ID/SIZE columns;
-    // resolve_model above already established the model exists, so a
-    // failure here (e.g. a race with a concurrent `rm`) just means those
-    // columns show as empty/zero rather than failing the whole request.
+    // Best-effort — used to populate `llmman ps`'s ID/SIZE columns and
+    // for the check right below; `resolve_model` after them establishes
+    // the model exists, so a failure here (e.g. a race with a concurrent
+    // `rm`) just means those columns show as empty/zero rather than
+    // failing the whole request.
     let (digest, size) = OciStore::open(&state.0.store_path)
         .and_then(|s| {
             s.find(model_ref).map(|d| {
@@ -2992,6 +3119,16 @@ async fn ensure_model(
             })
         })
         .unwrap_or_default();
+    // The content may be running already under a key this spelling does
+    // not resolve to; see `check_running_by_digest`'s doc comment for the
+    // order that produces one.
+    if !digest.is_empty() {
+        if let Some((key, port, guard)) = check_running_by_digest(state, model_ref, &digest).await {
+            return Ok((key, Target::Local(port), guard));
+        }
+    }
+    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, model_ref)
+        .with_context(|| format!("resolve model {model_ref}"))?;
     let context_shift = supports_context_shift(model_ref);
     // See enforce_max_loaded_models's doc comment — held for the rest
     // of this function.
@@ -7809,6 +7946,172 @@ mod tests {
         );
     }
 
+    /// An unload by digest of a model stored, and loaded, under a tag
+    /// other than `:latest`. The running key comes from the digest
+    /// spelling itself; resolving the lock key instead, which folds the
+    /// digest onto `:latest`, looked for a tag the model is not under and
+    /// reported it missing with the process still up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unload_by_digest_reaches_the_entry_stored_under_another_tag() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-unload-digest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = test_state_at(dir.clone());
+        let desc = crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:a1b2".into(),
+            size: 0,
+            annotations: None,
+        };
+        OciStore::open(&dir)
+            .unwrap()
+            .tag(desc, "docker.io/ai/m-tagged:v9")
+            .unwrap();
+        state.0.manager.lock().await.running.insert(
+            "docker.io/ai/m-tagged:v9".into(),
+            running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+        );
+
+        unload_model(&state, "docker.io/ai/m-tagged@sha256:a1b2")
+            .await
+            .expect("the digest spelling must unload the model loaded under its tag");
+        assert!(
+            !state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .contains_key("docker.io/ai/m-tagged:v9"),
+            "the entry under the tag must be gone"
+        );
+
+        // Stored but no longer loaded is a plain success, as for a tag.
+        unload_model(&state, "docker.io/ai/m-tagged@sha256:a1b2")
+            .await
+            .expect("a stored model must unload without a 404 whether or not it is loaded");
+        // A digest nothing in the store carries is the missing-model case.
+        let err = unload_model(&state, "docker.io/ai/m-tagged@sha256:ffff")
+            .await
+            .expect_err("a digest the store does not hold must be a 404");
+        assert_eq!(err.1, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The store has lost the entry while the model runs (`rm` on a loaded
+    /// model), so the digest cannot be resolved to the key it runs under;
+    /// the digest each `running` entry records is what finds it, the
+    /// spelled tag first when two entries hold the same content.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unload_by_digest_reaches_a_loaded_model_the_store_has_lost() {
+        let state = test_state();
+        let running = |digest: &str| {
+            let mut m = running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0);
+            m.digest = digest.into();
+            m
+        };
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running
+                .insert("docker.io/ai/m-gone:v8".into(), running("sha256:a1b2"));
+            mgr.running
+                .insert("docker.io/ai/m-gone:v9".into(), running("sha256:a1b2"));
+            mgr.running
+                .insert("docker.io/ai/other:v9".into(), running("sha256:a1b2"));
+        }
+
+        unload_model(&state, "docker.io/ai/m-gone:v9@sha256:A1B2")
+            .await
+            .expect("the digest must reach the model running under its lost tag");
+        let keys = |mgr: &ModelManager| {
+            let mut k: Vec<String> = mgr.running.keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(
+            keys(&*state.0.manager.lock().await),
+            ["docker.io/ai/m-gone:v8", "docker.io/ai/other:v9"],
+            "the spelled tag goes first; the other tag and the other repository stay"
+        );
+        unload_model(&state, "docker.io/ai/m-gone@sha256:a1b2")
+            .await
+            .expect("with no spelled tag, the remaining entry with the digest is it");
+        assert_eq!(
+            keys(&*state.0.manager.lock().await),
+            ["docker.io/ai/other:v9"]
+        );
+        let err = unload_model(&state, "docker.io/ai/m-gone@sha256:a1b2")
+            .await
+            .expect_err("nothing running or stored with it is the 404 case");
+        assert_eq!(err.1, StatusCode::NOT_FOUND);
+    }
+
+    /// Digest first: the load by digest registered the process under the
+    /// digest-named key its pull recorded, and the tag's own pull has
+    /// landed since. A load and an unload by the tag must both reach that
+    /// process, by content, rather than start or strand a second one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tag_reaches_the_process_a_load_by_digest_registered() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-digest-first-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = test_state_at(dir.clone());
+        let desc = |digest: &str| crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: digest.into(),
+            size: 0,
+            annotations: None,
+        };
+        let store = OciStore::open(&dir).unwrap();
+        store
+            .tag(desc("sha256:df01"), "docker.io/ai/m-df@sha256:df01")
+            .unwrap();
+        store
+            .tag(desc("sha256:df01"), "docker.io/ai/m-df:latest")
+            .unwrap();
+        {
+            let mut running = running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0);
+            running.digest = "sha256:df01".into();
+            state
+                .0
+                .manager
+                .lock()
+                .await
+                .running
+                .insert("docker.io/ai/m-df@sha256:df01".into(), running);
+        }
+
+        let (key, target, guard) = ensure_model(&state, "docker.io/ai/m-df", None)
+            .await
+            .expect("the tag must find the running content rather than load again");
+        assert_eq!(key, "docker.io/ai/m-df@sha256:df01");
+        assert!(matches!(target, Target::Local(0)));
+        drop(guard);
+
+        unload_model(&state, "docker.io/ai/m-df:latest")
+            .await
+            .expect("the tag must unload the process running under the digest key");
+        assert!(
+            state.0.manager.lock().await.running.is_empty(),
+            "the digest-keyed entry must be gone"
+        );
+        // Stored and not running: a plain success, as for any tag.
+        unload_model(&state, "docker.io/ai/m-df").await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An unload that arrives while a first load of the same model is in
     /// flight blocks on the load lock. By the time it runs, the pull has
     /// landed and the loader has inserted under the key `canonical_ref`
@@ -7874,6 +8177,138 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `m@sha256:…`, `m` and `m:latest` name one stored model and must
+    /// share a load lock; the digest form used to keep its own because
+    /// `default_tag` reads the `:` inside the digest as a tag. With the
+    /// store empty the digest folds onto `:latest`.
+    #[test]
+    fn load_identity_folds_the_digest_spelling_onto_the_tag_spelling() {
+        let store = std::env::temp_dir();
+        let latest = load_identity(&store, "docker.io/ai/m:latest").unwrap();
+        assert_eq!(load_identity(&store, "docker.io/ai/m").unwrap(), latest);
+        assert_eq!(
+            load_identity(&store, "docker.io/ai/m@sha256:0000000000000000").unwrap(),
+            latest
+        );
+        assert_eq!(
+            load_identity(&store, "docker.io/ai/m:v9@sha256:0000000000000000").unwrap(),
+            "docker.io/ai/m:v9"
+        );
+    }
+
+    /// With the content in the store under a tag, a digest locks as that
+    /// tag, whatever tag it spells itself; content the store holds only
+    /// under a digest-named entry, or not at all, still folds.
+    #[test]
+    fn load_identity_takes_the_tag_the_store_holds_a_digest_under() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-identity-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = OciStore::open(&dir).unwrap();
+        let desc = |digest: &str| crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: digest.into(),
+            size: 0,
+            annotations: None,
+        };
+        store
+            .tag(desc("sha256:aaaa"), "docker.io/ai/m-key:v9")
+            .unwrap();
+        store
+            .tag(desc("sha256:bbbb"), "docker.io/ai/m-key@sha256:bbbb")
+            .unwrap();
+
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key@sha256:aaaa").unwrap(),
+            "docker.io/ai/m-key:v9"
+        );
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key:latest@sha256:aaaa").unwrap(),
+            "docker.io/ai/m-key:v9",
+            "the tag the content is under wins over the one spelled"
+        );
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key@sha256:bbbb").unwrap(),
+            "docker.io/ai/m-key:latest",
+            "a digest-named entry is what a pull by digest writes; it folds"
+        );
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key@sha256:ffff").unwrap(),
+            "docker.io/ai/m-key:latest"
+        );
+        assert_eq!(
+            load_identity(&dir, "docker.io/ai/m-key:v9").unwrap(),
+            "docker.io/ai/m-key:v9"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The load side of that key: a load by digest waits on the lock a
+    /// load by tag holds, `:v9` here, not `:latest`, and once through it
+    /// takes the process that load started rather than starting its own.
+    /// With `ensure_model` keying
+    /// its lock on the digest spelling, as it did before it went through
+    /// `load_identity`, nothing here would block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_load_by_digest_waits_on_the_tag_spellings_lock_and_takes_its_process() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmman-load-digest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = test_state_at(dir.clone());
+        // The pull by tag has landed...
+        let desc = crate::storage::oci::Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:d16e".into(),
+            size: 0,
+            annotations: None,
+        };
+        OciStore::open(&dir)
+            .unwrap()
+            .tag(desc, "docker.io/ai/m-digest:v9")
+            .unwrap();
+        // ...and that load still holds its lock.
+        let loading =
+            acquire_load_lock(&load_identity(&dir, "docker.io/ai/m-digest:v9").unwrap()).await;
+
+        let loader = state.clone();
+        let load = tokio::spawn(async move {
+            ensure_model(&loader, "docker.io/ai/m-digest@sha256:d16e", None).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !load.is_finished(),
+            "a load by digest must wait on the lock the tag spelling holds"
+        );
+
+        state.0.manager.lock().await.running.insert(
+            "docker.io/ai/m-digest:v9".into(),
+            running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0),
+        );
+        drop(loading);
+
+        let (model_ref, target, _guard) = load
+            .await
+            .unwrap()
+            .expect("the load by digest must succeed once the lock releases");
+        assert_eq!(model_ref, "docker.io/ai/m-digest:v9");
+        assert!(
+            matches!(target, Target::Local(0)),
+            "the process the tag spelling started must be the one handed back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The wider window: the pull has landed but the loader, still holding
     /// its lock, has not yet inserted into `running`. An unload resolving
     /// through the store now gets the refined spelling and locks on that
@@ -7905,7 +8340,7 @@ mod tests {
             .tag(desc, "docker.io/ai/m")
             .unwrap();
         // ...and the loader still holds the lock it took before pulling.
-        let loading = acquire_load_lock(&load_identity("docker.io/ai/m").unwrap()).await;
+        let loading = acquire_load_lock(&load_identity(&dir, "docker.io/ai/m").unwrap()).await;
 
         let unloader = state.clone();
         let unload = tokio::spawn(async move { unload_model(&unloader, "docker.io/ai/m").await });
@@ -8993,26 +9428,30 @@ mod tests {
     /// (see `ensure_model`'s `default_tag` call).
     #[test]
     fn ensure_model_key_pipeline_converges_aliases_before_the_lock() {
-        let tagless = crate::storage::default_tag(
-            &crate::shortnames::resolve_ollama_api("regression-test-model").unwrap(),
-        );
-        let tagged = crate::storage::default_tag(
-            &crate::shortnames::resolve_ollama_api("regression-test-model:latest").unwrap(),
-        );
+        let store = std::env::temp_dir();
+        let tagless = load_identity(&store, "regression-test-model").unwrap();
+        let tagged = load_identity(&store, "regression-test-model:latest").unwrap();
+        let digest = load_identity(&store, "regression-test-model@sha256:0000").unwrap();
         assert_eq!(
             tagless, tagged,
             "tagless and :latest aliases must resolve to one key"
         );
+        assert_eq!(
+            tagless, digest,
+            "the digest spelling must resolve to the same key"
+        );
 
         let a = load_lock(&tagless);
         let b = load_lock(&tagged);
+        let c = load_lock(&digest);
         assert!(
-            Arc::ptr_eq(&a, &b),
-            "both aliases must take the same load lock"
+            Arc::ptr_eq(&a, &b) && Arc::ptr_eq(&a, &c),
+            "all three aliases must take the same load lock"
         );
 
         drop(a);
         drop(b);
+        drop(c);
         release_load_lock(&tagless);
     }
 
