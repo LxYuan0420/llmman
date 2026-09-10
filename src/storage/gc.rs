@@ -177,7 +177,8 @@ fn prune_blobs_with_account(
 /// hex for GGUF, a manifest hex for safetensors — see
 /// `modelpack::extract_gguf_layer` / `extract_safetensors_dir`) doesn't
 /// correspond to a live digest, skipping anything younger than `grace`. A
-/// missing cache directory is a no-op.
+/// missing cache directory is a no-op. Stale `.tmp` files inside kept
+/// cache directories are also removed.
 pub fn prune_cache(
     cache_path: &Path,
     live: &HashSet<String>,
@@ -212,9 +213,15 @@ fn prune_cache_with_account(
             continue;
         };
         if live_hex.contains(name) {
+            let tmp_stats = prune_stale_cache_temps(&path, grace, account);
+            stats.count += tmp_stats.count;
+            stats.bytes += tmp_stats.bytes;
             continue;
         }
         if !is_older_than(&path, grace) {
+            let tmp_stats = prune_stale_cache_temps(&path, grace, account);
+            stats.count += tmp_stats.count;
+            stats.bytes += tmp_stats.bytes;
             continue;
         }
         let size = dir_size(&path, account);
@@ -261,6 +268,39 @@ fn dir_size(dir: &Path, account: &mut GcFileAccount) -> u64 {
             }
         })
         .sum()
+}
+
+fn prune_stale_cache_temps(dir: &Path, grace: Duration, account: &mut GcFileAccount) -> GcStats {
+    let mut stats = GcStats::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return stats;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let inner = prune_stale_cache_temps(&path, grace, account);
+            stats.count += inner.count;
+            stats.bytes += inner.bytes;
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".tmp") || !is_older_than(&path, grace) {
+            continue;
+        }
+        let size = account.size(&path);
+        if let Err(e) = std::fs::remove_file(&path) {
+            eprintln!(
+                "[llmman] couldn't remove stale cache temp file {}: {e:#}",
+                path.display()
+            );
+            continue;
+        }
+        stats.count += 1;
+        stats.bytes += size;
+    }
+    stats
 }
 
 /// Skips both the post-`rm` and startup GC sweeps when `LLMMAN_NOPRUNE` is
@@ -358,6 +398,32 @@ mod tests {
         assert_eq!(stats.count, 1);
         assert!(cache.join("aaaa").exists(), "referenced cache dir survives");
         assert!(!cache.join("bbbb").exists(), "orphan cache dir removed");
+
+        std::fs::remove_dir_all(&cache).unwrap();
+    }
+
+    #[test]
+    fn prune_cache_removes_stale_temp_files_inside_live_dirs() {
+        let cache = temp_dir("prune-cache-temp");
+        std::fs::create_dir_all(cache.join("aaaa").join("sub")).unwrap();
+        std::fs::write(cache.join("aaaa").join("model.safetensors"), b"kept").unwrap();
+        let tmp = cache
+            .join("aaaa")
+            .join("sub")
+            .join("model.safetensors.123.tmp");
+        std::fs::write(&tmp, b"partial copy").unwrap();
+
+        let mut live = HashSet::new();
+        live.insert("sha256:aaaa".to_string());
+
+        let stats = prune_cache(&cache, &live, Duration::ZERO).unwrap();
+        assert_eq!(stats.count, 1);
+        assert_eq!(stats.bytes, "partial copy".len() as u64);
+        assert!(
+            cache.join("aaaa").join("model.safetensors").exists(),
+            "live cache file survives"
+        );
+        assert!(!tmp.exists(), "stale temp file is removed");
 
         std::fs::remove_dir_all(&cache).unwrap();
     }
