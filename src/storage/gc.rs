@@ -286,7 +286,7 @@ fn prune_stale_cache_temps(dir: &Path, grace: Duration, account: &mut GcFileAcco
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !name.ends_with(".tmp") || !is_older_than(&path, grace) {
+        if !is_cache_copy_temp_name(name) || !is_older_than(&path, grace) {
             continue;
         }
         let size = account.size(&path);
@@ -301,6 +301,23 @@ fn prune_stale_cache_temps(dir: &Path, grace: Duration, account: &mut GcFileAcco
         stats.bytes += size;
     }
     stats
+}
+
+fn is_cache_copy_temp_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".tmp") else {
+        return false;
+    };
+    let Some((before_counter, counter)) = stem.rsplit_once('.') else {
+        return false;
+    };
+    let Some((dest, pid)) = before_counter.rsplit_once('.') else {
+        return false;
+    };
+    !dest.is_empty()
+        && !pid.is_empty()
+        && !counter.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && counter.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Skips both the post-`rm` and startup GC sweeps when `LLMMAN_NOPRUNE` is
@@ -407,10 +424,12 @@ mod tests {
         let cache = temp_dir("prune-cache-temp");
         std::fs::create_dir_all(cache.join("aaaa").join("sub")).unwrap();
         std::fs::write(cache.join("aaaa").join("model.safetensors"), b"kept").unwrap();
+        let legitimate_tmp_layer = cache.join("aaaa").join("sub").join("weights.tmp");
+        std::fs::write(&legitimate_tmp_layer, b"real layer").unwrap();
         let tmp = cache
             .join("aaaa")
             .join("sub")
-            .join("model.safetensors.123.tmp");
+            .join("model.safetensors.123.0.tmp");
         std::fs::write(&tmp, b"partial copy").unwrap();
 
         let mut live = HashSet::new();
@@ -424,8 +443,22 @@ mod tests {
             "live cache file survives"
         );
         assert!(!tmp.exists(), "stale temp file is removed");
+        assert!(
+            legitimate_tmp_layer.exists(),
+            "real cache layer ending in .tmp survives"
+        );
 
         std::fs::remove_dir_all(&cache).unwrap();
+    }
+
+    #[test]
+    fn cache_copy_temp_name_matches_only_atomic_copy_temps() {
+        assert!(is_cache_copy_temp_name("model.safetensors.123.0.tmp"));
+        assert!(is_cache_copy_temp_name("config.json.123.45.tmp"));
+        assert!(!is_cache_copy_temp_name("weights.tmp"));
+        assert!(!is_cache_copy_temp_name("model.safetensors.tmp"));
+        assert!(!is_cache_copy_temp_name("model.safetensors.123.tmp"));
+        assert!(!is_cache_copy_temp_name("model.safetensors.pid.0.tmp"));
     }
 
     #[test]
