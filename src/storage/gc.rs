@@ -127,9 +127,90 @@ pub fn prune_blobs_and_cache(
     grace: Duration,
 ) -> anyhow::Result<(GcStats, GcStats)> {
     let mut account = GcFileAccount::default();
+    remember_retained_blobs(store_root, live, grace, &mut account)?;
+    remember_retained_cache_files(cache_path, live, grace, &mut account)?;
     let blob_stats = prune_blobs_with_account(store_root, live, grace, &mut account)?;
     let cache_stats = prune_cache_with_account(cache_path, live, grace, &mut account)?;
     Ok((blob_stats, cache_stats))
+}
+
+fn remember_retained_blobs(
+    store_root: &Path,
+    live: &HashSet<String>,
+    grace: Duration,
+    account: &mut GcFileAccount,
+) -> anyhow::Result<()> {
+    let blobs_dir = store_root.join("blobs").join("sha256");
+    let entries = match std::fs::read_dir(&blobs_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", blobs_dir.display())),
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with("tmp-") || name.ends_with(".tmp") {
+            continue;
+        }
+        if live.contains(&format!("sha256:{name}")) || !is_older_than(&path, grace) {
+            account.remember(&path);
+        }
+    }
+    Ok(())
+}
+
+fn remember_retained_cache_files(
+    cache_path: &Path,
+    live: &HashSet<String>,
+    grace: Duration,
+    account: &mut GcFileAccount,
+) -> anyhow::Result<()> {
+    let live_hex: HashSet<&str> = live
+        .iter()
+        .filter_map(|d| d.strip_prefix("sha256:"))
+        .collect();
+    let entries = match std::fs::read_dir(cache_path) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", cache_path.display())),
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if live_hex.contains(name) || !is_older_than(&path, grace) {
+            remember_cache_dir_files(&path, grace, account);
+        }
+    }
+    Ok(())
+}
+
+fn remember_cache_dir_files(dir: &Path, grace: Duration, account: &mut GcFileAccount) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            remember_cache_dir_files(&path, grace, account);
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if is_cache_copy_temp_name(name) && is_older_than(&path, grace) {
+            continue;
+        }
+        account.remember(&path);
+    }
 }
 
 fn prune_blobs_with_account(
@@ -532,6 +613,38 @@ mod tests {
         assert_eq!(cache_stats.count, 1);
         assert_eq!(blob_stats.bytes + cache_stats.bytes, 0);
         assert!(blob.exists(), "live blob survives");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_does_not_count_blob_link_retained_by_fresh_cache_dir() {
+        let root = temp_dir("prune-blob-link-retained-by-cache");
+        let blobs = root.join("blobs").join("sha256");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(cache.join("bbbb")).unwrap();
+        let blob = blobs.join("aaaa");
+        let cache_file = cache.join("bbbb").join("model.safetensors");
+        let weights = b"complete-weights-bytes";
+        std::fs::write(&blob, weights).unwrap();
+        std::fs::hard_link(&blob, &cache_file).unwrap();
+
+        let old = SystemTime::now() - GC_GRACE_PERIOD - Duration::from_secs(60);
+        filetime_set(&blob, old);
+
+        let live = HashSet::new();
+        let (blob_stats, cache_stats) =
+            prune_blobs_and_cache(&root, &cache, &live, GC_GRACE_PERIOD).unwrap();
+
+        assert_eq!(blob_stats.count, 1);
+        assert_eq!(cache_stats.count, 0);
+        assert_eq!(blob_stats.bytes + cache_stats.bytes, 0);
+        assert!(!blob.exists(), "old unreferenced blob path is removed");
+        assert!(
+            cache_file.exists(),
+            "fresh cache dir keeps its hardlink to the bytes"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
