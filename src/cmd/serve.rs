@@ -3872,11 +3872,13 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         if let Ok(store) = OciStore::open(&store_path) {
             if let Ok(live) = crate::storage::gc::referenced_digests(&store) {
                 let grace = crate::storage::gc::GC_GRACE_PERIOD;
-                if let Err(e) = crate::storage::gc::prune_blobs(&store_path, &live, grace) {
-                    eprintln!("[llmman] blob GC sweep failed: {e:#}");
-                }
-                if let Err(e) = crate::storage::gc::prune_cache(&cache_path, &live, grace) {
-                    eprintln!("[llmman] cache GC sweep failed: {e:#}");
+                if let Err(e) = crate::storage::gc::prune_blobs_and_cache(
+                    &store_path,
+                    &cache_path,
+                    &live,
+                    grace,
+                ) {
+                    eprintln!("[llmman] GC sweep failed: {e:#}");
                 }
             }
         }

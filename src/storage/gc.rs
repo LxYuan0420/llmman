@@ -8,9 +8,9 @@
 //! sync (a crash, a manual edit, an interrupted pull can never desync it,
 //! because the live set is rebuilt fresh on every sweep).
 //!
-//! [`referenced_digests`] builds that live set; [`prune_blobs`] and
-//! [`prune_cache`] sweep everything not in it. Both are grace-gated the
-//! same way [`crate::storage::repair`] gates its stale-temp-file sweep: a
+//! [`referenced_digests`] builds that live set; [`prune_blobs_and_cache`]
+//! sweeps everything not in it. Both namespaces are grace-gated the same
+//! way [`crate::storage::repair`] gates its stale-temp-file sweep: a
 //! blob is written before its manifest/tag pointer, so a blob can be
 //! legitimately unreferenced for a moment mid-pull — anything younger than
 //! `grace` is left alone. Both `rm` and the `serve` startup catch-all pass
@@ -128,7 +128,8 @@ pub fn referenced_digests(store: &OciStore) -> anyhow::Result<HashSet<String>> {
 /// digest isn't in `live`, skipping in-progress temp writes (`tmp-`/
 /// `.tmp`, same as [`crate::storage::repair`]) and anything younger than
 /// `grace`. A missing blobs directory is a no-op.
-pub fn prune_blobs(
+#[cfg(test)]
+fn prune_blobs(
     store_root: &Path,
     live: &HashSet<String>,
     grace: Duration,
@@ -278,7 +279,8 @@ fn prune_blobs_with_account(
 /// correspond to a live digest, skipping anything younger than `grace`. A
 /// missing cache directory is a no-op. Stale `.tmp` files inside kept
 /// cache directories are also removed.
-pub fn prune_cache(
+#[cfg(test)]
+fn prune_cache(
     cache_path: &Path,
     live: &HashSet<String>,
     grace: Duration,
