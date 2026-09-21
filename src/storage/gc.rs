@@ -40,9 +40,15 @@ pub struct GcStats {
     pub bytes: u64,
 }
 
+#[cfg(unix)]
+type GcFileIdentity = (u64, u64);
+
+#[cfg(windows)]
+type GcFileIdentity = same_file::Handle;
+
 #[derive(Default)]
 struct GcFileAccount {
-    files: HashSet<same_file::Handle>,
+    identities: HashSet<GcFileIdentity>,
 }
 
 impl GcFileAccount {
@@ -53,8 +59,8 @@ impl GcFileAccount {
         if !meta.is_file() {
             return;
         }
-        if let Ok(handle) = same_file::Handle::from_path(path) {
-            self.files.insert(handle);
+        if let Some(identity) = file_identity(path, &meta) {
+            self.identities.insert(identity);
         }
     }
 
@@ -66,17 +72,29 @@ impl GcFileAccount {
             return 0;
         }
         let size = meta.len();
-        match same_file::Handle::from_path(path) {
-            Ok(handle) => {
-                if self.files.insert(handle) {
+        match file_identity(path, &meta) {
+            Some(identity) => {
+                if self.identities.insert(identity) {
                     size
                 } else {
                     0
                 }
             }
-            Err(_) => size,
+            None => size,
         }
     }
+}
+
+#[cfg(unix)]
+fn file_identity(_path: &Path, meta: &std::fs::Metadata) -> Option<GcFileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(path: &Path, _meta: &std::fs::Metadata) -> Option<GcFileIdentity> {
+    same_file::Handle::from_path(path).ok()
 }
 
 /// Every blob digest ("sha256:<hex>") still reachable from a surviving

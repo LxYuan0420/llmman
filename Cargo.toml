@@ -47,7 +47,6 @@ regex      = "1"
 anyhow     = "1"
 walkdir    = "2"
 dunce      = "1"
-same-file  = "1"
 chrono     = { version = "0.4", features = ["serde"] }
 dirs       = "5"
 tar        = "0.4"
@@ -107,6 +106,9 @@ hf-xet = "=1.6.0"
 # latter alone, so there is exactly one TLS stack in the binary.
 aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+
+[target.'cfg(windows)'.dependencies]
+same-file = "1"
 
 [features]
 default = ["docker"]
