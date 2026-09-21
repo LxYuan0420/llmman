@@ -751,8 +751,17 @@ fn link_or_copy_file(src: &Path, dest: &Path, layer_size: u64) -> anyhow::Result
     match std::fs::hard_link(src, dest) {
         Ok(()) if cached_layer_file_matches(dest, layer_size) => Ok(()),
         Ok(()) => {
-            let _ = std::fs::remove_file(dest);
-            copy_file_atomic(src, dest, layer_size)
+            let actual_size = dest
+                .symlink_metadata()
+                .with_context(|| format!("inspect hardlink {}", dest.display()))
+                .map(|meta| meta.len());
+            std::fs::remove_file(dest)
+                .with_context(|| format!("remove invalid hardlink {}", dest.display()))?;
+            let actual_size = actual_size?;
+            anyhow::bail!(
+                "blob {} is {actual_size} bytes, expected {layer_size}",
+                src.display()
+            );
         }
         Err(_) if cached_layer_file_matches(dest, layer_size) => Ok(()),
         Err(hardlink_error) => copy_file_atomic(src, dest, layer_size).with_context(|| {
@@ -1306,7 +1315,11 @@ mod tests {
         let dest = dir.join("model.safetensors");
         std::fs::write(&src, b"short").unwrap();
 
-        assert!(link_or_copy_file(&src, &dest, 22).is_err());
+        let error = link_or_copy_file(&src, &dest, 22).unwrap_err();
+        assert!(
+            error.to_string().contains("is 5 bytes, expected 22"),
+            "{error:#}"
+        );
         assert!(!dest.exists(), "short linked dest should be removed");
         std::fs::remove_dir_all(&dir).unwrap();
     }
